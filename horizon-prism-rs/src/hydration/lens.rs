@@ -36,6 +36,10 @@ pub struct Markers {
     /// The node's replies were not read to their end. The inner value is
     /// the position to resume from, absent when none was read.
     pub more_replies: Option<Option<String>>,
+    /// The posts between this node and the next node of the parent chain
+    /// are not known: the next node is a deleted or missing post whose own
+    /// parent could not be read (`gapBelow`).
+    pub gap_below: bool,
 }
 
 impl Markers {
@@ -214,6 +218,9 @@ impl LensNode {
         // gate (amendment 1 §2.2). No other part of the gate is set here.
         if self.hidden_by_threadgate() {
             v["hiddenByThreadgate"] = json!(true);
+        }
+        if self.markers().gap_below {
+            v["gapBelow"] = json!(true);
         }
         // Only a post node or a known-block gap carries a marker.
         if self.walkable() {

@@ -615,7 +615,11 @@ async fn t_o11_the_chain() {
     // The same chain with v hidden by moderation: the walk ends at v.
     exec(&w.db.pool, &format!("INSERT INTO labels (subject, val) VALUES ('{v}', '!takedown')")).await;
     let t = lens.read(Some(&outline), &anchor, 6, 80, None, &cfg).await;
-    assert_eq!(shape_of(&t.nodes), [(v.clone(), Some("not-found")), (m2.clone(), Some("blocked-by-you")), (anchor.clone(), None)]);
+    // Above it, the root the anchor names, marked: the posts between are
+    // not said, and v names no parent.
+    assert_eq!(shape_of(&t.nodes), [(root.clone(), None), (v.clone(), Some("not-found")), (m2.clone(), Some("blocked-by-you")), (anchor.clone(), None)]);
+    assert!(t.nodes[0].markers().gap_below);
+    assert_eq!(node(&t, &v).and_then(LensNode::parent_uri), None);
 
     // An outline-only reply the ladder cannot find: skipped, not a gap.
     let r2 = w.stored(OP, 10, "r2", None, None).await;
@@ -853,7 +857,14 @@ async fn t_o11_a_deleted_chain_post_is_placed_as_today() {
         assert_eq!(got.outline, Some(Use::Tree), "{author}");
         let emit = |t: &Thread| serde_json::to_value(lens_thread(&anchor, &t.nodes, t.bridging, true)).expect("json");
         assert_eq!(emit(&got), emit(&today), "{author}");
-        assert_eq!(uris(&got), [d.clone(), v.clone(), m.clone(), anchor.clone()], "{author}");
+        // A deleted post by a `Clear` author has the root above it, marked;
+        // a blocked author's gap does not.
+        if author == A1 {
+            assert_eq!(uris(&got), [root.clone(), d.clone(), v.clone(), m.clone(), anchor.clone()], "{author}");
+            assert!(got.nodes[0].markers().gap_below, "{author}");
+        } else {
+            assert_eq!(uris(&got), [d.clone(), v.clone(), m.clone(), anchor.clone()], "{author}");
+        }
         assert!(!matches!(node(&got, &d), Some(LensNode::Post { .. })), "{author}");
         assert!(node(&got, &d).is_some_and(|n| !n.markers().more_parents), "{author}");
         assert!(lens.record_reads().is_empty(), "{author}");

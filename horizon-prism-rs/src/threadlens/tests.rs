@@ -1319,6 +1319,62 @@ async fn the_walk_reads_the_link_above_a_blocked_post_from_its_record() {
     db.drop_db().await;
 }
 
+/// A parent the upstream thread reports as blocked (a block between other
+/// parties) but that no source has, by an author the caller has no block
+/// with: it reads as missing, not as a block. With its own parent unknown,
+/// the root the anchor's reply names comes first, marked `gapBelow`, and the
+/// missing post names no parent.
+#[tokio::test]
+async fn a_missing_parent_reads_as_missing_with_the_root_above() {
+    use crate::hydration::testing::{FixedUpstream, hydrator_with_upstream_and_farsight};
+
+    // An author Farsight can vouch for: a DID its grammar accepts.
+    const GONE_AUTHOR: &str = "did:plc:gggggggggggggggggggggggg";
+    let Some(db) = fresh_db("threadlens_missing_parent_root").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (did, handle) in [(AUTHOR, "author.test"), (GONE_AUTHOR, "gone.test"), (VIEWER_A, "a.test")] {
+        actor(p, did, handle, handle).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{VIEWER_A}', 'admin', now())")).await;
+    let at = |did: &str, rkey: &str| format!("at://{did}/app.bsky.feed.post/{rkey}");
+    // root ← (unknown) ← gone ← anchor; the anchor is not stored, so the
+    // baseline is an upstream thread, which ends at `gone`.
+    let root = post(p, VIEWER_A, "3kroot33333", "root", None, None).await;
+    let gone = at(GONE_AUTHOR, "3kgone33333");
+    let anchor = at(AUTHOR, "3kanchor3333");
+    let mut up = FixedUpstream::default();
+    let thread = json!({"$type": "app.bsky.feed.defs#threadViewPost", "post": upstream_view(&anchor, AUTHOR, "anchor", Some(&gone), &root),
+                        "parent": {"$type": "app.bsky.feed.defs#blockedPost", "uri": gone, "blocked": true, "author": {"did": GONE_AUTHOR, "handle": "gone.test"}},
+                        "replies": []});
+    up.threads.insert(anchor.clone(), json!({"thread": thread}));
+    let up = Arc::new(up);
+    let (farsight, _fake) = crate::farsight::lookup::tests::engine("").await;
+    let h = hydrator_with_upstream_and_farsight(p, ScopeSets::default(), Arc::clone(&up) as _, farsight);
+    let base = fake_upstream(Arc::new(Calls::default()), None).await;
+    let l = ladder(h, &base, Arc::new(StubLookup::default()));
+    let (req, viewer, key, cfg) = (Requester::test(), member(VIEWER_A), CursorKey::generated(), ThreadLensConfig::default());
+
+    let request = thread::Request { viewer: &viewer, req: &req, anchor: &anchor, depth: 0, parent_height: 80 };
+    let got = thread::get_thread(&l, &cfg, &key, request, None).await.expect("thread");
+    let shape = shape_of(&got.nodes);
+    // The emitted root carries the marker; the missing post no link.
+    let emitted = serde_json::to_value(crate::hydration::lens::lens_thread(&anchor, &got.nodes, got.bridging, true)).expect("json");
+    assert_eq!(emitted["nodes"][0]["gapBelow"], json!(true), "{emitted}");
+    assert!(emitted["nodes"][1].get("parentUri").is_none() && emitted["nodes"][1].get("gapBelow").is_none(), "{emitted}");
+    assert_eq!(got.bridging, Bridging::Full, "{shape:?}");
+    assert_eq!(shape.len(), 3, "{shape:?}");
+    assert_eq!(shape[0], (root.clone(), None), "{shape:?}");
+    assert_eq!(shape[1].0, gone);
+    assert!(matches!(shape[1].1, Some("not-found" | "deleted")), "{shape:?}");
+    assert_eq!(shape[2], (anchor.clone(), None), "{shape:?}");
+    assert!(got.nodes[0].markers().gap_below);
+    assert!(!got.nodes[1].markers().gap_below && !got.nodes[2].markers().gap_below);
+    assert_eq!(got.nodes[1].parent_uri(), None);
+    db.drop_db().await;
+}
+
 /// One call the labelers' fake AppView received: the method, the
 /// `uris`/`uri` it asked for, its `atproto-accept-labelers`, and every
 /// header name and value it carried.

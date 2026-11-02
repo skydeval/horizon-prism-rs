@@ -596,8 +596,16 @@ impl Work<'_> {
                     let Some(resolved) = fetched.remove(&uri) else {
                         continue;
                     };
-                    if !matches!(resolved, Resolved::Gap(_)) {
-                        self.nodes[i] = self.ladder_node(resolved, &uri, parent);
+                    match resolved {
+                        // The post is gone or stripped: say so, rather than
+                        // a block the ordinary view reported for it.
+                        Resolved::Gap(found @ (Gap::Deleted | Gap::NotFound | Gap::ContentStripped)) => {
+                            if let LensNode::Gap { gap, .. } = &mut self.nodes[i] {
+                                *gap = found;
+                            }
+                        }
+                        Resolved::Gap(_) => {}
+                        post => self.nodes[i] = self.ladder_node(post, &uri, parent),
                     }
                 }
                 Some(Verdict::Undetermined) | None => self.limited = true,
@@ -627,6 +635,11 @@ impl Work<'_> {
                     None => h.lens_record_parent(self.r.req, uri).await?,
                 }
             }
+            // A deleted or missing post: only a link the response already
+            // has names its parent. No local row is read: a post hidden by
+            // moderation also reads as missing, and its place in the thread
+            // stays unsaid.
+            Some(LensNode::Gap { uri, gap: Gap::Deleted | Gap::NotFound, parent_uri, .. }) => parent_uri.clone().or_else(|| self.links.get(uri).cloned()),
             _ => None,
         })
     }
@@ -681,7 +694,9 @@ impl Work<'_> {
                     LensNode::gap(&parent, None, Gap::BlockStateUnknown)
                 }
             };
-            let goes_on = node.walkable();
+            // A deleted or missing post goes on only to a parent a link
+            // already names (`parent_of_top`).
+            let goes_on = node.walkable() || matches!(node, LensNode::Gap { gap: Gap::Deleted | Gap::NotFound, .. });
             self.seen.insert(parent);
             self.nodes.insert(0, node);
             self.budget -= 1;
@@ -689,6 +704,55 @@ impl Work<'_> {
                 return Ok(());
             }
         }
+    }
+
+    /// When the chain stops at a deleted or missing post whose parent is not
+    /// known, the thread root the anchor's reply names, placed root-most
+    /// and marked `gapBelow`: the posts in between are not known. Judged and
+    /// fetched as a parent is, within the same bounds; never a guessed
+    /// `parentUri`.
+    async fn root_across_gap(&mut self) -> Result<(), sqlx::Error> {
+        if !matches!(self.nodes.first(), Some(LensNode::Gap { gap: Gap::Deleted | Gap::NotFound, parent_uri: None, .. })) {
+            return Ok(());
+        }
+        let anchor = self.r.anchor;
+        let Some(root) = self.nodes.iter().find_map(|n| match n {
+            LensNode::Post { uri, root_uri: Some(root), .. } if uri == anchor => Some(root.clone()),
+            _ => None,
+        }) else {
+            return Ok(());
+        };
+        let chain = self.index(anchor).unwrap_or(0);
+        let height = usize::try_from(self.r.parent_height).unwrap_or(usize::MAX);
+        if self.seen.contains(&root) || chain >= height || self.budget == 0 || self.parent_rounds == 0 {
+            return Ok(());
+        }
+        let author = uri_author(&root).unwrap_or_default().to_string();
+        if gap_by_form(&root).is_none() {
+            self.parent_rounds -= 1;
+            let judged = self.judge.round(std::slice::from_ref(&author)).await?;
+            self.refresh_known();
+            if !judged {
+                return Ok(());
+            }
+        }
+        let verdict = self.judge.verdict(&author);
+        let mut node = match (gap_by_form(&root), block_gap(verdict), verdict) {
+            (Some(gap), ..) | (None, Some(gap), _) => LensNode::gap(&root, None, gap),
+            (None, None, Some(Verdict::Clear)) => {
+                let resolved = self.fetch(&root).await?;
+                self.ladder_node(resolved, &root, None)
+            }
+            _ => {
+                self.limited = true;
+                LensNode::gap(&root, None, Gap::BlockStateUnknown)
+            }
+        };
+        node.markers_mut().gap_below = true;
+        self.seen.insert(root);
+        self.nodes.insert(0, node);
+        self.budget -= 1;
+        Ok(())
     }
 
     /// The local phase of one node's reply sequence from `from` (§5.15.14):
@@ -1886,11 +1950,13 @@ pub async fn get_thread_outlined(
         match &outlined_tree {
             Some(tree) => {
                 work.tree_parents(tree).await?;
+                work.root_across_gap().await?;
                 phases.mark("parents");
                 work.tree_replies(tree).await?;
             }
             None => {
                 work.parents().await?;
+                work.root_across_gap().await?;
                 phases.mark("parents");
                 work.replies().await?;
             }

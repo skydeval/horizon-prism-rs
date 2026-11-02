@@ -191,6 +191,10 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Fixed
 
+- **Thread Lens:** a parent the ordinary thread view reports as blocked, but
+  that is deleted or missing, reads as `deleted` or `not-found`, not
+  `blocked`. When the chain stops at such a post, the thread's root comes
+  first, marked `gapBelow`.
 - **Admin:** Cancel on a confirmation returns to the page it came from, not
   Home. The health check for a relay in `firehose.private_relays` says the
   list is set in app.toml and links Running. Account and Look up links work
