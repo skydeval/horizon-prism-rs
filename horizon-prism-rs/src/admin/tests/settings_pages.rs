@@ -36,7 +36,7 @@ async fn settings_pages_and_their_forms() {
     let networks: Vec<String> = Vec::new();
     let mut homes: Vec<(String, &str)> = SETTINGS_LIVE.iter().map(|id| (id.page().href.to_string(), id.page().name)).collect();
     homes.extend(Group::ALL.into_iter().filter(|g| !view::sections_at(Place::Group(*g), &networks).is_empty()).map(|g| (format!("/admin/settings/{}", g.slug()), g.title())));
-    assert_eq!(homes.len(), 10);
+    assert_eq!(homes.len(), 11);
     for (path, title) in homes {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.get(&url(&path)).await;
@@ -46,15 +46,17 @@ async fn settings_pages_and_their_forms() {
     // Past the ten-pages-a-second limit (§5.6).
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let index = alice.get(&url("/admin/settings")).await;
-    assert!(index.body.contains("Set when Prism was installed") && index.body.contains("Who can use Prism"), "{}", index.body);
+    assert!(index.body.contains("Set when Prism was installed") && index.body.contains("What Prism stores") && !index.body.contains("Who can use Prism"), "{}", index.body);
     assert_eq!(alice.get(&url("/admin/settings/installed")).await.status, 200);
     let running = alice.get(&url("/admin/settings/running")).await;
     assert!(running.body.contains("[community]"), "{}", running.body);
     assert_eq!(alice.get(&url("/admin/settings/nowhere")).await.status, 404);
 
     // A live key, beside an unchanged field: one command with only the
-    // change and the form's version, by the operator.
-    let page = alice.get(&url("/admin/settings/access")).await;
+    // change and the form's version, by the operator, through the old
+    // group address, which still saves once its page redirects.
+    assert_eq!(alice.get(&url("/admin/settings/access")).await.status, 308);
+    let page = alice.get(&url("/admin/thread-lens")).await;
     assert!(page.body.contains("name=\"threadlens.access\"") && page.body.contains("Applies at once"), "{}", page.body);
     let csrf = csrf_of(&page);
     let saved = post(&alice, &url("/admin/settings/access"), &[("csrf", &csrf), ("threadlens.access", "members"), ("version:threadlens.access", "0"), ("community.max_members", "1000")]).await;

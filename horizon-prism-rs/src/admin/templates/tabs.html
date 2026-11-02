@@ -1,1 +1,1 @@
-{% if let Some(nav) = nav %}<nav class="tabs" aria-label="Communities · Refract">{% for t in nav.tabs() %}<a href="{{ t.href }}"{% if t.current %} aria-current="page"{% endif %}>{{ t.name }}</a>{% endfor %}</nav>{% endif %}
+{% if let Some(nav) = nav %}<nav class="tabs" aria-label="Communities · Refract">{% for t in nav.tabs() %}<a href="{{ t.href }}"{% if t.current %} aria-current="page"{% endif %}>{{ t.name }}{% if t.count > 0 %}<span class="pill">{{ t.count }}</span>{% endif %}</a>{% endfor %}</nav>{% endif %}

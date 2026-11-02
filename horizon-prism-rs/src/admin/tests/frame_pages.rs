@@ -7,7 +7,7 @@
 use std::path::Path as FsPath;
 
 use super::*;
-use crate::admin::menu::{self, MENU, PAGES, PageId, REDIRECTS, TABS};
+use crate::admin::menu::{self, GROUP_REDIRECTS, MENU, PAGES, PageId, REDIRECTS, TABS};
 use crate::admin::test_support::css::{self, Rule};
 use crate::admin::test_support::html::{self, Table};
 use crate::admin::test_support::{current_item, sidebar};
@@ -61,10 +61,11 @@ async fn every_menu_item_renders() {
     // A tag makes the title differ from the h1.
     let blocks = get(&alice, &format!("{}/admin/blocks", h.base)).await;
     assert!(blocks.body.contains("<title>Blocks · Farsight · Horizon-Prism admin</title>") && blocks.body.contains("<h1>Blocks</h1>"), "{}", blocks.body);
-    // The tabs: both h1 "Communities", their own titles, one tab marked.
+    // The tabs: each h1 "Communities", their own titles, one tab marked.
     for (path, title, current) in [
         ("/admin/communities", "Communities · Refract", "Communities"),
         ("/admin/communities/accounts", "Accounts · Communities · Refract", "Accounts"),
+        ("/admin/communities/pending", "Pending ends · Communities · Refract", "Pending ends"),
     ] {
         let page = get(&alice, &format!("{}{path}", h.base)).await;
         assert_eq!(page.status, 200, "{path}");
@@ -98,7 +99,12 @@ async fn the_sidebar_markup_is_the_mocks() {
         (
             "moderation",
             "Moderation",
-            &[("/admin/labels", "Labels", None), ("/admin/blocks", "Blocks", Some("Farsight")), ("/admin/communities", "Communities", Some("Refract"))],
+            &[
+                ("/admin/labels", "Labels", None),
+                ("/admin/blocks", "Blocks", Some("Farsight")),
+                ("/admin/communities", "Communities", Some("Refract")),
+                ("/admin/thread-lens", "Thread Lens", None),
+            ],
         ),
         ("data", "Data", &[("/admin/jobs", "Jobs", None), ("/admin/problems", "Problems", None)]),
         (
@@ -649,8 +655,9 @@ const TABLES: &[Expected] = &[
     ("/admin/operators", &[("Account", &["name", "text", "name", "when", "actions"]), ("Server", &["name", "text", "when", "actions"])]),
     ("/admin/lookup?q={BOB}", &[("On", &["name", "name", "when", "actions"]), ("Kind", &["state", "state", "num", "text", "when"])]),
     ("/admin/labels", &[("On", &["name", "name", "when", "actions"])]),
-    ("/admin/communities", &[("Community", &["name", "list", "name", "list", "list", "actions"]), ("Why", PENDING)]),
-    ("/admin/communities/accounts", &[("Account", ACCOUNTS), ("Why", PENDING)]),
+    ("/admin/communities", &[("Community", &["name", "list", "name", "list", "list", "actions"])]),
+    ("/admin/communities/accounts", &[("Account", ACCOUNTS)]),
+    ("/admin/communities/pending", &[("Why", PENDING)]),
     ("/admin/communities/accounts/{BOB}", &[("Labeler", &["name", "name", "name", "when", "when", "state", "state"]), ("When", &["when", "state", "state", "text"])]),
     ("/admin/jobs", &[("Kind", &["state", "num", "num", "num", "num", "num", "num"]), ("Why", &["text", "num"]), ("Account", &["name", "state", "num", "text", "when", "actions"])]),
     ("/admin/health", &[("Check", &["name", "state", "text"])]),
@@ -739,7 +746,20 @@ const OLD_PATHS: &[&str] = &[
     "/admin/settings/running",
     "/admin/settings/appearance",
     "/admin/settings/access",
+    "/admin/settings/storage",
+    "/admin/settings/private",
+    "/admin/settings/blocks",
+    "/admin/settings/apps",
+    "/admin/settings/services",
+    "/admin/settings/limits",
+    "/admin/settings/profiles",
+    "/admin/settings/lookups",
 ];
+
+/// Whether a path is an old address that redirects now.
+fn redirected(path: &str) -> bool {
+    REDIRECTS.iter().any(|(old, _, _)| *old == path) || path.strip_prefix("/admin/settings/").is_some_and(|slug| menu::group_redirect(slug).is_some())
+}
 
 /// The old paths of moved forms, which no page may post to: each also an
 /// old group's page, `/admin/settings/{slug}`.
@@ -802,6 +822,20 @@ async fn every_old_address_redirects() {
     }
     // Every row of the table is one of these.
     assert_eq!(REDIRECTS.len(), 5);
+    // Old group pages with no settings left: their slug's GET only, the
+    // query kept before the fragment.
+    for (slug, to, fragment) in GROUP_REDIRECTS {
+        for q in ["", "?open=advanced"] {
+            let old = format!("/admin/settings/{slug}{q}");
+            let page = get(&stranger, &url(&old)).await;
+            assert_eq!(page.status, 308, "{old}");
+            let want = if fragment.is_empty() { format!("{to}{q}") } else { format!("{to}{q}#{fragment}") };
+            assert_eq!(location(&page), Some(want.as_str()), "{old}");
+            assert_admin_headers(&page, &old);
+            assert_eq!(get(&alice, &url(&format!("{to}{q}"))).await.status, 200, "{to}{q}");
+        }
+    }
+    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access"]);
     // The encoded port reaches the account page as one DID.
     let account = get(&alice, &url("/admin/communities/accounts/did:web:h%253A8080")).await;
     assert!(account.body.contains("did:web:h%3A8080") && !account.body.contains("did:web:h:8080"), "{}", account.body);
@@ -828,7 +862,6 @@ async fn every_old_address_redirects() {
         "/admin/settings/%FF",
         "/admin/static/fonts/%FF",
         "/admin/settings/nowhere",
-        "/admin/settings/communities",
     ] {
         let page = get(&stranger, &url(path)).await;
         assert_eq!(page.status, 404, "{path}");
@@ -840,10 +873,14 @@ async fn every_old_address_redirects() {
     let nowhere = post(&alice, &url("/admin/settings/nowhere"), &[("csrf", &csrf_of(&settings)), ("retention.tombstone_days", "9")]).await;
     assert_eq!(nowhere.status, 404);
     assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_commands").await, before);
+    // A POST to the old communities slug, never a group page, saves nothing.
+    let communities = post(&alice, &url("/admin/settings/communities"), &[("csrf", &csrf_of(&settings)), ("refract.visitor_viewer_state", "off")]).await;
+    assert_eq!(communities.status, 404);
+    assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_commands").await, before);
     // A group with keys left is still its page.
-    let access = get(&alice, &url("/admin/settings/access")).await;
-    assert_eq!(access.status, 200);
-    assert_eq!(current_item(&access.body), Some(("All settings".to_string(), "true".to_string())), "{}", access.body);
+    let storage = get(&alice, &url("/admin/settings/storage")).await;
+    assert_eq!(storage.status, 200);
+    assert_eq!(current_item(&storage.body), Some(("All settings".to_string(), "true".to_string())), "{}", storage.body);
     h.db.drop_db().await;
 }
 
@@ -877,9 +914,7 @@ async fn only_built_pages_and_no_stale_links() {
     for old in OLD_PATHS {
         let page = get(&alice, &url(old)).await;
         assert!(page.status == 200 || page.status == 308, "{old}: {}", page.status);
-        if page.status == 308 {
-            assert!(REDIRECTS.iter().any(|(o, _, _)| o == old), "{old}");
-        }
+        assert_eq!(page.status == 308, redirected(old), "{old}: {}", page.status);
     }
     // The pages to read: every built page and tab, an account page with a
     // pending end, a command page, Installed, Running, a group page, the
@@ -895,7 +930,7 @@ async fn only_built_pages_and_no_stale_links() {
         "/admin/communities/accounts/did:plc:nobodynobodynobodynobody".to_string(),
         "/admin/settings/installed".to_string(),
         "/admin/settings/running".to_string(),
-        "/admin/settings/access".to_string(),
+        "/admin/settings/storage".to_string(),
         format!("/admin/lookup?q={BOB}"),
     ] {
         pages.push((path.clone(), get(&alice, &url(&path)).await));
@@ -921,14 +956,14 @@ async fn only_built_pages_and_no_stale_links() {
     for (path, page) in &pages {
         let body = &page.body;
         for (action, t) in targets(body) {
-            assert!(!REDIRECTS.iter().any(|(old, _, _)| *old == t), "{path} links {t}");
+            assert!(!redirected(&t), "{path} links {t}");
             assert!(!t.starts_with(menu::OLD_ACCOUNT_PREFIX), "{path} links {t}");
             assert!(!(action && is_alias(&t)), "{path} posts to {t}");
         }
         assert!(!body.contains("style="), "{path}: an inline style");
         assert!(!body.contains("tabindex"), "{path}: a tab index");
         assert_eq!(body.contains("<script"), path == "/admin", "{path}: scripts");
-        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join"] {
+        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join", "Blocks (Farsight)", "Who can use Prism", "Fallback and memory settings"] {
             assert!(!body.contains(old), "{path}: an old name, {old}");
         }
         assert!(current_item(body).is_some(), "{path}: not exactly one marked item: {}", sidebar(body));
@@ -947,9 +982,10 @@ async fn sub_pages_mark_their_parent() {
     for (path, item) in [
         ("/admin/communities/accounts".to_string(), "Communities"),
         (menu::account_href(BOB), "Communities"),
+        ("/admin/communities/pending".to_string(), "Communities"),
         ("/admin/settings/installed".to_string(), "All settings"),
         ("/admin/settings/running".to_string(), "All settings"),
-        ("/admin/settings/access".to_string(), "All settings"),
+        ("/admin/settings/storage".to_string(), "All settings"),
     ] {
         let page = get(&alice, &format!("{}{path}", h.base)).await;
         assert_eq!(page.status, 200, "{path}");
@@ -990,9 +1026,22 @@ async fn moved_forms_check_the_token() {
         "/admin/refract/end",
         "/admin/settings/save",
         "/admin/settings/access",
+        "/admin/settings/blocks",
+        "/admin/communities/keep",
     ] {
         let target = format!("{}{path}", h.base);
-        let fields = [("mode", "dark"), ("scheme", "teal"), ("input", CAROL), ("did", BOB), ("confirm", "yes"), ("typed", "bbbbbbbb"), ("community.max_members", "5")];
+        let fields = [
+            ("mode", "dark"),
+            ("scheme", "teal"),
+            ("input", CAROL),
+            ("did", BOB),
+            ("confirm", "yes"),
+            ("typed", "bbbbbbbb"),
+            ("community.max_members", "5"),
+            ("farsight.memory.max_total", "5"),
+            ("scope", "feature"),
+            ("keep", "true"),
+        ];
         let mut with = vec![("csrf", other.as_str())];
         with.extend(fields);
         let mut own = vec![("csrf", csrf.as_str())];

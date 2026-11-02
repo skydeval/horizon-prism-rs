@@ -187,17 +187,33 @@ async fn communities_page() {
     assert_eq!(current_item(&page.body), Some(("Communities".to_string(), "page".to_string())), "{}", page.body);
     for text in [
         "<strong>community-a</strong>",
-        "Pending ends",
+        "1 pending end, hidden now and ended unless kept — <a href=\"/admin/communities/pending\">Pending ends</a>",
         "Add a community",
         "<title>Communities · Refract · Horizon-Prism admin</title>",
         "<p class=\"eyebrow\">Moderation · Refract</p>",
         "<h1>Communities</h1>",
-        "<nav class=\"tabs\" aria-label=\"Communities · Refract\"><a href=\"/admin/communities\" aria-current=\"page\">Communities</a><a href=\"/admin/communities/accounts\">Accounts</a></nav>",
+        "<nav class=\"tabs\" aria-label=\"Communities · Refract\"><a href=\"/admin/communities\" aria-current=\"page\">Communities</a><a href=\"/admin/communities/accounts\">Accounts</a><a href=\"/admin/communities/pending\">Pending ends<span class=\"pill\">1</span></a></nav>",
         "on <a href=\"/admin/communities/accounts\">the Accounts tab</a>",
     ] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
     assert!(!page.body.contains("href=\"/admin/refract"), "{}", page.body);
+    // The pending ends are on their own tab, with Keep and Release.
+    assert!(!page.body.contains("action=\"/admin/communities/keep\"") && !page.body.contains("<th class=\"name\">Why</th>"), "{}", page.body);
+    let tab = get(&alice, &format!("{}/admin/communities/pending", h.base)).await;
+    assert_eq!(tab.status, 200, "{}", tab.body);
+    assert_eq!(current_item(&tab.body), Some(("Communities".to_string(), "true".to_string())), "{}", tab.body);
+    for text in [
+        "<title>Pending ends · Communities · Refract · Horizon-Prism admin</title>",
+        "<p class=\"eyebrow\">Moderation · Refract</p>",
+        "<h1>Communities</h1>",
+        "<a href=\"/admin/communities/pending\" aria-current=\"page\">Pending ends<span class=\"pill\">1</span></a>",
+        "<code class=\"chip\">feature</code>",
+        "action=\"/admin/communities/keep\"",
+        ">Keep</button>",
+    ] {
+        assert!(tab.body.contains(text), "{text}: {}", tab.body);
+    }
     let csrf = csrf_of(&page);
     let toggle = format!("{}/admin/communities/toggle", h.base);
     let before = count(p, "SELECT count(*) FROM admin_commands").await;
@@ -270,14 +286,13 @@ async fn refract_accounts_page() {
         BOB_HANDLE,
         CAROL,
         "fetching, 1 collection fetched, now app.bsky.feed.post",
-        "Pending ends",
-        ">Release</button>",
         "<main id=\"main\" class=\"wide\">",
         "<table class=\"dense\">",
     ] {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
     assert!(!page.body.contains("action=\"/admin/communities/accounts/add\"") && !page.body.contains("Refract accounts"), "{}", page.body);
+    assert!(!page.body.contains("action=\"/admin/communities/keep\"") && !page.body.contains("<th class=\"name\">Why</th>"), "no pending table here: {}", page.body);
     let csrf = csrf_of(&page);
     let before = count(p, "SELECT count(*) FROM admin_commands").await;
     let refused = post(&alice, &url("add"), &[("csrf", &csrf), ("input", DAN)]).await;
@@ -310,7 +325,7 @@ async fn refract_accounts_page() {
     for text in [
         "<p class=\"eyebrow\">Moderation · Refract</p>",
         "<a href=\"/admin/communities/accounts\">All accounts</a>",
-        "See <a href=\"/admin/communities/accounts\">Pending ends</a>",
+        "See <a href=\"/admin/communities/pending\">Pending ends</a>",
         "action=\"/admin/communities/accounts/check\"",
         "action=\"/admin/communities/accounts/end\"",
         "restored: kept and served",
@@ -363,7 +378,9 @@ async fn refract_accounts_page() {
     assert!(ran.body.contains(&format!("href=\"{account}\"")), "{}", ran.body);
     assert_eq!(current_item(&ran.body), Some(("Audit log".to_string(), "true".to_string())), "{}", ran.body);
 
-    // Pending ends: release.
+    // Pending ends: released from their tab.
+    let pending = get(&alice, &format!("{}/admin/communities/pending", h.base)).await;
+    assert!(pending.body.contains(">Release</button>"), "{}", pending.body);
     let release = post(&alice, &format!("{}/admin/communities/keep", h.base), &[("csrf", &csrf), ("scope", "feature"), ("keep", "false")]).await;
     assert_eq!(release.status, 303, "{}", release.body);
     assert_eq!(newest(p).await, ("refract keep".to_string(), json!({"scope": "feature", "keep": false}), Some(ALICE.to_string())));

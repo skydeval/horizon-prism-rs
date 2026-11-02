@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block main_class %} class="wide"{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+{% include "tabs.html" %}
+<p class="muted">When Refract is turned off, or a community is disabled, removed or given other servers, its restored
+accounts are hidden at once and ended at the time shown. Keep holds them hidden without ending them; Release starts
+their time again.</p>
+<div class="scroll">
+<table class="dense">
+<thead><tr><th class="name">Why</th><th class="num">Accounts</th><th class="when">Since</th><th class="when">Ends</th><th class="actions"></th></tr></thead>
+<tbody>
+{% for p in pending %}
+<tr>
+<td class="name"><code class="chip">{{ p.scope }}</code></td>
+<td class="num">{{ p.dids }}</td>
+<td class="when">{{ p.since }}</td>
+<td class="when">{{ p.ends }}</td>
+<td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
+</tr>
+{% else %}
+<tr><td colspan="5" class="muted">No pending ends.</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">The same from the command line: <code>admin refract keep|unkeep &lt;scope&gt;</code>.</p>
+{% endblock %}

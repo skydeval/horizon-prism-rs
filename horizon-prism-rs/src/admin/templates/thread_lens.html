@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Thread Lens is a thread view for Horizon apps that keeps the conversation: a block hides one author's
+posts, never the thread around them. Its lookups of who blocks whom go to Farsight, set up on
+<a href="/admin/blocks">Blocks</a>.</p>
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
+{% endblock %}

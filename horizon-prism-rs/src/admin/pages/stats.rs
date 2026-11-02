@@ -23,7 +23,7 @@ use crate::firehose::feed::{Kind, Outcome, Source, Totals};
 const UNKNOWN: &str = "unknown";
 
 fn fig(label: &str, value: impl Into<String>) -> Figure {
-    Figure { label: label.to_string(), value: value.into() }
+    Figure { label: label.to_string(), value: value.into(), link: None }
 }
 
 /// A disk as the page shows it.

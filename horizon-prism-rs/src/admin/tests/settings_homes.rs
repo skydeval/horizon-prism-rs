@@ -78,9 +78,13 @@ async fn every_key_renders_on_one_page() {
         }
     }
     for g in Group::ALL {
-        // Every old group still has settings on its page.
-        assert!(!view::sections_at(Place::Group(g), &networks).is_empty(), "{}", g.slug());
-        paths.push(format!("/admin/settings/{}", g.slug()));
+        // A group with settings left is its page; one with none redirects.
+        let path = format!("/admin/settings/{}", g.slug());
+        if view::sections_at(Place::Group(g), &networks).is_empty() {
+            assert_eq!(get(&alice, &url(&path)).await.status, 308, "{path}");
+        } else {
+            paths.push(path);
+        }
     }
     for path in paths {
         let page = get(&alice, &url(&path)).await;
@@ -208,15 +212,121 @@ async fn saving_from_members() {
     let folded = post(&alice, &save, &[("csrf", &csrf), back, ("community.never_ready_expiry_days", "12"), ("version:community.never_ready_expiry_days", "0")]).await;
     assert_eq!(folded.status, 303, "{}", folded.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "community.never_ready_expiry_days", "value": 12, "base_version": 0}]})));
-    // The old group address saves the same way, any setting.
+    // The old group address saves the same way, any setting, also once its
+    // page redirects.
+    assert_eq!(get(&alice, &url("/admin/settings/access")).await.status, 308);
     let old = post(&alice, &url("/admin/settings/access"), &[("csrf", &csrf), ("community.max_members", "1234"), ("version:community.max_members", "0")]).await;
     assert_eq!(old.status, 303, "{}", old.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "community.max_members", "value": 1234, "base_version": 0}]})));
-    // A typed change confirms through the one save.
-    let typed = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/settings/blocks"), ("farsight.fallback.enabled", "on")]).await;
-    assert_eq!(typed.status, 200, "{}", typed.body);
-    assert!(typed.body.contains("action=\"/admin/settings/save\"") && typed.body.contains("<code>ON</code>"), "{}", typed.body);
-    assert_eq!(field(&typed.body, "back").as_deref(), Some("/admin/settings/blocks"));
+    assert_eq!(get(&alice, &url("/admin/settings/blocks")).await.status, 308);
+    let old = post(&alice, &url("/admin/settings/blocks"), &[("csrf", &csrf), ("farsight.memory.max_total", "4321"), ("version:farsight.memory.max_total", "0")]).await;
+    assert_eq!(old.status, 303, "{}", old.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "farsight.memory.max_total", "value": 4321, "base_version": 0}]})));
+    h.db.drop_db().await;
+}
+
+/// Blocks, Communities and Thread Lens hold their settings, the rarely
+/// changed ones folded. Turning the fallback on from Blocks asks ON, keeps
+/// Cancel on Blocks through a wrong word and queues on the right one; a
+/// typed reset from Blocks asks OFF; keep works from there too.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn moderation_pages_hold_their_settings() {
+    let Some(h) = harness("admin_homes_moderation").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    let url = |path: &str| format!("{}{path}", h.base);
+    let pages: [(&str, &[&str], &[&str]); 3] = [
+        (
+            "/admin/blocks",
+            &["farsight.fallback.enabled", "farsight.fallback.network", "farsight.memory.enabled", "farsight.memory.retention_hours", "farsight.memory.max_per_viewer", "farsight.memory.max_total"],
+            &["farsight.rate_per_sec", "farsight.burst"],
+        ),
+        ("/admin/communities", &["refract.visitor_viewer_state"], &["rate_limits.refract.per_sec", "rate_limits.refract.burst"]),
+        ("/admin/thread-lens", &["threadlens.access"], &["rate_limits.thread_lens.per_sec", "rate_limits.thread_lens.burst"]),
+    ];
+    for (path, everyday, advanced) in pages {
+        let page = get(&alice, &url(path)).await;
+        assert_eq!(page.status, 200, "{path}: {}", page.body);
+        let body = &page.body;
+        assert!(body.contains("<form id=\"settings\" class=\"stack\" method=\"post\" action=\"/admin/settings/save\">"), "{path}: {body}");
+        assert!(body.contains("<details class=\"advanced\" id=\"advanced\"><summary>Advanced</summary>"), "{path}: {body}");
+        for key in everyday {
+            assert!(!folded(body, key), "{path}: {key} is folded");
+        }
+        for key in advanced {
+            assert!(folded(body, key), "{path}: {key} is not folded");
+        }
+        let opened = get(&alice, &url(&format!("{path}?open=advanced"))).await;
+        assert!(opened.body.contains("<details class=\"advanced\" id=\"advanced\" open>"), "{path}: {}", opened.body);
+    }
+    // Health keeps Farsight to one line, which leads to Blocks.
+    let health = get(&alice, &url("/admin/health")).await;
+    let line = &health.body[health.body.find("<span class=\"l\">Farsight (blocks)</span>").expect("farsight line")..];
+    let line = &line[..line.find("</div>").expect("line end")];
+    assert!(line.ends_with(" — <a href=\"/admin/blocks\">Blocks</a></span>"), "{line}");
+    assert_eq!(health.body.matches("Farsight (blocks)").count(), 1, "{}", health.body);
+    let blocks = get(&alice, &url("/admin/blocks")).await;
+    assert!(!blocks.body.contains("/admin/settings/blocks") && !blocks.body.contains("Fallback and memory settings"), "{}", blocks.body);
+    let csrf = csrf_of(&blocks);
+    let save = url("/admin/settings/save");
+    let before = queued(p).await.len();
+
+    // The fallback on: asked first, Cancel back to Blocks, then queued.
+    let ask = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/blocks"), ("farsight.fallback.enabled", "on"), ("version:farsight.fallback.enabled", "0")]).await;
+    assert_eq!(ask.status, 200, "{}", ask.body);
+    assert!(ask.body.contains("action=\"/admin/settings/save\"") && ask.body.contains("<code>ON</code>"), "{}", ask.body);
+    assert_eq!(field(&ask.body, "back").as_deref(), Some("/admin/blocks"));
+    assert_eq!(field(&ask.body, "farsight.fallback.enabled").as_deref(), Some("on"));
+    assert_eq!(link_before(&ask.body, "Cancel"), "/admin/blocks");
+    assert_eq!(crate::admin::test_support::current_item(&ask.body), Some(("Blocks".to_string(), "page".to_string())));
+    let wrong = post(
+        &alice,
+        &save,
+        &[("csrf", &csrf), ("back", "/admin/blocks"), ("farsight.fallback.enabled", "on"), ("version:farsight.fallback.enabled", "0"), ("confirm", "yes"), ("typed", "nope")],
+    )
+    .await;
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    assert_eq!(field(&wrong.body, "back").as_deref(), Some("/admin/blocks"));
+    assert_eq!(link_before(&wrong.body, "Cancel"), "/admin/blocks");
+    assert_eq!(queued(p).await.len(), before, "nothing queued unconfirmed");
+    let right = post(
+        &alice,
+        &save,
+        &[("csrf", &csrf), ("back", "/admin/blocks"), ("farsight.fallback.enabled", "on"), ("version:farsight.fallback.enabled", "0"), ("confirm", "yes"), ("typed", "ON")],
+    )
+    .await;
+    assert_eq!(right.status, 303, "{}", right.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "farsight.fallback.enabled", "value": true, "base_version": 0}]})));
+
+    // A typed reset from Blocks: the memory saved on, app.toml's off.
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by) VALUES ('farsight.memory.enabled', 'true', 'cli')").execute(p).await.expect("row");
+    let blocks = get(&alice, &url("/admin/blocks")).await;
+    assert!(blocks.body.contains("<form id=\"reset-farsight.memory.enabled\" method=\"post\" action=\"/admin/settings/reset\">"), "{}", blocks.body);
+    let before = queued(p).await.len();
+    let reset = post(&alice, &url("/admin/settings/reset"), &[("csrf", &csrf), ("key", "farsight.memory.enabled"), ("version", "1"), ("back", "/admin/blocks")]).await;
+    assert_eq!(reset.status, 200, "{}", reset.body);
+    assert!(reset.body.contains("<code>OFF</code>"), "{}", reset.body);
+    assert_eq!(link_before(&reset.body, "Cancel"), "/admin/blocks");
+    assert_eq!(queued(p).await.len(), before, "a typed reset asks first");
+    let done = post(&alice, &url("/admin/settings/reset"), &[("csrf", &csrf), ("key", "farsight.memory.enabled"), ("version", "1"), ("confirm", "yes"), ("typed", "OFF")]).await;
+    assert_eq!(done.status, 303, "{}", done.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "farsight.memory.enabled", "reset": true, "base_version": 1}]})));
+
+    // Keep, from Blocks, once app.toml changed under a saved value.
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by, file_notice, file_value) VALUES ('farsight.memory.retention_hours', '48', 'cli', true, '{\"value\": 12, \"explicit\": true}')")
+        .execute(p)
+        .await
+        .expect("notice");
+    let blocks = get(&alice, &url("/admin/blocks")).await;
+    assert!(blocks.body.contains("Keep my value"), "{}", blocks.body);
+    let home = get(&alice, &url("/admin")).await;
+    assert!(home.body.contains("href=\"/admin/blocks#s-farsight-memory-retention_hours\""), "{}", home.body);
+    let keep = post(&alice, &url("/admin/settings/keep"), &[("csrf", &csrf), ("key", "farsight.memory.retention_hours"), ("version", "1")]).await;
+    assert_eq!(keep.status, 303, "{}", keep.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "farsight.memory.retention_hours", "value": 48, "base_version": 1}]})));
     h.db.drop_db().await;
 }
 
@@ -291,7 +401,9 @@ async fn the_command_page_leads_back() {
     for (key, value, follow, name) in [
         ("community.max_members", "5", "/admin/members#s-community-max_members", "Back to Members"),
         ("community.reindex_retry_secs", "7", "/admin/members?open=advanced#s-community-reindex_retry_secs", "Back to Members"),
-        ("threadlens.access", "members", "/admin/settings/access#s-threadlens-access", "Back to Who can use Prism"),
+        ("threadlens.access", "members", "/admin/thread-lens#s-threadlens-access", "Back to Thread Lens"),
+        ("farsight.burst", "77", "/admin/blocks?open=advanced#s-farsight-rate_per_sec", "Back to Blocks"),
+        ("rate_limits.refract.burst", "77", "/admin/communities?open=advanced#s-rate_limits-refract-per_sec", "Back to Communities"),
     ] {
         let version = format!("version:{key}");
         let saved = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
@@ -316,12 +428,19 @@ async fn all_settings_lists_where_settings_are() {
     let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
     let own = &own[..own.find("</div>").expect("card end")];
     let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(hrefs, ["/admin/members", "/admin/communities"], "{own}");
-    assert!(own.contains(">Communities · Refract</a>"), "{own}");
+    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens"], "{own}");
+    assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
+    let networks: Vec<String> = Vec::new();
     for g in Group::ALL {
-        assert!(body.contains(&format!("<h2><a href=\"/admin/settings/{}\">{}</a></h2>", g.slug(), g.title())), "{}", g.slug());
+        let card = format!("<h2><a href=\"/admin/settings/{}\">{}</a></h2>", g.slug(), g.title());
+        assert_eq!(body.contains(&card), !view::sections_at(Place::Group(g), &networks).is_empty(), "{}", g.slug());
     }
-    assert!(body.contains("<h2><a href=\"/admin/settings/access\">Who can use Prism</a></h2>\n<p class=\"muted\">Who may use Thread Lens</p>"), "{body}");
+    assert!(!body.contains("Who can use Prism") && !body.contains("Blocks (Farsight)") && !body.contains("/admin/settings/blocks"), "{body}");
+    // A group that lost some settings names only those left.
+    assert!(body.contains("<h2><a href=\"/admin/settings/limits\">Limits</a></h2>"), "{body}");
+    let limits = &body[body.find("/admin/settings/limits").expect("limits")..];
+    let limits = &limits[..limits.find("</p>").expect("summary")];
+    assert!(limits.contains("Visitors not signed in") && !limits.contains("Thread Lens") && !limits.contains("Accounts kept from other communities"), "{limits}");
     h.db.drop_db().await;
 }
 

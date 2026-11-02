@@ -7,7 +7,7 @@
 <div class="banner">Refract is off: nothing is checked and no account is kept. Turn it on on <a href="/admin/communities">the Communities tab</a>.</div>
 {% endif %}
 {% if !pending.is_empty() %}
-<div class="banner">Hidden while a pending end runs: {% for p in pending %}<code>{{ p }}</code>{% if !loop.last %}, {% endif %}{% endfor %}. See <a href="/admin/communities/accounts">Pending ends</a>.</div>
+<div class="banner">Hidden while a pending end runs: {% for p in pending %}<code>{{ p }}</code>{% if !loop.last %}, {% endif %}{% endfor %}. See <a href="/admin/communities/pending">Pending ends</a>.</div>
 {% endif %}
 <div class="grid">
 <div class="card">

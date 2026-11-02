@@ -154,7 +154,7 @@ struct InstancePage {
 }
 
 fn fig(label: &str, value: impl Into<String>) -> Figure {
-    Figure { label: label.to_string(), value: value.into() }
+    Figure { label: label.to_string(), value: value.into(), link: None }
 }
 
 /// A URL's host, else the text itself.

@@ -31,8 +31,11 @@ blocks made through lists are not applied.</div>
 {% endfor %}
 {% for f in memory %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
 {% endfor %}
-<p><a href="/admin/settings/blocks">Fallback and memory settings</a></p>
+<p class="muted">The fallback and the memory of blocks are <a href="#settings">set below</a>.</p>
 </div>
 </div>
 {% endif %}
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
 {% endblock %}

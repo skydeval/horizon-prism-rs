@@ -12,14 +12,17 @@
 //! - A change that would make restored accounts pending removal (the
 //!   switch off, a community disabled, removed, or given other servers)
 //!   says how many first and asks for confirmation.
-//! - Pending ends with Keep and Unkeep (`refract keep`/`unkeep`).
+//! - Its settings: visitors' own likes, and, folded, Refract's request
+//!   limit.
+//! - The Pending ends tab (`/admin/communities/pending`): pending ends with
+//!   Keep and Release (`refract keep`/`unkeep`).
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use askama::Template;
 use axum::Form;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde::Deserialize;
@@ -28,8 +31,10 @@ use serde_json::Value;
 use super::{Confirm, Nav, back_to, confirmed, css, enqueue, hidden_field, message, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
-use crate::admin::menu::Tab;
+use crate::admin::menu::{PageId, Tab};
+use crate::admin::pages::settings::OpenQuery;
 use crate::admin::settings::store::Change;
+use crate::admin::settings::view::{self as settings_view, Place, SettingsBlock};
 use crate::admin_executor::AdminCommand;
 use crate::config::{LabelSource, RefractCommunity, default_gone_labels};
 
@@ -111,9 +116,22 @@ struct CommunitiesPage {
     csrf: String,
     enabled: bool,
     communities: Vec<CommunityView>,
-    pending: Vec<PendingView>,
+    /// How many pending ends there are; the Pending ends tab lists them.
+    pending: i64,
     unlisted: Vec<Unlisted>,
     file_changes: Vec<FileChange>,
+    /// Visitors' own likes, and Refract's request limit.
+    settings: SettingsBlock,
+}
+
+#[derive(Template)]
+#[template(path = "refract_pending.html")]
+struct PendingPage {
+    css: &'static str,
+    nav: Option<Nav>,
+    title: String,
+    csrf: String,
+    pending: Vec<PendingView>,
 }
 
 /// This page's two settings whose `app.toml` value changed under the saved
@@ -188,7 +206,7 @@ fn view(c: &RefractCommunity, counts: &HashMap<(String, String), i64>) -> Commun
 }
 
 /// `GET /admin/communities`.
-pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
         Err(response) => return response,
@@ -198,8 +216,13 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Ok(c) => c,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let pending = match super::refract::pending(&state).await {
-        Ok(p) => p,
+    let pending = match super::refract::pending_count(&state).await {
+        Ok(n) => n,
+        Err(e) => return super::internal_error(&state, &e),
+    };
+    let sections = settings_view::sections_at(Place::Page(PageId::Communities), &state.settings.networks());
+    let settings = match settings_view::settings_block(&state, &op.csrf, &sections, q.open.as_deref() == Some("advanced")).await {
+        Ok(b) => b,
         Err(e) => return super::internal_error(&state, &e),
     };
     let mut unlisted: Vec<Unlisted> = Vec::new();
@@ -220,7 +243,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &CommunitiesPage {
             css: css(),
-            nav: Some(Nav::tab(&op, Tab::Communities)),
+            nav: Some(Nav::tab_with(&op, Tab::Communities, pending)),
             title: "Communities".to_string(),
             csrf: op.csrf.clone(),
             enabled,
@@ -228,6 +251,31 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             pending,
             unlisted,
             file_changes,
+            settings,
+        },
+    )
+}
+
+/// `GET /admin/communities/pending`: the pending ends, each kept or
+/// released here.
+pub async fn pending_page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+    let op = match require(&state, &headers, peer, Need::Page, None).await {
+        Ok(op) => op,
+        Err(response) => return response,
+    };
+    let pending = match super::refract::pending(&state).await {
+        Ok(p) => p,
+        Err(e) => return super::internal_error(&state, &e),
+    };
+    let n = i64::try_from(pending.len()).unwrap_or(i64::MAX);
+    render(
+        StatusCode::OK,
+        &PendingPage {
+            css: css(),
+            nav: Some(Nav::tab_with(&op, Tab::Pending, n)),
+            title: PageId::Communities.page().name.to_string(),
+            csrf: op.csrf.clone(),
+            pending,
         },
     )
 }

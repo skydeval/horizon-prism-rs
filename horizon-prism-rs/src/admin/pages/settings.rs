@@ -11,8 +11,8 @@ use std::net::SocketAddr;
 
 use askama::Template;
 use axum::Form;
-use axum::extract::rejection::PathRejection;
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::rejection::{PathRejection, QueryRejection};
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
@@ -215,15 +215,23 @@ pub struct OpenQuery {
 }
 
 /// `GET /admin/settings/{group}`: a group's page, with the settings whose
-/// feature page does not hold them yet. Any other slug, or a segment that
-/// is not text, is the plain 404 page, without a session.
+/// feature page does not hold them yet; a group with none left answers
+/// `308` to the page that holds most of them, without a session. Any other
+/// slug, or a segment that is not text, is the plain 404 page, without a
+/// session.
 pub async fn group(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     slug: Result<Path<String>, PathRejection>,
-    Query(q): Query<OpenQuery>,
+    RawQuery(raw): RawQuery,
+    q: Result<Query<OpenQuery>, QueryRejection>,
 ) -> Response {
+    if let Ok(Path(s)) = &slug
+        && let Some((to, fragment)) = menu::group_redirect(s)
+    {
+        return crate::admin::moved_to(to, raw.as_deref(), fragment).await;
+    }
     let Some(group) = old_group(slug) else {
         return super::not_found().await;
     };
@@ -233,7 +241,8 @@ pub async fn group(
     };
     let ctx = &state.settings;
     let sections = view::sections_at(Place::Group(group), &ctx.networks());
-    let settings = match view::settings_block(&state, &op.csrf, &sections, q.open.as_deref() == Some("advanced")).await {
+    let open = q.is_ok_and(|Query(q)| q.open.as_deref() == Some("advanced"));
+    let settings = match view::settings_block(&state, &op.csrf, &sections, open).await {
         Ok(b) => b,
         Err(e) => return super::internal_error(&state, &e),
     };

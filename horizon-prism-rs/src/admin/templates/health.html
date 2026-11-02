@@ -29,7 +29,7 @@
 {% for g in groups %}
 <div class="card">
 <h3>{{ g.title }}</h3>
-{% for f in g.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% for f in g.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}{% if let Some(link) = f.link %} — <a href="{{ link.0 }}">{{ link.1 }}</a>{% endif %}</span></div>
 {% endfor %}
 {% if !g.note.is_empty() %}<p class="muted">{{ g.note }}</p>{% endif %}
 </div>

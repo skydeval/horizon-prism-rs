@@ -185,7 +185,7 @@ async fn menu_order_and_product_name() {
     assert_eq!(home.status, 200, "{}", home.body);
     assert_eq!(
         menu(&home.body),
-        ["Home", "Members", "Operators", "Look up", "Labels", "Blocks", "Communities", "Jobs", "Problems", "Health", "Stats", "About this server", "Audit log", "All settings"]
+        ["Home", "Members", "Operators", "Look up", "Labels", "Blocks", "Communities", "Thread Lens", "Jobs", "Problems", "Health", "Stats", "About this server", "Audit log", "All settings"]
     );
     assert_eq!(current_item(&home.body), Some(("Home".to_string(), "page".to_string())), "{}", home.body);
     // The name: the brand, the title, Home's card.

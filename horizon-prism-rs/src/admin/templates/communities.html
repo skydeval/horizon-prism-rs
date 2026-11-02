@@ -51,25 +51,8 @@ To use app.toml's instead, change it below.
 <p class="muted">Accounts of communities no longer listed: {% for u in unlisted %}{{ u.name }} ({{ u.count }}){% if !loop.last %}, {% endif %}{% endfor %}.</p>
 {% endif %}
 
-{% if !pending.is_empty() %}
-<h2>Pending ends</h2>
-<p class="muted">These accounts are hidden now and end at the time shown, unless kept.</p>
-<div class="scroll">
-<table class="dense">
-<thead><tr><th class="name">Why</th><th class="num">Accounts</th><th class="when">Since</th><th class="when">Ends</th><th class="actions"></th></tr></thead>
-<tbody>
-{% for p in pending %}
-<tr>
-<td class="name"><code>{{ p.scope }}</code></td>
-<td class="num">{{ p.dids }}</td>
-<td class="when">{{ p.since }}</td>
-<td class="when">{{ p.ends }}</td>
-<td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-</div>
+{% if pending > 0 %}
+<p>{{ pending }} pending end{% if pending != 1 %}s{% endif %}, hidden now and ended unless kept — <a href="/admin/communities/pending">Pending ends</a></p>
 {% endif %}
 
 <h2>Edit</h2>
@@ -109,6 +92,8 @@ To use app.toml's instead, change it below.
 </form>
 </div>
 </div>
+<h2>Settings</h2>
+{% include "settings_block.html" %}
 <p class="muted">The same from the command line: <code>admin settings set refract.communities '&lt;json&gt;'</code>,
 <code>admin settings set refract.enabled true</code>, and <code>admin refract status</code>.</p>
 {% endblock %}

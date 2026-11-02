@@ -114,7 +114,7 @@ pub const PAGES: &[Page] = &[
 pub const MENU: &[(SectionKey, &[PageId])] = &[
     (SectionKey::Overview, &[PageId::Home]),
     (SectionKey::People, &[PageId::Members, PageId::Operators, PageId::LookUp]),
-    (SectionKey::Moderation, &[PageId::Labels, PageId::Blocks, PageId::Communities]),
+    (SectionKey::Moderation, &[PageId::Labels, PageId::Blocks, PageId::Communities, PageId::ThreadLens]),
     (SectionKey::Data, &[PageId::Jobs, PageId::Problems]),
     (SectionKey::System, &[PageId::Health, PageId::Stats, PageId::About, PageId::Audit, PageId::Settings]),
 ];
@@ -122,7 +122,7 @@ pub const MENU: &[(SectionKey, &[PageId])] = &[
 /// The pages that hold their own settings now. Every other key still
 /// renders on its old settings group page, apart from the Communities
 /// page's own forms.
-pub const SETTINGS_LIVE: &[PageId] = &[PageId::Members];
+pub const SETTINGS_LIVE: &[PageId] = &[PageId::Members, PageId::Blocks, PageId::Communities, PageId::ThreadLens];
 
 /// A tab of Communities · Refract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -133,7 +133,7 @@ pub enum Tab {
 }
 
 /// The tabs built so far, in order.
-pub const TABS: &[Tab] = &[Tab::Communities, Tab::Accounts];
+pub const TABS: &[Tab] = &[Tab::Communities, Tab::Accounts, Tab::Pending];
 
 impl Tab {
     #[must_use]
@@ -258,6 +258,22 @@ pub const REDIRECTS: &[(&str, &str, &str)] = &[
     ("/admin/activity", "/admin/audit", ""),
 ];
 
+/// Old settings group pages with no settings left on them, `/admin/settings/{slug}`:
+/// the slug, the page holding most of what was there, and the fragment.
+/// They answer `308` to a GET; a POST to one of the old slugs still saves.
+pub const GROUP_REDIRECTS: &[(&str, &str, &str)] = &[
+    ("communities", "/admin/communities", ""),
+    ("blocks", "/admin/blocks", "settings"),
+    ("access", "/admin/members", "settings"),
+];
+
+/// Where an old group slug's GET now goes, once its page has no settings
+/// left.
+#[must_use]
+pub fn group_redirect(slug: &str) -> Option<(&'static str, &'static str)> {
+    GROUP_REDIRECTS.iter().find(|(s, _, _)| *s == slug).map(|(_, to, fragment)| (*to, *fragment))
+}
+
 /// The old account pages, `/admin/refract/{did}`, redirected to
 /// [`account_href`].
 pub const OLD_ACCOUNT_PREFIX: &str = "/admin/refract/";
@@ -358,7 +374,7 @@ pub fn safe_back(back: &str) -> bool {
         return !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
     }
     if let Some(slug) = path.strip_prefix("/admin/settings/") {
-        return matches!(slug, "installed" | "running") || OLD_GROUP_SLUGS.contains(&slug);
+        return matches!(slug, "installed" | "running") || (OLD_GROUP_SLUGS.contains(&slug) && group_redirect(slug).is_none());
     }
     false
 }
@@ -439,7 +455,7 @@ mod tests {
                 assert_eq!(id.page().section, Some(*key), "{id:?}");
             }
         }
-        assert_eq!(menu.len(), 14);
+        assert_eq!(menu.len(), 15);
     }
 
     #[test]
@@ -453,7 +469,8 @@ mod tests {
         assert_eq!(Tab::Communities.title(), "Communities · Refract");
         assert_eq!(Tab::Accounts.title(), "Accounts · Communities · Refract");
         assert!(PageId::Blocks.built() && PageId::Appearance.built() && !PageId::Storage.built());
-        assert!(Tab::Accounts.built() && !Tab::Pending.built());
+        assert!(Tab::Accounts.built() && Tab::Pending.built() && PageId::ThreadLens.built());
+        assert_eq!(Tab::Pending.title(), "Pending ends · Communities · Refract");
         // A page holds its settings only once it is built.
         assert!(SETTINGS_LIVE.iter().all(|id| id.built()));
     }
@@ -475,6 +492,8 @@ mod tests {
         assert_eq!(locate("/admin/communities"), Some((PageId::Communities, Current::Page, Some(Tab::Communities))));
         assert_eq!(locate("/admin/communities/accounts?state=restored"), Some((PageId::Communities, Current::Parent, Some(Tab::Accounts))));
         assert_eq!(locate("/admin/communities/accounts/did:plc:abc"), Some((PageId::Communities, Current::Parent, Some(Tab::Accounts))));
+        assert_eq!(locate("/admin/communities/pending"), Some((PageId::Communities, Current::Parent, Some(Tab::Pending))));
+        assert_eq!(locate("/admin/thread-lens"), Some((PageId::ThreadLens, Current::Page, None)));
         assert_eq!(locate("/admin/commands/12"), Some((PageId::Audit, Current::Parent, None)));
         assert_eq!(locate("/admin/settings/running"), Some((PageId::Settings, Current::Parent, None)));
         assert_eq!(locate("/admin/appearance"), Some((PageId::Appearance, Current::Page, None)));
@@ -492,8 +511,10 @@ mod tests {
             "/admin/communities/accounts?state=restored",
             "/admin/commands/12",
             "/admin/settings/running",
-            "/admin/settings/access",
+            "/admin/settings/storage",
             "/admin/appearance",
+            "/admin/communities/pending",
+            "/admin/thread-lens",
         ] {
             assert!(safe_back(ok), "{ok}");
         }
@@ -516,7 +537,9 @@ mod tests {
             "/admin/commands/12a",
             "/admin/commands/",
             "/admin/storage",
-            "/admin/communities/pending",
+            "/admin/settings/access",
+            "/admin/settings/blocks",
+            "/admin/settings/communities",
             "/admin/settings/nowhere",
             "/admin/members#x",
             "/admin//members",
@@ -535,5 +558,11 @@ mod tests {
             assert!(PageId::at(old).is_none() && !TABS.iter().any(|t| t.href() == *old), "{old} is a page");
             assert!(PageId::at(new).is_some() || TABS.iter().any(|t| t.href() == *new), "{new} is not a built page");
         }
+        for (slug, new, _) in GROUP_REDIRECTS {
+            assert!(OLD_GROUP_SLUGS.contains(slug) || *slug == "communities", "{slug}");
+            assert!(PageId::at(new).is_some(), "{new} is not a built page");
+        }
+        assert_eq!(group_redirect("blocks"), Some(("/admin/blocks", "settings")));
+        assert_eq!(group_redirect("storage"), None);
     }
 }

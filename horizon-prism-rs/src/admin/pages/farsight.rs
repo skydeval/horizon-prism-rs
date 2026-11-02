@@ -1,16 +1,16 @@
-//! Blocks (Farsight) (`/admin/farsight`, admin-ui design §6.8): Farsight's
-//! own report in brief and what Prism holds itself, the content of `admin
-//! farsight status`, read directly (it writes nothing) and kept for 30
-//! seconds; whether Farsight is down; the fallback and the memory of
-//! blocks, each with a link to its settings. Per-member actions belong to
-//! the members page.
+//! Blocks · Farsight (`/admin/blocks`): Farsight's own report in brief
+//! and what Prism holds itself, the content of `admin farsight status`,
+//! read directly (it writes nothing) and kept for 30 seconds; whether
+//! Farsight is down; the fallback and the memory of blocks; then their
+//! settings, with Farsight's lookup rate folded. Per-member actions belong
+//! to the members page.
 
 use std::net::SocketAddr;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use askama::Template;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
@@ -19,6 +19,9 @@ use super::{Nav, css, render};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
 use crate::admin::health::count;
+use crate::admin::menu::PageId;
+use crate::admin::pages::settings::OpenQuery;
+use crate::admin::settings::view::{self, Place, SettingsBlock};
 
 /// How long Farsight's report is reused.
 pub const KEEP: Duration = Duration::from_secs(30);
@@ -64,6 +67,8 @@ struct FarsightPage {
     local: Vec<Fact>,
     fallback: Vec<Fact>,
     memory: Vec<Fact>,
+    /// The fallback, the memory and the lookup rate.
+    settings: SettingsBlock,
 }
 
 fn yes_no(v: Option<&Value>) -> String {
@@ -78,15 +83,20 @@ fn num(v: Option<&Value>) -> String {
     v.and_then(Value::as_f64).map_or_else(|| "unknown".to_string(), count)
 }
 
-/// `GET /admin/farsight`.
-pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+/// `GET /admin/blocks`.
+pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
         Err(response) => return response,
     };
+    let sections = view::sections_at(Place::Page(PageId::Blocks), &state.settings.networks());
+    let settings = match view::settings_block(&state, &op.csrf, &sections, q.open.as_deref() == Some("advanced")).await {
+        Ok(b) => b,
+        Err(e) => return super::internal_error(&state, &e),
+    };
     let mut page = FarsightPage {
         css: css(),
-        nav: Some(Nav::page(&op, crate::admin::menu::PageId::Blocks)),
+        nav: Some(Nav::page(&op, PageId::Blocks)),
         title: "Blocks".to_string(),
         configured: false,
         answering: false,
@@ -96,6 +106,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         local: Vec::new(),
         fallback: Vec::new(),
         memory: Vec::new(),
+        settings,
     };
     let Some(farsight) = state.health.farsight.clone() else {
         return render(StatusCode::OK, &page);

@@ -25,8 +25,9 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | People | Operators | Operators and allowed sign-in hosts. |
 | People | Look up | Look up an account and what Horizon-Prism holds for it, including its Refract state. |
 | Moderation | Labels | Labels the operator applied; add and remove. |
-| Moderation | Blocks · Farsight | Farsight's status (when configured). |
-| Moderation | Communities · Refract | Refract (when used): the communities, and an Accounts tab with each account. |
+| Moderation | Blocks · Farsight | Farsight's status (when configured); the fallback and the memory of blocks. |
+| Moderation | Communities · Refract | Refract (when used): the communities and visitors' own likes, an Accounts tab with each account, and a Pending ends tab. |
+| Moderation | Thread Lens | Who may use Thread Lens, and its request limit. |
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
 | Data | Problems | Dead letters and stream state; replay or drop. |
 | System | Health | Database, Redis, relays, disk and background checks. |

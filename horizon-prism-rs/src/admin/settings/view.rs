@@ -275,3 +275,18 @@ pub async fn settings_block(state: &AdminState, csrf: &str, sections: &[Section]
     let open = open_query || advanced.iter().flat_map(|s| &s.fields).any(|f| f.set_aside.is_some() || f.file_notice.is_some() || f.running.is_some());
     Ok(SettingsBlock { csrf: csrf.to_string(), everyday: everyday.into_iter().map(|s| section_view(s, &rows, ctx)).collect(), advanced, open })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::menu::group_redirect;
+
+    /// An old group page redirects exactly when no setting is left on it.
+    #[test]
+    fn empty_groups_redirect() {
+        for g in Group::ALL {
+            assert_eq!(sections_at(Place::Group(g), &[]).is_empty(), group_redirect(g.slug()).is_some(), "{}", g.slug());
+        }
+        assert!(sections_at(Place::Group(Group::Communities), &[]).is_empty() && group_redirect("communities").is_some());
+    }
+}

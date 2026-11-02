@@ -21,6 +21,7 @@ pub mod refract;
 pub mod settings;
 pub mod setup;
 pub mod stats;
+pub mod thread_lens;
 
 use askama::Template;
 use axum::http::header::REFERER;
@@ -64,6 +65,8 @@ pub struct Nav {
     pub banners: Banners,
     /// The classes of `<html>`: the operator's own look.
     pub theme: String,
+    /// The pending ends, counted on the Pending ends tab's link.
+    pub pending_ends: i64,
 }
 
 /// A heading of the sidebar with its items.
@@ -87,6 +90,8 @@ pub struct TabLink {
     pub href: &'static str,
     pub name: &'static str,
     pub current: bool,
+    /// A count beside the name, shown when above 0.
+    pub count: i64,
 }
 
 impl Nav {
@@ -101,6 +106,7 @@ impl Nav {
             title_from,
             banners: op.banners,
             theme: op.theme.class(),
+            pending_ends: 0,
         }
     }
 
@@ -188,10 +194,19 @@ impl Nav {
         self.current.eyebrow()
     }
 
-    /// The Communities tabs, the current one marked.
+    /// A Communities tab, with the count its Pending ends link shows.
+    #[must_use]
+    pub fn tab_with(op: &Operator, tab: Tab, pending_ends: i64) -> Self {
+        Self { pending_ends, ..Self::tab(op, tab) }
+    }
+
+    /// The Communities tabs, the current one marked, Pending ends with its
+    /// count.
     #[must_use]
     pub fn tabs(&self) -> Vec<TabLink> {
-        TABS.iter().map(|t| TabLink { href: t.href(), name: t.name(), current: self.tab == Some(*t) }).collect()
+        TABS.iter()
+            .map(|t| TabLink { href: t.href(), name: t.name(), current: self.tab == Some(*t), count: if *t == Tab::Pending { self.pending_ends } else { 0 } })
+            .collect()
     }
 }
 

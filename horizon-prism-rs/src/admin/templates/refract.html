@@ -71,28 +71,6 @@ an ending one's data here is being deleted. The communities themselves are on <a
 {% if let Some(n) = next %}<a class="button secondary" href="{{ n }}">Next</a>{% endif %}
 </div>
 
-<h2>Pending ends</h2>
-<p class="muted">When Refract is turned off, or a community is disabled, removed or given other servers, its restored
-accounts are hidden at once and ended at the time shown. Keep holds them hidden without ending them; Release starts
-their time again.</p>
-<div class="scroll">
-<table class="dense">
-<thead><tr><th class="name">Why</th><th class="num">Accounts</th><th class="when">Since</th><th class="when">Ends</th><th class="actions"></th></tr></thead>
-<tbody>
-{% for p in pending %}
-<tr>
-<td class="name"><code class="chip">{{ p.scope }}</code></td>
-<td class="num">{{ p.dids }}</td>
-<td class="when">{{ p.since }}</td>
-<td class="when">{{ p.ends }}</td>
-<td class="actions"><form class="inline" method="post" action="/admin/communities/keep"><input type="hidden" name="csrf" value="{{ csrf }}"><input type="hidden" name="scope" value="{{ p.scope }}">{% if p.keep %}<input type="hidden" name="keep" value="false"><button class="secondary" type="submit">Release</button>{% else %}<input type="hidden" name="keep" value="true"><button class="secondary" type="submit">Keep</button>{% endif %}</form></td>
-</tr>
-{% else %}
-<tr><td colspan="5" class="muted">No pending ends.</td></tr>
-{% endfor %}
-</tbody>
-</table>
-</div>
-<p class="muted">The same from the command line: <code>admin refract list</code>, <code>admin refract check &lt;did&gt;</code>,
-<code>admin refract end &lt;did&gt;</code>, <code>admin refract keep|unkeep &lt;scope&gt;</code>.</p>
+<p class="muted">The same from the command line: <code>admin refract list</code>, <code>admin refract check &lt;did&gt;</code>
+and <code>admin refract end &lt;did&gt;</code>.</p>
 {% endblock %}

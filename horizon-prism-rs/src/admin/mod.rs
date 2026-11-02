@@ -387,6 +387,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/communities/toggle", route(post(pages::communities::toggle)))
         .route("/communities/remove", route(post(pages::communities::remove)))
         .route("/communities/keep", route(post(pages::communities::keep)))
+        .route("/communities/pending", route(get(pages::communities::pending_page)))
+        .route("/thread-lens", route(get(pages::thread_lens::page)))
         .route("/communities/accounts", route(get(pages::refract::page)))
         .route("/communities/accounts/add", route(post(pages::refract::add)))
         .route("/communities/accounts/check", route(post(pages::refract::check)))

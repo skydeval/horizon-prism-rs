@@ -3,10 +3,9 @@
 //! Refract knows, with its community, state, checks and, once restored, how
 //! far the fetch of its history has got. Add an account (a handle or a
 //! DID: `refract check`, so it becomes a candidate checked now), check one
-//! again, remove a restored one (`refract end`, typed: its handle), and
-//! keep or release pending ends (`refract keep`/`unkeep`). One account's
-//! page shows what `admin refract show` does. Handles come from stored
-//! `actors` rows, so a page makes no outbound call.
+//! again, and remove a restored one (`refract end`, typed: its handle).
+//! One account's page shows what `admin refract show` does. Handles come
+//! from stored `actors` rows, so a page makes no outbound call.
 
 use std::net::SocketAddr;
 
@@ -65,7 +64,6 @@ struct RefractPage {
     page: i64,
     prev: Option<String>,
     next: Option<String>,
-    pending: Vec<PendingView>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,7 +114,20 @@ const JOB_JOIN: &str = "LEFT JOIN backfill_jobs j ON j.did = d.did AND j.depth =
 
 type ListTuple = (String, Option<String>, String, String, Option<DateTime<Utc>>, Option<DateTime<Utc>>, DateTime<Utc>, Option<String>, Option<Value>, Option<String>);
 
-/// The pending ends (§4.6), as the Communities page shows them.
+/// How many pending ends there are, for the Pending ends tab's link.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn pending_count(state: &AdminState) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT count(*) FROM refract_pending").fetch_one(&state.pool).await
+}
+
+/// The pending ends, as the Pending ends tab shows them.
+///
+/// # Errors
+///
+/// Database errors.
 pub async fn pending(state: &AdminState) -> Result<Vec<PendingView>, sqlx::Error> {
     let rows: Vec<(String, DateTime<Utc>, bool, i64)> = sqlx::query_as(
         "SELECT p.scope, p.first_seen, p.keep, (SELECT count(*) FROM refract_pending_dids d WHERE d.scope = p.scope) FROM refract_pending p ORDER BY p.scope",
@@ -199,8 +210,8 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Ok(r) => r,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let pending = match pending(&state).await {
-        Ok(p) => p,
+    let pending = match pending_count(&state).await {
+        Ok(n) => n,
         Err(e) => return super::internal_error(&state, &e),
     };
     let live = state.settings.live.load();
@@ -234,7 +245,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         StatusCode::OK,
         &RefractPage {
             css: css(),
-            nav: Some(Nav::tab(&op, Tab::Accounts)),
+            nav: Some(Nav::tab_with(&op, Tab::Accounts, pending)),
             title: PageId::Communities.page().name.to_string(),
             csrf: op.csrf.clone(),
             enabled: live.refract_enabled,
@@ -247,7 +258,6 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             rows,
             total,
             page,
-            pending,
         },
     )
 }

@@ -53,10 +53,12 @@ impl From<Check> for CheckView {
 pub struct Figure {
     pub label: String,
     pub value: String,
+    /// The page this figure's subject has, and its name, after a dash.
+    pub link: Option<(&'static str, &'static str)>,
 }
 
 fn fig(label: &str, value: impl Into<String>) -> Figure {
-    Figure { label: label.to_string(), value: value.into() }
+    Figure { label: label.to_string(), value: value.into(), link: None }
 }
 
 /// A titled group of figures.
@@ -245,7 +247,10 @@ fn figures(state: &AdminState, now: Option<&Snapshot>, stored: Stored) -> Vec<Fi
 
     groups.push(FigureGroup {
         title: "Services Prism asks",
-        figures: vec![fig("Farsight (blocks)", farsight_words(state)), fig("Lodestar (account lookups)", lookups_words(state))],
+        figures: vec![
+            Figure { link: Some(("/admin/blocks", "Blocks")), ..fig("Farsight (blocks)", farsight_words(state)) },
+            fig("Lodestar (account lookups)", lookups_words(state)),
+        ],
         note: String::new(),
     });
 
