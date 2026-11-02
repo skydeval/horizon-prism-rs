@@ -1,10 +1,12 @@
-//! All settings (`/admin/settings`): the index of every page that holds
-//! settings, and the one save every settings form posts to. A save sends
-//! one `settings set` command with every changed field; the executor
-//! validates the whole configuration before anything is saved. The old
-//! settings group addresses redirect to the pages that took their
-//! settings. Two read-only pages: what was set at install, and everything
-//! Prism is running with. And the restart.
+//! All settings (`/admin/settings`): every setting, searched by words or
+//! technical name, each linking to the page it is changed on; the saved
+//! values that could not be used, the changes waiting for a restart and the
+//! `app.toml` changes; and the restart. Also the one save every settings
+//! form posts to. A save sends one `settings set` command with every
+//! changed field; the executor validates the whole configuration before
+//! anything is saved. The old settings group addresses redirect to the
+//! pages that took their settings. Two read-only pages: what was set at
+//! install, and everything Prism is running with.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -12,19 +14,19 @@ use std::net::SocketAddr;
 use askama::Template;
 use axum::Form;
 use axum::extract::rejection::PathRejection;
-use axum::extract::{ConnectInfo, Path, RawQuery, State};
+use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
 
-use super::{ConfirmPage, Hidden, Link, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches};
+use super::{ConfirmPage, Hidden, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
 use crate::admin::menu::{self, MENU, PageId};
 use crate::admin::settings::SettingsContext;
 use crate::admin::settings::overlay;
 use crate::admin::settings::registry;
-use crate::admin::settings::store::{self, Change, Row};
+use crate::admin::settings::store::{self, Change, PUBLIC_SCOPE_KEY, Row};
 use crate::admin::settings::view::{self, href, saved_rows, saved_value};
 use crate::admin_executor::AdminCommand;
 
@@ -34,10 +36,35 @@ struct IndexPage {
     css: &'static str,
     nav: Option<Nav>,
     title: String,
-    /// The pages that hold their own settings.
-    own: Vec<Link>,
+    csrf: String,
+    /// The search's words, as asked.
+    q: String,
+    /// The settings the search found, or every setting without one.
+    found: Vec<Entry>,
     aside: Vec<Notice>,
     waiting: Vec<Notice>,
+    /// `app.toml` changed under these saved values.
+    file: Vec<Notice>,
+    /// Prism runs under a supervisor, so it can restart itself.
+    supervised: bool,
+}
+
+/// One setting as the search lists it.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub name: String,
+    /// Where it is changed.
+    pub href: String,
+    /// "Page › section".
+    pub place: String,
+    pub key: String,
+    /// Its value now, in words.
+    pub value: String,
+    /// Folded under Advanced on its page.
+    pub advanced: bool,
+    /// Lower-cased: its name, field label, section title and help, and its
+    /// page's name, which the search's words are found in.
+    words: String,
 }
 
 /// A read-only row: what, its value, and why it is fixed.
@@ -100,25 +127,93 @@ pub async fn file_notices(state: &AdminState) -> Result<Vec<Notice>, sqlx::Error
         .collect())
 }
 
-/// The pages that hold their own settings, in the menu's order: every
-/// page some setting belongs on.
-fn own_pages(ctx: &SettingsContext) -> Vec<Link> {
-    let sections = registry::sections(&ctx.networks());
-    MENU.iter()
-        .flat_map(|(_, ids)| ids.iter())
-        .filter(|id| sections.iter().any(|s| s.home == **id))
-        .map(|id| Link { href: id.page().href.to_string(), label: id.title() })
+/// The public-data switch as the search lists it: not a registry key, its
+/// form is Indexing's own.
+fn public_scope_entry(community: bool) -> Entry {
+    let page = PageId::Indexing.title();
+    let (title, help) = ("Public data", "What Prism indexes: Kryphocron only, or Community, which also keeps public posts and interactions.");
+    Entry {
+        name: title.to_string(),
+        href: format!("{}#public-scope", PageId::Indexing.page().href),
+        place: format!("{page} › {title}"),
+        key: PUBLIC_SCOPE_KEY.to_string(),
+        value: if community { "Community" } else { "Kryphocron only" }.to_string(),
+        advanced: false,
+        words: format!("{title}\n{help}\n{page}").to_lowercase(),
+    }
+}
+
+/// Every setting, by page in the menu's order and within a page in the
+/// registry's, the public-data switch first on Indexing.
+#[must_use]
+pub fn catalog(ctx: &SettingsContext, rows: &BTreeMap<String, Row>, community: bool) -> Vec<Entry> {
+    let rctx = ctx.registry();
+    let sections = registry::sections(&rctx.networks);
+    let mut out = Vec::new();
+    for id in MENU.iter().flat_map(|(_, ids)| ids.iter()) {
+        if *id == PageId::Indexing {
+            out.push(public_scope_entry(community));
+        }
+        let page = id.title();
+        for s in sections.iter().filter(|s| s.home == *id) {
+            for f in &s.fields {
+                let name = if s.fields.len() == 1 { s.title.clone() } else { format!("{} ({})", s.title, f.label.to_lowercase()) };
+                let value = registry::words(&f.kind, &saved_value(&f.key, rows, ctx), &rctx);
+                out.push(Entry {
+                    words: format!("{name}\n{}\n{}\n{}\n{page}", f.label, s.title, s.help).to_lowercase(),
+                    name,
+                    href: href(&f.key, ctx),
+                    place: format!("{page} › {}", s.title),
+                    key: f.key.clone(),
+                    value,
+                    advanced: s.advanced,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The entries every word of `q` is found in, lower-cased and split on
+/// spaces: in the setting's name, label, section title or help, its page's
+/// name, or its technical name. A word holding `.` or `_` is looked for in
+/// technical names only. No words: every entry.
+#[must_use]
+pub fn search(entries: Vec<Entry>, q: &str) -> Vec<Entry> {
+    let words: Vec<String> = q.split_whitespace().map(str::to_lowercase).collect();
+    entries
+        .into_iter()
+        .filter(|e| {
+            let key = e.key.to_lowercase();
+            words.iter().all(|w| key.contains(w.as_str()) || (!w.contains(['.', '_']) && e.words.contains(w.as_str())))
+        })
         .collect()
 }
 
-/// `GET /admin/settings`.
-pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
+/// All settings' query.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct SearchQuery {
+    /// The search's words.
+    #[serde(default)]
+    pub q: String,
+}
+
+/// `GET /admin/settings`, searched with `?q=`.
+pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Query(query): Query<SearchQuery>) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
         Ok(op) => op,
         Err(response) => return response,
     };
     let saved = match store::rows(&state.pool).await {
         Ok(r) => r,
+        Err(e) => return super::internal_error(&state, &e),
+    };
+    let file = match file_notices(&state).await {
+        Ok(n) => n,
+        Err(e) => return super::internal_error(&state, &e),
+    };
+    let community = match super::indexing::community_chosen(&state).await {
+        Ok(on) => on,
         Err(e) => return super::internal_error(&state, &e),
     };
     let ctx = &state.settings;
@@ -141,15 +236,21 @@ pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
             Notice { name: setting_name(&key), href: href(&key, ctx), text }
         })
         .collect();
+    let q = query.q.trim().to_string();
+    let found = search(catalog(ctx, &by_key, community), &q);
     render(
         StatusCode::OK,
         &IndexPage {
             css: css(),
             nav: Some(Nav::page(&op, PageId::Settings)),
             title: "All settings".to_string(),
-            own: own_pages(ctx),
+            csrf: op.csrf.clone(),
+            q,
+            found,
             aside,
             waiting,
+            file,
+            supervised: ctx.env.supervised,
         },
     )
 }

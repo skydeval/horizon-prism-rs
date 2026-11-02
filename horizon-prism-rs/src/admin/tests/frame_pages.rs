@@ -645,6 +645,10 @@ async fn seed(h: &Harness) {
         .execute(p)
         .await
         .expect("aside");
+    q("INSERT INTO operator_settings (key, value, updated_by, file_notice, file_value) VALUES ('cache.profile_ttl_secs', '60', 'cli', true, '{\"value\": 30, \"explicit\": true}')")
+        .execute(p)
+        .await
+        .expect("file notice");
     let _ = crate::admin::usage::path("app", "app.bsky.feed.getTimeline");
     let _ = crate::admin::usage::path("test", "test.frame.neverUsed");
     h.usage.load_registry();
@@ -699,7 +703,11 @@ const TABLES: &[Expected] = &[
     ("/admin/stats", &[("Request", &["name", "num", "num", "num", "num", "num", "num", "when"]), ("Request", &["name"])]),
     ("/admin/about", &[("Method", &["name", "text"])]),
     ("/admin/audit", &[("When", &["when", "name", "text", "text"]), ("When", &["when", "name", "text", "name"])]),
-    ("/admin/settings", &[("Setting", &["name", "text"]), ("Setting", &["name", "text"])]),
+    (
+        "/admin/settings",
+        &[("Setting", &["name", "text", "name", "text", "state"]), ("Setting", &["name", "text"]), ("Setting", &["name", "text"]), ("Setting", &["name", "text"])],
+    ),
+    ("/admin/settings?q=background", &[("Setting", &["name", "text", "name", "text", "state"]), ("Setting", &["name", "text"]), ("Setting", &["name", "text"]), ("Setting", &["name", "text"])]),
     ("/admin/settings/installed", &[("What", &["name", "text", "text"])]),
 ];
 

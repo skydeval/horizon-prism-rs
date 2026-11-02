@@ -4,6 +4,26 @@
 <p class="muted">Each page lists its settings with what they do, the value saved now and the default. Some apply at once;
 the others apply after a restart. Every change is recorded in the audit log.</p>
 
+<form class="filters" method="get" action="/admin/settings">
+<input type="text" name="q" value="{{ q }}" spellcheck="false" placeholder="Words, or a technical name" aria-label="Find a setting">
+<button type="submit">Search</button>
+</form>
+{% if found.is_empty() %}
+<p id="found">No setting you can change here matches. Everything Prism runs with is on
+<a href="/admin/settings/running">Running</a>.</p>
+{% else %}
+<h2 id="found">{% if q.is_empty() %}Every setting{% else %}Settings that match{% endif %}</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="name">Setting</th><th class="text">Where</th><th class="name">Technical name</th><th class="text">Value now</th><th class="state"></th></tr></thead>
+<tbody>
+{% for e in found %}<tr><td class="name"><a href="{{ e.href }}">{{ e.name }}</a></td><td class="text"><div class="cell-text">{{ e.place }}</div></td><td class="name"><code>{{ e.key }}</code></td><td class="text"><div class="cell-text">{{ e.value }}</div></td><td class="state">{% if e.advanced %}Advanced{% endif %}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+{% endif %}
+
 {% if !aside.is_empty() %}
 <h2 id="aside">Saved settings that could not be used</h2>
 <div class="banner bad">When Prism last started, these saved values did not work with the rest of the settings, so Prism
@@ -32,16 +52,28 @@ used the values from app.toml instead. Change or clear them on their page.</div>
 </div>
 {% endif %}
 
-<div class="card">
-<h2>On their own pages</h2>
-<p class="muted">Each page holds its settings beside what it shows.</p>
-<ul>{% for p in own %}<li><a href="{{ p.href }}">{{ p.label }}</a></li>{% endfor %}</ul>
+{% if !file.is_empty() %}
+<h2 id="file">Settings whose app.toml value changed</h2>
+<div class="scroll">
+<table>
+<thead><tr><th class="name">Setting</th><th class="text">What happened</th></tr></thead>
+<tbody>
+{% for n in file %}<tr><td class="name"><a href="{{ n.href }}">{{ n.name }}</a></td><td class="text"><div class="cell-text">{{ n.text }}</div></td></tr>
+{% endfor %}
+</tbody>
+</table>
 </div>
+{% endif %}
 
-<h2>Yours alone</h2>
-<div class="card">
-<p><a href="/admin/appearance">Appearance</a>, under your name in the menu: light, dark or as your device is, the colours
-and the font of these pages. Saved for your account only, and not recorded in the audit log.</p>
+<div class="card" id="restart">
+<h2>Restart Prism</h2>
+{% if supervised %}
+<p>A restart applies the changes waiting for one. Prism is unavailable for about a minute.</p>
+<form method="post" action="/admin/restart"><input type="hidden" name="csrf" value="{{ csrf }}">
+<button class="secondary" type="submit">Restart Prism…</button></form>
+{% else %}
+<p>Prism cannot restart itself on this server; ask whoever runs it.</p>
+{% endif %}
 </div>
 
 <h2>Read only</h2>

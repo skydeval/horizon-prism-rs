@@ -17,6 +17,8 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
   earlier release needs the database restored from before the upgrade, or
   the 0061 row removed from `_sqlx_migrations` and
   `admin_operators.theme_font` dropped.
+- **Admin: All settings** searches every setting by words or technical name,
+  and offers Restart when Prism runs under a supervisor.
 - **Compact storage groundwork.** Shared account ids, a fixed collection
   list and record-key, reference and record codecs, for the smaller storage
   layout coming in the next releases. Nothing is stored differently yet.

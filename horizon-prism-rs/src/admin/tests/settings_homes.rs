@@ -1,8 +1,8 @@
 //! Settings on their feature pages over HTTP: every key renders on exactly
 //! one page; Members holds its settings, with the Advanced fold; the one
 //! save, reset and keep work from it and from the old group address; the
-//! command page leads back; All settings lists where everything is; Look up
-//! shows an account's Refract state.
+//! command page leads back; All settings finds every setting and offers the
+//! restart; Look up shows an account's Refract state.
 
 use serde_json::{Value, json};
 
@@ -752,50 +752,163 @@ async fn the_command_page_leads_back() {
     h.db.drop_db().await;
 }
 
-/// All settings lists every page that holds settings, in the menu's order,
-/// and no group is left.
+/// The search table's rows: each setting's link, technical name and
+/// whether it is folded under Advanced.
+fn found(body: &str) -> Vec<(String, String, bool)> {
+    let Some(start) = body.find("<h2 id=\"found\">") else {
+        return Vec::new();
+    };
+    let table = &body[start..];
+    let table = &table[..table.find("</table>").expect("table end")];
+    table
+        .split("<tr><td")
+        .skip(1)
+        .map(|row| {
+            let href = &row[row.find("href=\"").expect("link") + 6..];
+            let href = &href[..href.find('"').expect("link end")];
+            let key = &row[row.find("<code>").expect("key") + 6..row.find("</code>").expect("key end")];
+            (href.to_string(), key.to_string(), row.contains("<td class=\"state\">Advanced</td>"))
+        })
+        .collect()
+}
+
+/// One list of All settings, from its heading to its table's end.
+fn list<'a>(body: &'a str, id: &str) -> &'a str {
+    let start = body.find(&format!("<h2 id=\"{id}\">")).unwrap_or_else(|| panic!("no list {id}: {body}"));
+    let end = body[start..].find("</table>").map_or(body.len(), |e| start + e);
+    &body[start..end]
+}
+
+/// All settings: every setting once, by page in the menu's order, each
+/// linking where it is changed; the search by words, in any case, and by
+/// technical name; the three lists, each linking to its setting; the
+/// restart card without a supervisor; and no script.
 #[tokio::test]
-async fn all_settings_lists_where_settings_are() {
+#[allow(clippy::too_many_lines)]
+async fn all_settings_searches_every_setting() {
     let Some(h) = harness("admin_homes_index").await else {
+        return;
+    };
+    let alice = complete_setup(&h, ALICE).await;
+    let p = h.pool();
+    let url = |q: &str| format!("{}/admin/settings{q}", h.base);
+    let ctx = crate::admin::settings::SettingsContext::from_file(test_support::no_auto_join());
+    let menu_at = |href: &str| {
+        let path = href.split(['?', '#']).next().unwrap_or_default();
+        MENU.iter().flat_map(|(_, ids)| ids.iter()).position(|id| id.page().href == path).unwrap_or_else(|| panic!("{href} is no menu page"))
+    };
+
+    // No words: every key exactly once, and the public-data switch.
+    let index = get(&alice, &url("")).await;
+    assert_eq!(index.status, 200, "{}", index.body);
+    assert!(index.body.contains("<h2 id=\"found\">Every setting</h2>"), "{}", index.body);
+    let all = found(&index.body);
+    let mut keys: Vec<String> = all.iter().map(|r| r.1.clone()).collect();
+    let mut want = registry::keys(&ctx.networks());
+    want.push("indexing.public_scope".to_string());
+    assert_eq!(keys.len(), want.len(), "{keys:?}");
+    keys.sort();
+    want.sort();
+    assert_eq!(keys, want);
+    // A network's own keys are there, by their technical names.
+    assert!(ctx.networks().iter().filter(|n| n.as_str() != crate::config::COMMUNITY_NETWORK).all(|n| all.iter().any(|r| r.1 == format!("constellation.networks[{n}].background_burst"))));
+    // Each links where it is changed, the folded ones with the fold open.
+    for (link, key, advanced) in &all {
+        if key == "indexing.public_scope" {
+            assert_eq!(link, "/admin/indexing#public-scope");
+            assert!(!advanced);
+            continue;
+        }
+        assert_eq!(*link, view::href(key, &ctx), "{key}");
+        let (section, _) = registry::lookup(key, &ctx.networks()).expect("key");
+        assert_eq!(*advanced, section.advanced, "{key}");
+        assert_eq!(link.contains("?open=advanced"), section.advanced, "{key}");
+    }
+    // By page, in the menu's order.
+    let order: Vec<usize> = all.iter().map(|r| menu_at(&r.0)).collect();
+    assert!(order.windows(2).all(|w| w[0] <= w[1]), "{order:?}");
+    // The switch's anchor is on Indexing.
+    let indexing = get(&alice, &format!("{}/admin/indexing", h.base)).await;
+    assert!(indexing.body.contains("id=\"public-scope\""), "{}", indexing.body);
+
+    // Words, from the name, the help or the page.
+    let limit = found(&get(&alice, &url("?q=member+limit")).await.body);
+    assert!(limit.contains(&("/admin/members#s-community-max_members".to_string(), "community.max_members".to_string(), false)), "{limit:?}");
+    // A technical name, matched against technical names only.
+    let by_key = found(&get(&alice, &url("?q=max_members")).await.body);
+    assert_eq!(by_key, [("/admin/members#s-community-max_members".to_string(), "community.max_members".to_string(), false)]);
+    // Farsight's lookup rate: folded, and linked with the fold open.
+    let rate = found(&get(&alice, &url("?q=farsight%20rate")).await.body);
+    assert!(rate.contains(&("/admin/blocks?open=advanced#s-farsight-rate_per_sec".to_string(), "farsight.rate_per_sec".to_string(), true)), "{rate:?}");
+    // In any case.
+    let floors = get(&alice, &url("?q=FLOOR")).await;
+    assert!(floors.body.contains("<h2 id=\"found\">Settings that match</h2>") && floors.body.contains("value=\"FLOOR\""), "{}", floors.body);
+    let floors = found(&floors.body);
+    assert!(floors.iter().filter(|r| r.1.starts_with("private_read.floor_ms.")).count() == 12 && floors.iter().all(|r| r.2 || r.1.starts_with("bookmarks.")), "{floors:?}");
+    let only = found(&get(&alice, &url("?q=floor_ms")).await.body);
+    assert!(only.len() == 12 && only.iter().all(|r| r.1.starts_with("private_read.floor_ms.")), "{only:?}");
+    // Nothing found: where everything Prism runs with is.
+    let none = get(&alice, &url("?q=zzz")).await;
+    assert!(found(&none.body).is_empty() && !none.body.contains("<table"), "{}", none.body);
+    assert!(none.body.contains("No setting you can change here matches. Everything Prism runs with is on\n<a href=\"/admin/settings/running\">Running</a>."), "{}", none.body);
+
+    // The three lists, each row linking to where its setting is changed.
+    for at in ["waiting", "aside", "file"] {
+        assert!(!index.body.contains(&format!("<h2 id=\"{at}\">")), "{at} with nothing in it");
+    }
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by) VALUES ('retention.tombstone_days', '3', 'cli')").execute(p).await.expect("waiting");
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by, set_aside) VALUES ('private_read.max_chain', '500', 'cli', '{\"problem\": \"private_read.max_chain must be 1 to 100\"}')")
+        .execute(p)
+        .await
+        .expect("aside");
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by, file_notice, file_value) VALUES ('cache.profile_ttl_secs', '60', 'cli', true, '{\"value\": 30, \"explicit\": true}')")
+        .execute(p)
+        .await
+        .expect("file notice");
+    let index = get(&alice, &url("")).await;
+    let body = &index.body;
+    for (key, at) in [("retention.tombstone_days", "waiting"), ("private_read.max_chain", "aside"), ("cache.profile_ttl_secs", "file")] {
+        assert!(list(body, at).contains(&format!("href=\"{}\"", view::href(key, &ctx))), "{at}: {}", list(body, at));
+    }
+    assert!(list(body, "waiting").contains("href=\"/admin/storage?open=advanced#s-retention-tombstone_days\""), "{body}");
+    assert!(list(body, "file").contains("app.toml now says 30 seconds; your saved value 60 seconds still applies."), "{body}");
+    // The value now, in words: the saved one.
+    assert!(body.contains("<code>cache.profile_ttl_secs</code></td><td class=\"text\"><div class=\"cell-text\">60 seconds</div>"), "{body}");
+
+    // No supervisor: the card says so, and no restart form is drawn.
+    let card = &body[body.find("<div class=\"card\" id=\"restart\">").expect("restart card")..];
+    let card = &card[..card.find("</div>").expect("card end")];
+    assert!(card.contains("<h2>Restart Prism</h2>") && card.contains("Prism cannot restart itself on this server; ask whoever runs it."), "{card}");
+    assert!(!body.contains("action=\"/admin/restart\""), "{body}");
+    // The read-only pages, linked; no script; no group card is left.
+    assert!(body.contains("href=\"/admin/settings/installed\"") && body.contains("href=\"/admin/settings/running\""), "{body}");
+    assert!(!body.contains("<script"), "{body}");
+    for slug in OLD_GROUP_SLUGS {
+        assert!(!body.contains(&format!("/admin/settings/{slug}\"")), "{slug}: {body}");
+    }
+    assert!(!body.contains("On their own pages") && !body.contains("Who can use Prism") && !body.contains("What Prism stores"), "{body}");
+    h.db.drop_db().await;
+}
+
+/// Under a supervisor, All settings' restart card holds the restart form,
+/// which asks for confirmation first and queues nothing until confirmed.
+#[tokio::test]
+async fn all_settings_offers_restart_under_a_supervisor() {
+    let Some(h) = harness_supervised("admin_homes_restart").await else {
         return;
     };
     let alice = complete_setup(&h, ALICE).await;
     let index = get(&alice, &format!("{}/admin/settings", h.base)).await;
     let body = &index.body;
-    let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
-    let own = &own[..own.find("</div>").expect("card end")];
-    let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(
-        hrefs,
-        [
-            "/admin/members",
-            "/admin/blocks",
-            "/admin/communities",
-            "/admin/thread-lens",
-            "/admin/indexing",
-            "/admin/storage",
-            "/admin/private",
-            "/admin/apps",
-            "/admin/services",
-            "/admin/public-page",
-            "/admin/account-lookups",
-            "/admin/profiles",
-            "/admin/limits",
-        ],
-        "{own}"
-    );
-    // The same list as the registry's homes, in the menu's order.
-    let sections = registry::sections(&[]);
-    let homes: Vec<&str> = MENU.iter().flat_map(|(_, ids)| ids.iter()).filter(|id| sections.iter().any(|s| s.home == **id)).map(|id| id.page().href).collect();
-    assert_eq!(hrefs, homes);
-    assert!(own.contains(">Account lookups · lodestar</a>"), "{own}");
-    assert!(own.contains(">Private posts · kryphocron</a>"), "{own}");
-    assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
-    // No group card is left.
-    for slug in OLD_GROUP_SLUGS {
-        assert!(!body.contains(&format!("/admin/settings/{slug}\"")), "{slug}: {body}");
-    }
-    assert!(!body.contains("By group") && !body.contains("Who can use Prism") && !body.contains("What Prism stores"), "{body}");
+    let card = &body[body.find("<div class=\"card\" id=\"restart\">").expect("restart card")..];
+    let card = &card[..card.find("</div>").expect("card end")];
+    assert!(card.contains("<form method=\"post\" action=\"/admin/restart\">") && card.contains(&format!("name=\"csrf\" value=\"{}\"", csrf_of(&index))), "{card}");
+    assert!(!card.contains("cannot restart itself"), "{card}");
+    let before = queued(h.pool()).await.len();
+    let confirm = post(&alice, &format!("{}/admin/restart", h.base), &[("csrf", &csrf_of(&index))]).await;
+    assert_eq!(confirm.status, 200, "{}", confirm.body);
+    assert!(confirm.body.contains("Prism will be unavailable for about a minute.") && confirm.body.contains("name=\"confirm\""), "{}", confirm.body);
+    assert_eq!(queued(h.pool()).await.len(), before);
     h.db.drop_db().await;
 }
 

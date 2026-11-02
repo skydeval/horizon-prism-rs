@@ -1,21 +1,18 @@
-//! The admin UI end to end over HTTP (admin-ui design §15: T-A1, T-A2,
-//! T-A3, T-A4, T-A7, T-A16; membership design T-M9), with a stub identity
+//! The admin UI end to end over HTTP, with a stub identity
 //! and a stub authorization server behind the `FetchHandler` seam, served
 //! through `xrpc::router::finalize` as `serve` composes it.
 
-// The live feed (admin-ui-live-feed design §11).
+// The live feed.
 mod feed;
-// The settings pages (admin-ui design §6.3, §8).
+// The settings pages and All settings.
 mod settings_pages;
-// Health, Jobs, Problems, Blocks and Home's tiles (admin-ui design §6.1,
-// §6.4, §6.6-§6.8, §9).
+// Health, Jobs, Problems, Blocks and Home's tiles.
 mod health_pages;
-// Stats and the fullest-disk tile (admin-ui design §6.5, §10).
+// Stats and the fullest-disk tile.
 mod stats_pages;
-// Labels, Look up and the per-member actions (admin-ui design §6.2, §6.9,
-// §6.10; slice S5).
+// Labels, Look up and the per-member actions.
 mod s5_pages;
-// Appearance, the menu's order and the product name (#810).
+// Appearance, the menu's order and the product name.
 mod appearance_pages;
 // About this server and the lexicons it serves.
 mod instance_pages;
@@ -193,6 +190,20 @@ async fn harness_full(name: &str, timing: live::Timing, snippets: bool, inputs: 
 
 /// [`harness_full`] over the configuration `file`.
 async fn harness_config(name: &str, timing: live::Timing, snippets: bool, inputs: health::HealthInputs, file: crate::config::FileConfig) -> Option<Harness> {
+    harness_settings(name, timing, snippets, inputs, settings::SettingsContext::from_file(file)).await
+}
+
+/// [`harness`] for a Prism run under a supervisor, which can restart itself.
+async fn harness_supervised(name: &str) -> Option<Harness> {
+    let file = test_support::no_auto_join();
+    let live = settings::LiveSettings::new(&file);
+    let env = settings::EnvFacts { public_hostname: HOST.to_string(), supervised: true, secrets: Vec::new() };
+    let ctx = settings::SettingsContext::new(file.clone(), file, toml::Table::new(), live, env, None);
+    harness_settings(name, quick(), true, health::HealthInputs::default(), ctx).await
+}
+
+/// [`harness_full`] over the settings `ctx`.
+async fn harness_settings(name: &str, timing: live::Timing, snippets: bool, inputs: health::HealthInputs, ctx: settings::SettingsContext) -> Option<Harness> {
     let db = fresh_db(name).await?;
     let identity = Arc::new(StubIdentity::default());
     let oauth = Arc::new(StubAs::default());
@@ -207,7 +218,7 @@ async fn harness_config(name: &str, timing: live::Timing, snippets: bool, inputs
         session_idle: Duration::from_secs(28_800),
         session_max: Duration::from_secs(604_800),
         setup_code_file: code_file.clone(),
-        settings: settings::SettingsContext::from_file(file),
+        settings: ctx,
         disks: stats::DiskPaths { data: dir.clone(), postgres: dir.clone(), redis: dir.join("no-redis-volume") },
     };
     let live_settings = settings.settings.live.clone();
@@ -403,13 +414,12 @@ fn csrf_of(page: &Page) -> String {
     field(&page.body, "csrf").expect("csrf")
 }
 
-/// T-A16: the §3 headers, with [`CSP`].
+/// The admin's headers, with [`CSP`].
 fn assert_admin_headers(page: &Page, what: &str) {
     assert_headers_with(&page.headers, what, CSP);
 }
 
-/// T-A16 (amended by admin-ui-live-feed §11): the §3 headers, with the
-/// expected policy.
+/// The admin's headers, with the expected policy.
 fn assert_headers_with(headers: &RHeaders, what: &str, csp: &str) {
     let h = |n: &str| headers.get(n).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     assert_eq!(h("content-security-policy"), csp, "{what}");
@@ -419,7 +429,7 @@ fn assert_headers_with(headers: &RHeaders, what: &str, csp: &str) {
     assert!(headers.get("access-control-allow-credentials").is_none(), "{what}");
 }
 
-/// T-A1: the code's life across starts. The first start writes the row
+/// The code's life across starts. The first start writes the row
 /// (hash only) and the 0600 file; a restart keeps the same code; an expired
 /// row, or a missing, damaged or mismatched file, yields a new one; with an
 /// operator, the row and the file go and nothing is returned.
@@ -487,7 +497,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
     }
 }
 
-/// T-A1: the code is printed at start and again while no operator exists,
+/// The code is printed at start and again while no operator exists,
 /// only in `admin_setup_code` lines; once an operator exists the reprint
 /// stops and the file goes.
 #[tokio::test]
@@ -516,7 +526,7 @@ async fn t_a1_reprint_and_only_one_line_carries_the_code() {
     db.drop_db().await;
 }
 
-/// T-A2, T-A16: setup end to end with the stub authorization server.
+/// Setup end to end with the stub authorization server.
 #[tokio::test]
 async fn t_a2_setup_flow() {
     let Some(h) = harness("admin_t_a2").await else {
@@ -596,7 +606,7 @@ async fn t_a2_setup_flow() {
     h.db.drop_db().await;
 }
 
-/// T-A2: wrong codes past five a minute from one address (an IPv6 /64 as
+/// Wrong codes past five a minute from one address (an IPv6 /64 as
 /// one) are delayed, and past the bound answered 429; a correct code is
 /// never refused, even from a throttled address.
 #[tokio::test]
@@ -647,7 +657,7 @@ async fn t_a2_wrong_codes_are_throttled_per_address() {
     h.db.drop_db().await;
 }
 
-/// T-A3, T-M9: only an operator on an allowed host starts a flow, and a
+/// Only an operator on an allowed host starts a flow, and a
 /// refused one makes no request to its server; the token must name the
 /// expected DID and come back from the stored issuer; a DID that moves
 /// between start and callback is refused.
@@ -710,7 +720,7 @@ async fn t_a3_host_check_at_login() {
     h.db.drop_db().await;
 }
 
-/// T-M9: sign-in starts are limited per client address, keyed on the
+/// Sign-in starts are limited per client address, keyed on the
 /// forwarded address from the trusted proxy. Every 429 names `Retry-After`.
 #[tokio::test]
 async fn t_m9_login_limit_keys_on_the_forwarded_address() {
@@ -749,7 +759,7 @@ async fn t_m9_login_limit_keys_on_the_forwarded_address() {
     h.db.drop_db().await;
 }
 
-/// T-A4: a PDS change ends the session at the next POST, or at the next
+/// A PDS change ends the session at the next POST, or at the next
 /// page after five minutes; a failed resolution refuses the request and
 /// keeps the session; an operator removed loses the session.
 #[tokio::test]
@@ -802,7 +812,7 @@ async fn t_a4_host_recheck() {
     h.db.drop_db().await;
 }
 
-/// T-A7: a POST without the session's token, with another session's token,
+/// A POST without the session's token, with another session's token,
 /// or from a foreign Origin changes nothing; a typed action without its
 /// word changes nothing; with it, the command is queued with
 /// `requested_by`.

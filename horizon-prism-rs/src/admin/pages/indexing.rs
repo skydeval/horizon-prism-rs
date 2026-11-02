@@ -98,6 +98,16 @@ fn until(d: TimeDelta) -> String {
     }
 }
 
+/// Whether Community is the switch's saved choice.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn community_chosen(state: &AdminState) -> Result<bool, sqlx::Error> {
+    let value: Option<Value> = sqlx::query_scalar("SELECT value FROM operator_settings WHERE key = $1").bind(PUBLIC_SCOPE_KEY).fetch_optional(&state.pool).await?;
+    Ok(value.as_ref().and_then(Value::as_str) == Some(ScopeValue::Community.as_str()))
+}
+
 /// `GET /admin/indexing`.
 pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Query(q): Query<OpenQuery>) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
@@ -109,11 +119,10 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         Ok(b) => b,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let value: Option<Value> = match sqlx::query_scalar("SELECT value FROM operator_settings WHERE key = $1").bind(PUBLIC_SCOPE_KEY).fetch_optional(&state.pool).await {
-        Ok(v) => v,
+    let on = match community_chosen(&state).await {
+        Ok(on) => on,
         Err(e) => return super::internal_error(&state, &e),
     };
-    let on = value.as_ref().and_then(Value::as_str) == Some(ScopeValue::Community.as_str());
     let mode = state.scope.public_mode();
     let mut refill = Vec::new();
     if mode == PublicMode::Filling {
