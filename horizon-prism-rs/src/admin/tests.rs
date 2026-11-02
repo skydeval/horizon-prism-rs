@@ -869,7 +869,7 @@ async fn t_a7_csrf_and_confirmation() {
     h.db.drop_db().await;
 }
 
-/// T-A16: headers on every kind of `/admin` answer, a wrong verb, and an
+/// Headers on every kind of `/admin` answer, a wrong verb, and an
 /// unknown path; CORS never allows credentials.
 #[tokio::test]
 async fn t_a16_headers_everywhere() {
@@ -893,6 +893,9 @@ async fn t_a16_headers_everywhere() {
         "/admin/settings/private",
         "/admin/settings/apps",
         "/admin/settings/services",
+        "/admin/settings/limits",
+        "/admin/settings/profiles",
+        "/admin/settings/lookups",
         "/admin/settings/installed",
         "/admin/settings/running",
         "/admin/health",
@@ -913,6 +916,10 @@ async fn t_a16_headers_everywhere() {
         "/admin/apps",
         "/admin/services",
         "/admin/public-page",
+        "/admin/relays",
+        "/admin/account-lookups",
+        "/admin/profiles",
+        "/admin/limits",
         "/admin/refract",
         "/admin/appearance",
         "/admin/settings/appearance",
@@ -923,7 +930,7 @@ async fn t_a16_headers_everywhere() {
         js,
         css,
     ] {
-        // Under the ten-pages-a-second limit (§5.6).
+        // Under the ten-pages-a-second limit.
         tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.send(alice.http.get(format!("{}{path}", h.base)).header("origin", "https://elsewhere.example")).await;
         let csp = if path == "/admin" { CSP_LIVE } else { CSP };

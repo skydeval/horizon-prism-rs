@@ -755,3 +755,8 @@ label.choice input { margin: 0; accent-color: var(--accent); }
 .layout .settings-cards > .card { margin: 0; }
 .layout details.advanced { margin: 1.25rem 0; }
 .layout details.advanced > summary { font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem; }
+
+/* Request limits as one table: each number's input narrow, and its Reset
+   under it at the cell's right edge. */
+.layout table.limits-table input[type=text] { width: 7rem; }
+.layout table.limits-table button.reset { display: block; margin: 0.3rem 0 0 auto; padding: 0.15rem 0.5rem; font-size: 0.8rem; }

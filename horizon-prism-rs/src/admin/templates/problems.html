@@ -2,11 +2,7 @@
 {% block content %}
 <h1>{{ title }}</h1>
 
-<h2>The network stream</h2>
-<div class="card">
-{% for s in stream %}<p>{{ s }}</p>
-{% endfor %}
-</div>
+<p>Stream: {{ stream }} — <a href="/admin/relays">Relays</a></p>
 
 <h2>Records Prism could not process</h2>
 <p class="muted">Records from the network that Prism could not store, from members, from accounts Prism follows, or

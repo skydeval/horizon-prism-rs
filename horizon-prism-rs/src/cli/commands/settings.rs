@@ -1,6 +1,6 @@
-//! `admin settings list` and `admin settings get <key>` (admin-ui design
-//! §7, §8): the settings the admin UI edits, with the value saved there
-//! and the one `app.toml` gives. Read-only; `settings set` and `settings
+//! `admin settings list` and `admin settings get <key>`: the settings the
+//! admin UI edits, with the value saved there, the one `app.toml` gives,
+//! and the page each is changed on. Read-only; `settings set` and `settings
 //! reset` go through `serve`.
 
 use serde_json::Value;
@@ -55,6 +55,13 @@ pub async fn render_list(pool: &PgPool, file: &FileConfig) -> Result<String, sql
     Ok(table(&["key", "applies", "saved", "app.toml", "note"], &rows))
 }
 
+/// The admin page a setting is changed on: `page: Members`, or
+/// `page: Members, Advanced` when it is folded there.
+fn page_line(section: &registry::Section) -> String {
+    let page = section.home.title();
+    if section.advanced { format!("page: {page}, Advanced") } else { format!("page: {page}") }
+}
+
 /// One setting in full.
 ///
 /// # Errors
@@ -71,6 +78,7 @@ pub async fn render_get(pool: &PgPool, file: &FileConfig, key: &str) -> Result<S
     let mut out = vec![
         format!("{} ({})", section.title, field.label),
         section.help.clone(),
+        page_line(&section),
         format!("applies: {}", if section.live { "at once" } else { "after a restart" }),
         format!("default: {} ({})", words(&default), compact(&default)),
         format!("app.toml: {} ({})", words(&registry::value_at(&file_json, key)), compact(&registry::value_at(&file_json, key))),
@@ -129,5 +137,14 @@ mod tests {
         assert_eq!(parse_value(&file, "trends.descriptions", "{\"x\": \"y\"}"), Ok(json!({"x": "y"})));
         assert!(parse_value(&file, "http.bind", "0.0.0.0:1").is_err());
         assert!(parse_value(&file, "private_read.max_chain", "0").is_err());
+    }
+
+    #[test]
+    fn the_page_a_setting_is_on() {
+        let page = |key: &str| page_line(&registry::lookup(key, &[]).expect("key").0);
+        assert_eq!(page("community.max_members"), "page: Members");
+        assert_eq!(page("community.reindex_retry_secs"), "page: Members, Advanced");
+        assert_eq!(page("identity.lodestar_timeout_ms"), "page: Account lookups · lodestar, Advanced");
+        assert_eq!(page("rate_limits.global.burst"), "page: Request limits");
     }
 }

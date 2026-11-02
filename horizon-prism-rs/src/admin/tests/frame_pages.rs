@@ -58,6 +58,13 @@ async fn every_menu_item_renders() {
             assert!(page.body.contains(&format!("<title>{} · Horizon-Prism admin</title>", id.title())), "{}: {}", p.href, page.body);
         }
     }
+    // The whole menu: eight headings, twenty-five pages, four products.
+    assert_eq!(MENU.len(), 8);
+    assert_eq!(MENU.iter().map(|(_, ids)| ids.len()).sum::<usize>(), 25);
+    let labels: Vec<&str> = MENU.iter().filter_map(|(_, ids)| ids.first().and_then(|id| id.section_label())).collect();
+    assert_eq!(labels, ["Overview", "People", "Moderation", "Data", "Private posts", "Apps", "Network", "System"]);
+    let tags: Vec<&str> = MENU.iter().flat_map(|(_, ids)| ids.iter().filter_map(|id| id.page().tag)).collect();
+    assert_eq!(tags, ["Farsight", "Refract", "kryphocron", "lodestar"]);
     // A tag makes the title differ from the h1.
     let blocks = get(&alice, &format!("{}/admin/blocks", h.base)).await;
     assert!(blocks.body.contains("<title>Blocks · Farsight · Horizon-Prism admin</title>") && blocks.body.contains("<h1>Blocks</h1>"), "{}", blocks.body);
@@ -113,6 +120,16 @@ async fn the_sidebar_markup_is_the_mocks() {
         ),
         ("private", "Private posts", &[("/admin/private", "Private posts", Some("kryphocron"))]),
         ("apps", "Apps", &[("/admin/apps", "What apps see", None), ("/admin/services", "Extra services", None), ("/admin/public-page", "Public page", None)]),
+        (
+            "network",
+            "Network",
+            &[
+                ("/admin/relays", "Relays", None),
+                ("/admin/account-lookups", "Account lookups", Some("lodestar")),
+                ("/admin/profiles", "Profiles and caching", None),
+                ("/admin/limits", "Request limits", None),
+            ],
+        ),
         (
             "system",
             "System",
@@ -206,6 +223,8 @@ fn pinned() -> Vec<Rule> {
         rule("", ".layout .settings-cards > .card", "margin: 0"),
         rule("", ".layout details.advanced", "margin: 1.25rem 0"),
         rule("", ".layout details.advanced > summary", "font-weight: 600; font-size: 0.92rem; margin-bottom: 0.75rem"),
+        rule("", ".layout table.limits-table input[type=text]", "width: 7rem"),
+        rule("", ".layout table.limits-table button.reset", "display: block; margin: 0.3rem 0 0 auto; padding: 0.15rem 0.5rem; font-size: 0.8rem"),
     ]
 }
 
@@ -632,8 +651,8 @@ async fn seed(h: &Harness) {
     h.usage.record("app.bsky.feed.getTimeline", crate::admin::usage::Class::Ok);
 }
 
-/// The configuration of the frame's page tests: two relays and two listed
-/// communities, so About's tables have rows.
+/// The configuration of the frame's page tests: a relay and a listed
+/// community, so Relays' and the Communities tab's tables have rows.
 fn frame_config() -> crate::config::FileConfig {
     let mut file = test_support::no_auto_join();
     file.firehose.relay_labels =
@@ -672,12 +691,13 @@ const TABLES: &[Expected] = &[
     ("/admin/apps", &[]),
     ("/admin/services", &[]),
     ("/admin/public-page", &[]),
+    ("/admin/relays", &[("Relay", &["name", "list", "state", "when"])]),
+    ("/admin/account-lookups", &[]),
+    ("/admin/profiles", &[]),
+    ("/admin/limits", &[("What it limits", &["name", "num", "num", "text"])]),
     ("/admin/health", &[("Check", &["name", "state", "text"])]),
     ("/admin/stats", &[("Request", &["name", "num", "num", "num", "num", "num", "num", "when"]), ("Request", &["name"])]),
-    (
-        "/admin/about",
-        &[("Part", &["name", "state", "text"]), ("Relay", &["name", "list", "state", "when"]), ("Community", &["name", "num", "list", "name", "state"]), ("Method", &["name", "text"])],
-    ),
+    ("/admin/about", &[("Method", &["name", "text"])]),
     ("/admin/audit", &[("When", &["when", "name", "text", "text"]), ("When", &["when", "name", "text", "name"])]),
     ("/admin/settings", &[("Setting", &["name", "text"]), ("Setting", &["name", "text"])]),
     ("/admin/settings/installed", &[("What", &["name", "text", "text"])]),
@@ -834,8 +854,8 @@ async fn every_old_address_redirects() {
     }
     // Every row of the table is one of these.
     assert_eq!(REDIRECTS.len(), 5);
-    // Old group pages with no settings left: their slug's GET only, the
-    // query kept before the fragment.
+    // Old group pages: their slug's GET only, the query kept before the
+    // fragment.
     for (slug, to, fragment) in GROUP_REDIRECTS {
         for q in ["", "?open=advanced"] {
             let old = format!("/admin/settings/{slug}{q}");
@@ -847,7 +867,13 @@ async fn every_old_address_redirects() {
             assert_eq!(get(&alice, &url(&format!("{to}{q}"))).await.status, 200, "{to}{q}");
         }
     }
-    assert_eq!(GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(), ["communities", "blocks", "access", "storage", "private", "apps", "services"]);
+    assert_eq!(
+        GROUP_REDIRECTS.iter().map(|(s, _, _)| *s).collect::<Vec<_>>(),
+        ["communities", "blocks", "access", "storage", "private", "apps", "services", "limits", "profiles", "lookups"]
+    );
+    // Every old group's slug is one of them: no group page is left.
+    assert!(menu::OLD_GROUP_SLUGS.iter().all(|s| menu::group_redirect(s).is_some()));
+    assert_eq!(location(&get(&stranger, &url("/admin/settings/lookups")).await), Some("/admin/account-lookups#settings"));
     // The encoded port reaches the account page as one DID.
     let account = get(&alice, &url("/admin/communities/accounts/did:web:h%253A8080")).await;
     assert!(account.body.contains("did:web:h%3A8080") && !account.body.contains("did:web:h:8080"), "{}", account.body);
@@ -889,10 +915,6 @@ async fn every_old_address_redirects() {
     let communities = post(&alice, &url("/admin/settings/communities"), &[("csrf", &csrf_of(&settings)), ("refract.visitor_viewer_state", "off")]).await;
     assert_eq!(communities.status, 404);
     assert_eq!(count(h.pool(), "SELECT count(*) FROM admin_commands").await, before);
-    // A group with keys left is still its page.
-    let limits = get(&alice, &url("/admin/settings/limits")).await;
-    assert_eq!(limits.status, 200);
-    assert_eq!(current_item(&limits.body), Some(("All settings".to_string(), "true".to_string())), "{}", limits.body);
     h.db.drop_db().await;
 }
 
@@ -929,8 +951,7 @@ async fn only_built_pages_and_no_stale_links() {
         assert_eq!(page.status == 308, redirected(old), "{old}: {}", page.status);
     }
     // The pages to read: every built page and tab, an account page with a
-    // pending end, a command page, Installed, Running, a group page, the
-    // Refract refusal and "Not known", Appearance's "Not saved" and a
+    // pending end, a command page, Installed, Running, the Refract refusal and "Not known", Appearance's "Not saved" and a
     // confirmation.
     let mut pages: Vec<(String, Page)> = Vec::new();
     for p in PAGES.iter().filter(|p| p.id.built()) {
@@ -942,7 +963,6 @@ async fn only_built_pages_and_no_stale_links() {
         "/admin/communities/accounts/did:plc:nobodynobodynobodynobody".to_string(),
         "/admin/settings/installed".to_string(),
         "/admin/settings/running".to_string(),
-        "/admin/settings/limits".to_string(),
         format!("/admin/lookup?q={BOB}"),
     ] {
         pages.push((path.clone(), get(&alice, &url(&path)).await));
@@ -961,7 +981,7 @@ async fn only_built_pages_and_no_stale_links() {
     let resync = post(&alice, &url("/admin/members/resync"), &[("csrf", &csrf), ("did", BOB)]).await;
     let command = location(&resync).expect("command").to_string();
     pages.push((command.clone(), get(&alice, &url(&command)).await));
-    // A typed settings change's confirmation, from a group page.
+    // A typed settings change's confirmation.
     let typed = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("farsight.fallback.enabled", "on")]).await;
     assert_eq!(typed.status, 200, "{}", typed.body);
     pages.push(("the settings confirmation".to_string(), typed));
@@ -984,7 +1004,17 @@ async fn only_built_pages_and_no_stale_links() {
         assert!(!body.contains("style="), "{path}: an inline style");
         assert!(!body.contains("tabindex"), "{path}: a tab index");
         assert_eq!(body.contains("<script"), path == "/admin", "{path}: scripts");
-        for old in ["Refract accounts", "<h1>Instance</h1>", "Most members", "Limit for auto-join", "Blocks (Farsight)", "Who can use Prism", "Fallback and memory settings", "What Prism stores"] {
+        for old in [
+            "Refract accounts",
+            "<h1>Instance</h1>",
+            "Most members",
+            "Limit for auto-join",
+            "Blocks (Farsight)",
+            "Who can use Prism",
+            "Fallback and memory settings",
+            "What Prism stores",
+            "<h2>Status</h2>",
+        ] {
             assert!(!body.contains(old), "{path}: an old name, {old}");
         }
         assert!(current_item(body).is_some(), "{path}: not exactly one marked item: {}", sidebar(body));
@@ -1006,7 +1036,6 @@ async fn sub_pages_mark_their_parent() {
         ("/admin/communities/pending".to_string(), "Communities"),
         ("/admin/settings/installed".to_string(), "All settings"),
         ("/admin/settings/running".to_string(), "All settings"),
-        ("/admin/settings/limits".to_string(), "All settings"),
     ] {
         let page = get(&alice, &format!("{}{path}", h.base)).await;
         assert_eq!(page.status, 200, "{path}");
@@ -1052,6 +1081,9 @@ async fn moved_forms_check_the_token() {
         "/admin/settings/private",
         "/admin/settings/apps",
         "/admin/settings/services",
+        "/admin/settings/limits",
+        "/admin/settings/profiles",
+        "/admin/settings/lookups",
         "/admin/indexing/switch",
         "/admin/settings/public-scope",
         "/admin/communities/keep",
@@ -1074,6 +1106,9 @@ async fn moved_forms_check_the_token() {
             ("bookmarks.count_floor", "5"),
             ("services.push.state", "off"),
             ("public_page.name", "x"),
+            ("rate_limits.global.burst", "5"),
+            ("cache.profile_refresh_max", "5"),
+            ("identity.lodestar_url", "https://lodestar.example"),
         ];
         let mut with = vec![("csrf", other.as_str())];
         with.extend(fields);
@@ -1130,15 +1165,15 @@ async fn cancel_goes_back() {
     assert_eq!(cancel(&both.body), "/admin/lookup?q=x");
     assert_eq!(current_item(&both.body), Some(("Look up".to_string(), "page".to_string())));
     // Anything else falls back to the action's page: another host, none, a
-    // tampered field, a page not built yet.
+    // tampered field, an old address that redirects.
     for (back, referer) in [
         (None, Some("https://evil.example/admin/lookup")),
         (None, Some("http://prism.example.com/admin/lookup")),
         (None, None),
         (Some("//evil.example"), None),
         (Some("https://evil.example/admin"), None),
-        (Some("/admin/relays"), None),
-        (None, Some("https://prism.example.com/admin/relays")),
+        (Some("/admin/settings/limits"), None),
+        (None, Some("https://prism.example.com/admin/settings/limits")),
     ] {
         let mut form = vec![("csrf", csrf.as_str()), ("did", CAROL)];
         if let Some(b) = back {

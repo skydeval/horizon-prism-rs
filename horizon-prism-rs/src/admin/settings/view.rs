@@ -2,18 +2,18 @@
 //! each with its explanation, whether it applies at once or after a
 //! restart, the value saved now, the default, the value `app.toml` writes if
 //! it writes one, and the last change. Rarely changed sections are folded
-//! under Advanced. Also where each key is changed: its feature page once
-//! that page holds its settings, else its old settings group page.
+//! under Advanced. Request limits shows its settings as one table instead.
+//! Also where each key is changed: its feature page.
 
 use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::registry::{self, Group, Kind, Section};
+use super::registry::{self, Kind, Section};
 use super::store::{self, Row};
 use super::{SettingsContext, overlay};
 use crate::admin::AdminState;
-use crate::admin::menu::{PageId, SETTINGS_LIVE};
+use crate::admin::menu::PageId;
 use crate::admin::pages::when;
 
 /// A choice of a select.
@@ -66,8 +66,6 @@ pub struct SectionView {
 pub enum Place {
     /// Its feature page.
     Page(PageId),
-    /// Its old settings group page.
-    Group(Group),
 }
 
 impl Place {
@@ -76,7 +74,6 @@ impl Place {
     pub fn path(self) -> String {
         match self {
             Self::Page(id) => id.page().href.to_string(),
-            Self::Group(g) => format!("/admin/settings/{}", g.slug()),
         }
     }
 
@@ -85,17 +82,14 @@ impl Place {
     pub fn name(self) -> &'static str {
         match self {
             Self::Page(id) => id.page().name,
-            Self::Group(g) => g.title(),
         }
     }
 }
 
-/// Where `section` renders: its feature page once that page holds its
-/// settings, and always for a section with forms of its own; else its old
-/// group page.
+/// Where `section` renders: its feature page.
 #[must_use]
 pub fn place(section: &Section) -> Place {
-    if section.own_form || SETTINGS_LIVE.contains(&section.home) { Place::Page(section.home) } else { Place::Group(section.group) }
+    Place::Page(section.home)
 }
 
 /// The sections a settings block at `at` shows, in the registry's order.
@@ -241,14 +235,51 @@ pub fn section_view(s: &Section, rows: &BTreeMap<String, Row>, ctx: &SettingsCon
     }
 }
 
+impl SectionView {
+    /// A table row's state in words: the default, or who saved it and when.
+    #[must_use]
+    pub fn state(&self) -> String {
+        let mut saved: Vec<&str> = self.fields.iter().filter_map(|f| f.saved.as_deref()).collect();
+        saved.dedup();
+        if saved.is_empty() { "default".to_string() } else { saved.join("; ") }
+    }
+
+    /// A table row's pills: a value waiting for a restart, one set aside,
+    /// and `app.toml` changed under a saved one.
+    #[must_use]
+    pub fn pills(&self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.fields.iter().any(|f| f.running.is_some()) {
+            out.push("Waits for a restart");
+        }
+        if self.fields.iter().any(|f| f.set_aside.is_some()) {
+            out.push("Set aside");
+        }
+        if self.fields.iter().any(|f| f.file_notice.is_some()) {
+            out.push("app.toml changed");
+        }
+        out
+    }
+}
+
+/// How a settings block lays out its sections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    /// One card for each.
+    Cards,
+    /// One table row for each, its two numbers side by side.
+    Table,
+}
+
 /// A page's settings block: one form for every card, the everyday ones
-/// first, then the Advanced fold.
+/// first, then the Advanced fold; or one table.
 pub struct SettingsBlock {
     pub csrf: String,
     pub everyday: Vec<SectionView>,
     pub advanced: Vec<SectionView>,
     /// Whether the Advanced fold is open.
     pub open: bool,
+    pub layout: Layout,
 }
 
 impl SettingsBlock {
@@ -256,6 +287,33 @@ impl SettingsBlock {
     #[must_use]
     pub fn cards(&self) -> Vec<&SectionView> {
         self.everyday.iter().chain(&self.advanced).collect()
+    }
+
+    /// The same block, as one table.
+    #[must_use]
+    pub fn table(mut self) -> Self {
+        self.layout = Layout::Table;
+        self
+    }
+
+    /// Whether the block is one table.
+    #[must_use]
+    pub fn is_table(&self) -> bool {
+        self.layout == Layout::Table
+    }
+
+    /// When every section applies the same way, how: said once above a
+    /// table.
+    #[must_use]
+    pub fn applies(&self) -> Option<&'static str> {
+        let first = self.cards().first()?.applies;
+        self.cards().iter().all(|s| s.applies == first).then_some(first)
+    }
+
+    /// Whether every section applies at once.
+    #[must_use]
+    pub fn applies_now(&self) -> bool {
+        self.applies() == Some("Applies at once")
     }
 }
 
@@ -273,20 +331,58 @@ pub async fn settings_block(state: &AdminState, csrf: &str, sections: &[Section]
     let (advanced, everyday): (Vec<&Section>, Vec<&Section>) = sections.iter().partition(|s| s.advanced);
     let advanced: Vec<SectionView> = advanced.into_iter().map(|s| section_view(s, &rows, ctx)).collect();
     let open = open_query || advanced.iter().flat_map(|s| &s.fields).any(|f| f.set_aside.is_some() || f.file_notice.is_some() || f.running.is_some());
-    Ok(SettingsBlock { csrf: csrf.to_string(), everyday: everyday.into_iter().map(|s| section_view(s, &rows, ctx)).collect(), advanced, open })
+    Ok(SettingsBlock {
+        csrf: csrf.to_string(),
+        everyday: everyday.into_iter().map(|s| section_view(s, &rows, ctx)).collect(),
+        advanced,
+        open,
+        layout: Layout::Cards,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::menu::group_redirect;
+    use crate::admin::menu::{OLD_GROUP_SLUGS, group_redirect};
 
-    /// An old group page redirects exactly when no setting is left on it.
+    /// Every old settings group page redirects, and every key renders on a
+    /// page that exists.
     #[test]
-    fn empty_groups_redirect() {
-        for g in Group::ALL {
-            assert_eq!(sections_at(Place::Group(g), &[]).is_empty(), group_redirect(g.slug()).is_some(), "{}", g.slug());
+    fn every_old_group_redirects() {
+        for slug in OLD_GROUP_SLUGS {
+            assert!(group_redirect(slug).is_some(), "{slug}");
         }
-        assert!(sections_at(Place::Group(Group::Communities), &[]).is_empty() && group_redirect("communities").is_some());
+        assert!(group_redirect("communities").is_some());
+        for s in registry::sections(&["a".to_string()]) {
+            assert!(place(&s) == Place::Page(s.home) && s.home.built(), "{}", s.title);
+        }
+    }
+
+    /// A table row says who saved it, or that it is the default, and what
+    /// waits.
+    #[test]
+    fn table_rows_in_words() {
+        let field = |saved: Option<&str>, running: Option<&str>| FieldView {
+            key: "k".into(),
+            label: "l".into(),
+            input: "text",
+            value: String::new(),
+            options: Vec::new(),
+            unit: String::new(),
+            current: String::new(),
+            default: String::new(),
+            file: None,
+            version: 0,
+            saved: saved.map(str::to_string),
+            set_aside: None,
+            file_notice: None,
+            running: running.map(str::to_string),
+            reset: None,
+        };
+        let row = |fields| SectionView { slug: "s".into(), title: "t".into(), help: "h".into(), applies: "Applies after a restart", warning: None, fields };
+        let plain = row(vec![field(None, None), field(None, None)]);
+        assert_eq!((plain.state(), plain.pills()), ("default".to_string(), Vec::new()));
+        let saved = row(vec![field(Some("saved by cli, today"), Some("10")), field(Some("saved by cli, today"), None)]);
+        assert_eq!((saved.state(), saved.pills()), ("saved by cli, today".to_string(), vec!["Waits for a restart"]));
     }
 }

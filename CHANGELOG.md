@@ -29,6 +29,9 @@ New entries go under `## [Unreleased]` and move into a phase when it closes.
 
 ### Changed
 
+- **Admin:** Relays, Account lookups · lodestar, Profiles and caching and
+  Request limits pages; About this server keeps only facts about the
+  server.
 - **Admin:** What apps see, Extra services and Public page have pages of
   their own.
 - **Admin:** a kryphocron page holds its settings and figures.

@@ -1,18 +1,18 @@
-//! Settings (`/admin/settings`): the index of every page that holds
-//! settings, the old group pages for the settings whose feature page does
-//! not hold them yet, and the one save every settings form posts to. A save
-//! sends one `settings set` command with every changed field; the executor
-//! validates the whole configuration before anything is saved. Two
-//! read-only pages: what was set at install, and everything Prism is
-//! running with. And the restart.
+//! All settings (`/admin/settings`): the index of every page that holds
+//! settings, and the one save every settings form posts to. A save sends
+//! one `settings set` command with every changed field; the executor
+//! validates the whole configuration before anything is saved. The old
+//! settings group addresses redirect to the pages that took their
+//! settings. Two read-only pages: what was set at install, and everything
+//! Prism is running with. And the restart.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 use askama::Template;
 use axum::Form;
-use axum::extract::rejection::{PathRejection, QueryRejection};
-use axum::extract::{ConnectInfo, Path, Query, RawQuery, State};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{ConnectInfo, Path, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use serde_json::Value;
@@ -20,20 +20,13 @@ use serde_json::Value;
 use super::{ConfirmPage, Hidden, Link, Nav, back_to, css, enqueue, message, render, setting_name, typed_matches};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, Operator, require};
-use crate::admin::menu::{self, MENU, PageId, SETTINGS_LIVE};
+use crate::admin::menu::{self, MENU, PageId};
 use crate::admin::settings::SettingsContext;
 use crate::admin::settings::overlay;
-use crate::admin::settings::registry::{self, Group};
+use crate::admin::settings::registry;
 use crate::admin::settings::store::{self, Change, Row};
-use crate::admin::settings::view::{self, Place, SettingsBlock, href, saved_rows, saved_value};
+use crate::admin::settings::view::{self, href, saved_rows, saved_value};
 use crate::admin_executor::AdminCommand;
-
-/// A group in the index, with the titles of the settings still on it.
-pub struct GroupLink {
-    pub slug: &'static str,
-    pub title: &'static str,
-    pub summary: String,
-}
 
 #[derive(Template)]
 #[template(path = "settings.html")]
@@ -43,19 +36,8 @@ struct IndexPage {
     title: String,
     /// The pages that hold their own settings.
     own: Vec<Link>,
-    groups: Vec<GroupLink>,
     aside: Vec<Notice>,
     waiting: Vec<Notice>,
-}
-
-#[derive(Template)]
-#[template(path = "settings_group.html")]
-struct GroupPage {
-    css: &'static str,
-    nav: Option<Nav>,
-    title: String,
-    lodestar: Option<String>,
-    settings: SettingsBlock,
 }
 
 /// A read-only row: what, its value, and why it is fixed.
@@ -95,7 +77,7 @@ fn words_of(key: &str, v: &Value, ctx: &SettingsContext) -> String {
     registry::lookup(key, &rctx.networks).map_or_else(|| v.to_string(), |(_, f)| registry::words(&f.kind, v, &rctx))
 }
 
-/// Settings whose `app.toml` value changed under a saved one (§8.4), for
+/// Settings whose `app.toml` value changed under a saved one, for
 /// Home: listed until each is kept or reset.
 ///
 /// # Errors
@@ -118,26 +100,14 @@ pub async fn file_notices(state: &AdminState) -> Result<Vec<Notice>, sqlx::Error
         .collect())
 }
 
-/// The pages that hold their own settings, in the menu's order:
-/// Communities, whose own forms are there, and every page live as a home.
-fn own_pages() -> Vec<Link> {
+/// The pages that hold their own settings, in the menu's order: every
+/// page some setting belongs on.
+fn own_pages(ctx: &SettingsContext) -> Vec<Link> {
+    let sections = registry::sections(&ctx.networks());
     MENU.iter()
         .flat_map(|(_, ids)| ids.iter())
-        .filter(|id| **id == PageId::Communities || SETTINGS_LIVE.contains(id))
+        .filter(|id| sections.iter().any(|s| s.home == **id))
         .map(|id| Link { href: id.page().href.to_string(), label: id.title() })
-        .collect()
-}
-
-/// The groups with settings still on their page, each summed up by the
-/// titles of those settings.
-fn groups_left(ctx: &SettingsContext) -> Vec<GroupLink> {
-    let networks = ctx.networks();
-    Group::ALL
-        .into_iter()
-        .filter_map(|g| {
-            let titles: Vec<String> = view::sections_at(Place::Group(g), &networks).into_iter().map(|s| s.title).collect();
-            (!titles.is_empty()).then(|| GroupLink { slug: g.slug(), title: g.title(), summary: titles.join(", ") })
-        })
         .collect()
 }
 
@@ -177,21 +147,17 @@ pub async fn index(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
             css: css(),
             nav: Some(Nav::page(&op, PageId::Settings)),
             title: "All settings".to_string(),
-            own: own_pages(),
-            groups: groups_left(ctx),
+            own: own_pages(ctx),
             aside,
             waiting,
         },
     )
 }
 
-/// The settings group an old page slug names: one of
-/// [`crate::admin::menu::OLD_GROUP_SLUGS`], else `None`.
-fn old_group(slug: Result<Path<String>, PathRejection>) -> Option<Group> {
-    let Ok(Path(slug)) = slug else {
-        return None;
-    };
-    menu::OLD_GROUP_SLUGS.contains(&slug.as_str()).then(|| Group::from_slug(&slug)).flatten()
+/// Whether a slug is one of the old settings groups',
+/// [`crate::admin::menu::OLD_GROUP_SLUGS`].
+fn old_group(slug: &Result<Path<String>, PathRejection>) -> bool {
+    slug.as_ref().is_ok_and(|Path(s)| menu::OLD_GROUP_SLUGS.contains(&s.as_str()))
 }
 
 /// A settings page's query.
@@ -201,55 +167,22 @@ pub struct OpenQuery {
     pub open: Option<String>,
 }
 
-/// `GET /admin/settings/{group}`: a group's page, with the settings whose
-/// feature page does not hold them yet; a group with none left answers
-/// `308` to the page that holds most of them, without a session. Any other
-/// slug, or a segment that is not text, is the plain 404 page, without a
-/// session.
-pub async fn group(
-    State(state): State<AdminState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    slug: Result<Path<String>, PathRejection>,
-    RawQuery(raw): RawQuery,
-    q: Result<Query<OpenQuery>, QueryRejection>,
-) -> Response {
-    if let Ok(Path(s)) = &slug
-        && let Some((to, fragment)) = menu::group_redirect(s)
-    {
-        return crate::admin::moved_to(to, raw.as_deref(), fragment).await;
+/// `GET /admin/settings/{group}`: an old settings group's address answers
+/// `308` to the page that holds most of what was there, with the request's
+/// own query, without a session. Any other slug, or a segment that is not
+/// text, is the plain 404 page, without a session.
+pub async fn group(slug: Result<Path<String>, PathRejection>, RawQuery(raw): RawQuery) -> Response {
+    match &slug {
+        Ok(Path(s)) => match menu::group_redirect(s) {
+            Some((to, fragment)) => crate::admin::moved_to(to, raw.as_deref(), fragment).await,
+            None => super::not_found().await,
+        },
+        Err(_) => super::not_found().await,
     }
-    let Some(group) = old_group(slug) else {
-        return super::not_found().await;
-    };
-    let op = match require(&state, &headers, peer, Need::Page, None).await {
-        Ok(op) => op,
-        Err(response) => return response,
-    };
-    let ctx = &state.settings;
-    let sections = view::sections_at(Place::Group(group), &ctx.networks());
-    let open = q.is_ok_and(|Query(q)| q.open.as_deref() == Some("advanced"));
-    let settings = match view::settings_block(&state, &op.csrf, &sections, open).await {
-        Ok(b) => b,
-        Err(e) => return super::internal_error(&state, &e),
-    };
-    let lodestar = (group == Group::Lookups).then(|| match &ctx.lodestar {
-        None => "Lodestar is off: no address was set when Prism started.".to_string(),
-        Some(l) if l.gate().is_open() => format!("Lodestar ({}) is answering and up to date, so Prism is reading from it.", l.host()),
-        Some(l) => format!("Lodestar ({}) is not answering or is behind, so Prism is reading from the PLC directory.", l.host()),
-    });
-    render(
-        StatusCode::OK,
-        &GroupPage { css: css(), nav: Some(Nav::under(&op, PageId::Settings)), title: group.title().to_string(), lodestar, settings },
-    )
 }
 
 /// The name of the page at `back`, for a "Back to …" link.
 fn back_label(back: &str) -> String {
-    let path = back.split_once('?').map_or(back, |(p, _)| p);
-    if let Some(g) = path.strip_prefix("/admin/settings/").and_then(Group::from_slug) {
-        return format!("Back to {}", g.title());
-    }
     match menu::locate(back) {
         Some((id, _, _)) => format!("Back to {}", id.page().name),
         None => "Back to the settings".to_string(),
@@ -316,7 +249,7 @@ pub async fn save_at_group(
     slug: Result<Path<String>, PathRejection>,
     Form(pairs): Form<Vec<(String, String)>>,
 ) -> Response {
-    if old_group(slug).is_none() {
+    if !old_group(&slug) {
         return super::not_found().await;
     }
     save_form(&state, peer, &headers, &pairs).await
@@ -407,7 +340,7 @@ pub struct KeyForm {
 }
 
 /// `POST /admin/settings/reset`: remove the saved value, back to the
-/// file's or the default (§8.3).
+/// file's or the default.
 pub async fn reset(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -445,7 +378,7 @@ pub async fn reset(
 }
 
 /// `POST /admin/settings/keep`: keep the saved value although `app.toml`
-/// changed under it (§8.4); the notice goes.
+/// changed under it; the notice goes.
 pub async fn keep(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -478,8 +411,7 @@ pub struct RestartForm {
     pub back: Option<String>,
 }
 
-/// `POST /admin/restart` (§8.5, C-A4): confirmed, then a `restart`
-/// command.
+/// `POST /admin/restart`: confirmed, then a `restart` command.
 pub async fn restart(
     State(state): State<AdminState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -523,7 +455,7 @@ pub async fn restart(
     enqueue(&state, &op, &AdminCommand::Restart).await
 }
 
-/// A URL with any `user:password@` removed (§5.9).
+/// A URL with any `user:password@` removed.
 #[must_use]
 pub fn without_credentials(text: &str) -> String {
     match url::Url::parse(text) {
@@ -577,7 +509,7 @@ fn list<T: std::fmt::Display>(items: impl IntoIterator<Item = T>) -> String {
     if v.is_empty() { "none".to_string() } else { v.join(", ") }
 }
 
-/// The rows of "Set when Prism was installed" (§8.6).
+/// The rows of "Set when Prism was installed".
 #[must_use]
 pub fn installed_rows(ctx: &SettingsContext) -> Vec<Fixed> {
     let c = &ctx.running;
@@ -650,8 +582,7 @@ pub async fn installed(State(state): State<AdminState>, ConnectInfo(peer): Conne
 mod tests {
     use super::*;
 
-    /// T-A15 (settings): the running configuration never shows a URL's
-    /// password.
+    /// The running configuration never shows a URL's password.
     #[test]
     fn credentials_are_removed() {
         assert_eq!(without_credentials("https://user:secret@farsight.example.net/x"), "https://farsight.example.net/x");

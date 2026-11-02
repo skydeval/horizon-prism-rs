@@ -121,7 +121,7 @@ All keys apply at restart. Switching it off clears its progress; switching it on
 
 ## Public page
 
-`[public_page]` sets the read-only page at `/` (see the [API guide](api.md#the-instance-page)). All keys apply at restart and are read-only in the admin UI.
+`[public_page]` sets the read-only page at `/` (see the [API guide](api.md#the-instance-page)). `enabled` and `name` can also be set on the admin Public page; the other keys are set here and apply at restart.
 
 | Key | Default | Meaning |
 |---|---|---|

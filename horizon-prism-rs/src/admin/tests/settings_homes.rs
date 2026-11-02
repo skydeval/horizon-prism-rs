@@ -7,8 +7,8 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::admin::menu::{PAGES, PageId, TABS};
-use crate::admin::settings::registry::{self, Group};
+use crate::admin::menu::{MENU, OLD_GROUP_SLUGS, PAGES, PageId, TABS};
+use crate::admin::settings::registry;
 use crate::admin::settings::view::{self, Place};
 
 type Queued = (String, Value);
@@ -59,9 +59,9 @@ fn card<'a>(body: &'a str, slug: &str) -> &'a str {
     &body[start..end]
 }
 
-/// Every key is on exactly one page: on its home once that page holds its
-/// settings, with forms of its own on Communities, and else on its old
-/// group page; a folded key sits inside the Advanced fold.
+/// Every key is on exactly one page, its home, with forms of its own on
+/// Communities; a folded key sits inside the Advanced fold; no old group
+/// page is left.
 #[tokio::test]
 async fn every_key_renders_on_one_page() {
     let Some(h) = harness("admin_homes_one_page").await else {
@@ -77,14 +77,9 @@ async fn every_key_renders_on_one_page() {
             paths.push(t.href().to_string());
         }
     }
-    for g in Group::ALL {
-        // A group with settings left is its page; one with none redirects.
-        let path = format!("/admin/settings/{}", g.slug());
-        if view::sections_at(Place::Group(g), &networks).is_empty() {
-            assert_eq!(get(&alice, &url(&path)).await.status, 308, "{path}");
-        } else {
-            paths.push(path);
-        }
+    for slug in OLD_GROUP_SLUGS {
+        let path = format!("/admin/settings/{slug}");
+        assert_eq!(get(&alice, &url(&path)).await.status, 308, "{path}");
     }
     for path in paths {
         let page = get(&alice, &url(&path)).await;
@@ -578,6 +573,89 @@ async fn apps_pages_hold_their_settings() {
     h.db.drop_db().await;
 }
 
+/// Request limits is one table: a row per class with its two numbers, each
+/// saved alone and reset alone; Thread Lens's and Refract's limits are on
+/// their own pages. Account lookups holds lodestar's state, counts and
+/// settings, its rarer ones folded; Profiles holds its settings. The old
+/// group addresses redirect there and still save.
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn network_pages_hold_their_settings() {
+    let Some(h) = harness("admin_homes_network").await else {
+        return;
+    };
+    let p = h.pool();
+    let alice = complete_setup(&h, ALICE).await;
+    let url = |path: &str| format!("{}{path}", h.base);
+    let limits = get(&alice, &url("/admin/limits")).await;
+    assert_eq!(limits.status, 200, "{}", limits.body);
+    let body = &limits.body;
+    assert!(body.contains("<h1>Request limits</h1>") && !body.contains("<h2>Settings</h2>"), "{body}");
+    assert!(body.contains("<form id=\"settings\" class=\"stack\" method=\"post\" action=\"/admin/settings/save\">"), "{body}");
+    assert!(body.contains("<div class=\"scroll\">\n<table class=\"limits-table\">") && !body.contains("<details class=\"advanced\""), "{body}");
+    let tables = crate::admin::test_support::html::tables(body);
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].rows.len(), 11, "one row per class");
+    assert_eq!(body.matches("<input type=\"text\" id=\"rate_limits.").count(), 22, "{body}");
+    for class in ["thread_lens", "refract"] {
+        assert!(!body.contains(&format!("name=\"rate_limits.{class}.")), "{class} is on its own page");
+    }
+    assert!(body.contains("<span class=\"pill\">Applies after a restart</span>") && body.contains("<summary>What each limits</summary>"), "{body}");
+    assert!(!body.contains("class=\"secondary reset\""), "nothing saved, nothing to reset");
+    let csrf = csrf_of(&limits);
+    // One cell: one key queued.
+    let save = url("/admin/settings/save");
+    let saved = post(&alice, &save, &[("csrf", &csrf), ("back", "/admin/limits"), ("rate_limits.global.burst", "77"), ("version:rate_limits.global.burst", "0"), ("rate_limits.global.per_sec", &field(body, "rate_limits.global.per_sec").expect("rate"))]).await;
+    assert_eq!(saved.status, 303, "{}", saved.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "rate_limits.global.burst", "value": 77, "base_version": 0}]})));
+    // A saved cell: its own Reset, its row's state, and a reset of it alone.
+    sqlx::query("INSERT INTO operator_settings (key, value, updated_by) VALUES ('rate_limits.global.burst', '77', 'cli')").execute(p).await.expect("row");
+    let saved = get(&alice, &url("/admin/limits")).await;
+    let row = &saved.body[saved.body.find("<tr id=\"s-rate_limits-global-per_sec\">").expect("row")..];
+    let row = &row[..row.find("</tr>").expect("row end")];
+    assert_eq!(row.matches("class=\"secondary reset\"").count(), 1, "{row}");
+    assert!(row.contains("form=\"reset-rate_limits.global.burst\">Reset</button>") && row.contains("saved by the command line"), "{row}");
+    assert!(row.contains("<span class=\"pill amber\">Waits for a restart</span>"), "{row}");
+    assert_eq!(saved.body.matches("class=\"secondary reset\"").count(), 1, "{}", saved.body);
+    let reset = post(&alice, &url("/admin/settings/reset"), &[("csrf", &csrf), ("key", "rate_limits.global.burst"), ("version", "1")]).await;
+    assert_eq!(reset.status, 303, "{}", reset.body);
+    assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "rate_limits.global.burst", "reset": true, "base_version": 1}]})));
+
+    // Account lookups: lodestar off here, its counts, its settings.
+    let lookups = get(&alice, &url("/admin/account-lookups")).await;
+    assert_eq!(lookups.status, 200, "{}", lookups.body);
+    let body = &lookups.body;
+    assert!(body.contains("<title>Account lookups · lodestar · Horizon-Prism admin</title>") && body.contains("<h1>Account lookups</h1>"), "{body}");
+    assert!(body.contains("<div class=\"banner\">Lodestar is off: no address was set when Prism started.</div>"), "{body}");
+    assert!(body.contains("not set up; Prism asks the PLC directory"), "{body}");
+    assert!(!folded(body, "identity.lodestar_url"), "{body}");
+    for key in ["identity.lodestar_request_rate_per_sec", "identity.lodestar_request_burst", "identity.lodestar_timeout_ms"] {
+        assert!(folded(body, key), "{key} is not folded");
+    }
+    assert!(get(&alice, &url("/admin/account-lookups?open=advanced")).await.body.contains("<details class=\"advanced\" id=\"advanced\" open>"));
+    // Profiles: its settings alone.
+    let profiles = get(&alice, &url("/admin/profiles")).await;
+    assert_eq!(profiles.status, 200, "{}", profiles.body);
+    for key in ["cache.profile_ttl_secs", "cache.profile_negative_ttl_secs", "cache.profile_refresh_max"] {
+        assert!(profiles.body.contains(&format!("name=\"{key}\"")) && !folded(&profiles.body, key), "{key}");
+    }
+    // The old group addresses redirect, and still save.
+    for (slug, to, key, value, want) in [
+        ("limits", "/admin/limits", "rate_limits.write.burst", "9", json!(9)),
+        ("profiles", "/admin/profiles", "cache.profile_refresh_max", "9", json!(9)),
+        ("lookups", "/admin/account-lookups#settings", "identity.lodestar_timeout_ms", "777", json!(777)),
+    ] {
+        let old = get(&alice, &url(&format!("/admin/settings/{slug}"))).await;
+        assert_eq!(old.status, 308, "{slug}");
+        assert_eq!(location(&old), to);
+        let version = format!("version:{key}");
+        let alias = post(&alice, &url(&format!("/admin/settings/{slug}")), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
+        assert_eq!(alias.status, 303, "{slug} {key}: {}", alias.body);
+        assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": key, "value": want, "base_version": 0}]})), "{key}");
+    }
+    h.db.drop_db().await;
+}
+
 /// Reset and keep from Members, a typed reset's Cancel kept through a
 /// wrong word, and each file notice on Home leading to the setting.
 #[tokio::test]
@@ -659,6 +737,10 @@ async fn the_command_page_leads_back() {
         ("private_read.degraded_retry_max_secs", "90", "/admin/private?open=advanced#s-private_read-degraded_retry_min_secs", "Back to Private posts"),
         ("bookmarks.count_floor", "4", "/admin/apps#s-bookmarks-emit_count", "Back to What apps see"),
         ("public_page.name", "Our server", "/admin/public-page#s-public_page-name", "Back to Public page"),
+        ("identity.lodestar_url", "https://lodestar.example", "/admin/account-lookups#s-identity-lodestar_url", "Back to Account lookups"),
+        ("identity.lodestar_timeout_ms", "900", "/admin/account-lookups?open=advanced#s-identity-lodestar_timeout_ms", "Back to Account lookups"),
+        ("cache.profile_refresh_max", "9", "/admin/profiles#s-cache-profile_refresh_max", "Back to Profiles and caching"),
+        ("rate_limits.global.burst", "9", "/admin/limits#s-rate_limits-global-per_sec", "Back to Request limits"),
     ] {
         let version = format!("version:{key}");
         let saved = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), (key, value), (&version, "0")]).await;
@@ -670,8 +752,8 @@ async fn the_command_page_leads_back() {
     h.db.drop_db().await;
 }
 
-/// All settings lists the pages that hold their settings, and each group
-/// with settings left, summed up by those settings alone.
+/// All settings lists every page that holds settings, in the menu's order,
+/// and no group is left.
 #[tokio::test]
 async fn all_settings_lists_where_settings_are() {
     let Some(h) = harness("admin_homes_index").await else {
@@ -683,21 +765,37 @@ async fn all_settings_lists_where_settings_are() {
     let own = &body[body.find("<h2>On their own pages</h2>").expect("own pages")..];
     let own = &own[..own.find("</div>").expect("card end")];
     let hrefs: Vec<&str> = own.match_indices("href=\"").map(|(i, _)| &own[i + 6..i + 6 + own[i + 6..].find('"').expect("end")]).collect();
-    assert_eq!(hrefs, ["/admin/members", "/admin/blocks", "/admin/communities", "/admin/thread-lens", "/admin/indexing", "/admin/storage", "/admin/private", "/admin/apps", "/admin/services", "/admin/public-page"], "{own}");
+    assert_eq!(
+        hrefs,
+        [
+            "/admin/members",
+            "/admin/blocks",
+            "/admin/communities",
+            "/admin/thread-lens",
+            "/admin/indexing",
+            "/admin/storage",
+            "/admin/private",
+            "/admin/apps",
+            "/admin/services",
+            "/admin/public-page",
+            "/admin/account-lookups",
+            "/admin/profiles",
+            "/admin/limits",
+        ],
+        "{own}"
+    );
+    // The same list as the registry's homes, in the menu's order.
+    let sections = registry::sections(&[]);
+    let homes: Vec<&str> = MENU.iter().flat_map(|(_, ids)| ids.iter()).filter(|id| sections.iter().any(|s| s.home == **id)).map(|id| id.page().href).collect();
+    assert_eq!(hrefs, homes);
+    assert!(own.contains(">Account lookups · lodestar</a>"), "{own}");
     assert!(own.contains(">Private posts · kryphocron</a>"), "{own}");
     assert!(own.contains(">Communities · Refract</a>") && own.contains(">Blocks · Farsight</a>"), "{own}");
-    let networks: Vec<String> = Vec::new();
-    for g in Group::ALL {
-        let card = format!("<h2><a href=\"/admin/settings/{}\">{}</a></h2>", g.slug(), g.title());
-        assert_eq!(body.contains(&card), !view::sections_at(Place::Group(g), &networks).is_empty(), "{}", g.slug());
+    // No group card is left.
+    for slug in OLD_GROUP_SLUGS {
+        assert!(!body.contains(&format!("/admin/settings/{slug}\"")), "{slug}: {body}");
     }
-    assert!(!body.contains("Who can use Prism") && !body.contains("Blocks (Farsight)") && !body.contains("/admin/settings/blocks"), "{body}");
-    assert!(!body.contains("What Prism stores") && !body.contains("/admin/settings/storage"), "{body}");
-    // A group that lost some settings names only those left.
-    assert!(body.contains("<h2><a href=\"/admin/settings/limits\">Limits</a></h2>"), "{body}");
-    let limits = &body[body.find("/admin/settings/limits").expect("limits")..];
-    let limits = &limits[..limits.find("</p>").expect("summary")];
-    assert!(limits.contains("Visitors not signed in") && !limits.contains("Thread Lens") && !limits.contains("Accounts kept from other communities"), "{limits}");
+    assert!(!body.contains("By group") && !body.contains("Who can use Prism") && !body.contains("What Prism stores"), "{body}");
     h.db.drop_db().await;
 }
 

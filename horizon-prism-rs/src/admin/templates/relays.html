@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">The relays Prism reads the network from, and the stream it reads them through. Nothing on this page changes anything.</p>
+{% for n in notices %}<div class="banner">{{ n.text }}</div>
+{% endfor %}
+
+<div class="scroll">
+<table>
+<thead><tr><th class="name">Relay</th><th class="list">Host</th><th class="state">Behind the network</th><th class="when">Last heard (its newest record)</th></tr></thead>
+<tbody>
+{% for r in relays %}
+<tr><td class="name">{{ r.label }}{% if r.private %}<br><span class="muted wrap">private posts wait for it</span>{% endif %}</td><td class="list">{{ r.hosts }}</td><td class="state"><span class="pill {{ r.class }}">{{ r.behind }}</span></td><td class="when">{{ r.last_heard }}</td></tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<p class="muted">How far behind is measured from the newest record Prism has processed from each relay, so it includes Prism's own processing.</p>
+
+<div class="grid">
+<div class="card">
+<h2>Records</h2>
+{% for f in figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+
+<div class="card">
+<h2>Relays private posts wait for</h2>
+<p>{{ private }}</p>
+<p class="muted">Set in app.toml (<code>firehose.private_relays</code>); restart Prism after changing it.</p>
+</div>
+
+<div class="card">
+<h2>The network stream</h2>
+{% for s in stream %}<p>{{ s }}</p>
+{% endfor %}
+</div>
+</div>
+{% endblock %}

@@ -1,5 +1,31 @@
 <form id="settings" class="stack" method="post" action="/admin/settings/save">
 <input type="hidden" name="csrf" value="{{ settings.csrf }}">
+{% if settings.is_table() %}
+{% if let Some(applies) = settings.applies() %}<p><span class="pill{% if settings.applies_now() %} on{% endif %}">{{ applies }}</span></p>{% endif %}
+{% for s in settings.cards() %}{% for f in s.fields %}{% if let Some(file) = f.file_notice %}<div class="banner">{{ s.title }}, {{ f.label }}: app.toml now says {{ file }}; your saved value {{ f.current }} still applies.
+<button class="secondary" type="submit" form="reset-{{ f.key }}">Use the file's value</button>
+<button class="secondary" type="submit" form="keep-{{ f.key }}">Keep my value</button></div>
+{% endif %}{% endfor %}{% endfor %}
+<div class="scroll">
+<table class="limits-table">
+<thead><tr><th class="name">What it limits</th><th class="num">Per second</th><th class="num">At once</th><th class="text">State</th></tr></thead>
+<tbody>
+{% for s in settings.cards() %}
+<tr id="s-{{ s.slug }}">
+<td class="name" title="{{ s.help }}">{{ s.title }}</td>
+{% for f in s.fields %}<td class="num"><input type="hidden" name="version:{{ f.key }}" value="{{ f.version }}"><input type="text" id="{{ f.key }}" name="{{ f.key }}" value="{{ f.value }}" aria-label="{{ s.title }}: {{ f.label }}" spellcheck="false">{% if f.reset.is_some() && f.file_notice.is_none() %}<button class="secondary reset" type="submit" form="reset-{{ f.key }}">Reset</button>{% endif %}</td>{% endfor %}
+<td class="text"><div class="cell-text">{{ s.state() }}{% for p in s.pills() %} <span class="pill amber">{{ p }}</span>{% endfor %}</div></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+</div>
+<details>
+<summary>What each limits</summary>
+{% for s in settings.cards() %}<div class="fact"><span class="l">{{ s.title }}</span><span class="v">{{ s.help }}</span></div>
+{% endfor %}
+</details>
+{% else %}
 {% if !settings.everyday.is_empty() %}
 <div class="settings-cards">
 {% for s in settings.everyday %}{% include "settings_card.html" %}{% endfor %}
@@ -11,6 +37,7 @@
 {% for s in settings.advanced %}{% include "settings_card.html" %}{% endfor %}
 </div>
 </details>
+{% endif %}
 {% endif %}
 <div class="row"><button type="submit">Save changes</button></div>
 </form>

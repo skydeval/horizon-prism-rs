@@ -1,11 +1,10 @@
-//! Health (`/admin/health`, admin-ui design §6.4): the checks of §9.2 with
-//! their state, and the key figures of §9.1 in words. "Re-sync private
-//! data and members" (typed) sits beside a held gap. The page reloads every
-//! 30 seconds, to `/admin/health?auto=1`, which is watching and not
-//! activity, as Home's reload is (admin-ui-live-feed design §3.3).
+//! Health (`/admin/health`): the checks with their state, and the key
+//! figures in words, each feature's in one line leading to its page.
+//! "Re-sync private data and members" (typed) sits beside a held gap. The
+//! page reloads every 30 seconds, to `/admin/health?auto=1`, which is
+//! watching and not activity, as Home's reload is.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use askama::Template;
 use axum::Form;
@@ -84,7 +83,6 @@ struct HealthPage {
 }
 
 const UNKNOWN: &str = "unknown";
-const FIVE_MIN: Duration = Duration::from_secs(300);
 
 /// The network stream in one phrase, for Home's tile: the furthest relay's
 /// delay.
@@ -152,39 +150,34 @@ fn or_unknown(v: Option<f64>, f: impl Fn(f64) -> String) -> String {
     v.map_or_else(|| UNKNOWN.to_string(), f)
 }
 
-/// The key figures. Storage, public data and private posts are one line
-/// each, linking the page that shows them in full.
-#[allow(clippy::too_many_lines)]
+/// The relays in one phrase: how many, the slowest, and the records
+/// waiting.
+#[must_use]
+pub fn relays_words(state: &AdminState, now: Option<&Snapshot>) -> String {
+    let mut relays: Vec<&String> = state.settings.running.firehose.relay_labels.values().collect();
+    relays.sort();
+    relays.dedup();
+    let n = relays.len();
+    let slowest = match now.and_then(|s| s.max(crate::firehose::watermark::METRIC_DELAY)) {
+        None => "slowest unknown".to_string(),
+        Some(d) if d.is_infinite() => "one has never reported".to_string(),
+        Some(d) if d < 120.0 => format!("slowest {:.0} s behind", d.max(0.0)),
+        Some(d) => format!("slowest {:.0} minutes behind", (d / 60.0).round()),
+    };
+    let waiting = now.and_then(|s| s.sum(crate::firehose::consumer::METRIC_LAG)).map_or_else(|| "records waiting unknown".to_string(), |l| format!("{} records waiting", count(l)));
+    format!("{n} relay{}, {slowest}, {waiting}", if n == 1 { "" } else { "s" })
+}
+
+/// The key figures. Each feature's is one line, linking the page that
+/// shows it in full.
 fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
-    let ring = &state.health.ring;
     let get = |name: &str| now.and_then(|s| s.sum(name));
     let mut groups = Vec::new();
 
-    let mut stream = Vec::new();
-    let mut relays: Vec<String> = state.settings.running.firehose.relay_labels.values().cloned().collect();
-    relays.sort();
-    relays.dedup();
-    for relay in relays {
-        let delay = now.and_then(|s| s.sum_where(crate::firehose::watermark::METRIC_DELAY, "relay", &relay));
-        stream.push(fig(
-            &format!("{relay} delay"),
-            match delay {
-                None => UNKNOWN.to_string(),
-                Some(d) if d.is_infinite() => "never reported".to_string(),
-                Some(d) if d < 120.0 => format!("{d:.0} seconds"),
-                Some(d) => format!("{:.0} minutes", (d / 60.0).round()),
-            },
-        ));
-    }
-    stream.push(fig("Records waiting", or_unknown(get(crate::firehose::consumer::METRIC_LAG), count)));
-    stream.push(fig(
-        "Processed per second (last 5 minutes)",
-        or_unknown(ring.rate(FIVE_MIN, |s| s.sum(crate::firehose::consumer::METRIC_PROCESSED)), |r| format!("{r:.1}")),
-    ));
     groups.push(FigureGroup {
         title: "Network stream",
-        figures: stream,
-        note: "The live feed on Home shows what is indexed as it happens.".to_string(),
+        figures: vec![Figure { link: Some(("/admin/relays", "Relays")), ..fig("Relays", relays_words(state, now)) }],
+        note: String::new(),
     });
 
     groups.push(FigureGroup {
@@ -217,7 +210,7 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
         title: "Services Prism asks",
         figures: vec![
             Figure { link: Some(("/admin/blocks", "Blocks")), ..fig("Farsight (blocks)", farsight_words(state)) },
-            fig("Lodestar (account lookups)", lookups_words(state)),
+            Figure { link: Some(("/admin/account-lookups", "Account lookups")), ..fig("Lodestar (account lookups)", lookups_words(state)) },
         ],
         note: String::new(),
     });
@@ -278,7 +271,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
 }
 
 /// `POST /admin/health/resync`: `resync --private-and-members`, typed
-/// `RESYNC` (§6.4, §7).
+/// `RESYNC`.
 pub async fn resync(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<ResyncForm>) -> Response {
     let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
         Ok(op) => op,
@@ -301,7 +294,7 @@ pub async fn resync(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
 }
 
 /// The checks that need attention, worst first, and how many have no data
-/// (Home, §6.1).
+/// (Home).
 #[must_use]
 pub fn attention(checks: Vec<health::Check>) -> (Vec<CheckView>, usize) {
     let no_data = checks.iter().filter(|c| c.level == health::Level::NoData).count();

@@ -64,7 +64,7 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: DeadletterAction,
     },
-    /// Firehose stream state (read-only).
+    /// The network stream's state (Relays), read-only.
     Stream {
         #[command(subcommand)]
         action: StreamAction,
@@ -99,7 +99,7 @@ pub enum AdminCmd {
     },
     /// Print the first-run setup code while no operator exists (read-only).
     SetupCode,
-    /// Identity reads (read-only).
+    /// Account lookups · lodestar (read-only).
     Identity {
         #[command(subcommand)]
         action: IdentityAction,

@@ -11,7 +11,7 @@ use super::*;
 use crate::admin::fonts::{FONTS, TEXT, WOFF2};
 use crate::admin::test_support::{current_item, sidebar};
 
-/// A page, under the ten-pages-a-second limit (§5.6).
+/// A page, under the ten-pages-a-second limit.
 async fn get(b: &Browser, url: &str) -> Page {
     tokio::time::sleep(Duration::from_millis(120)).await;
     b.get(url).await
@@ -185,7 +185,7 @@ async fn menu_order_and_product_name() {
     assert_eq!(home.status, 200, "{}", home.body);
     assert_eq!(
         menu(&home.body),
-        ["Home", "Members", "Operators", "Look up", "Labels", "Blocks", "Communities", "Thread Lens", "Indexing", "Storage", "Jobs", "Problems", "Private posts", "What apps see", "Extra services", "Public page", "Health", "Stats", "About this server", "Audit log", "All settings"]
+        ["Home", "Members", "Operators", "Look up", "Labels", "Blocks", "Communities", "Thread Lens", "Indexing", "Storage", "Jobs", "Problems", "Private posts", "What apps see", "Extra services", "Public page", "Relays", "Account lookups", "Profiles and caching", "Request limits", "Health", "Stats", "About this server", "Audit log", "All settings"]
     );
     assert_eq!(current_item(&home.body), Some(("Home".to_string(), "page".to_string())), "{}", home.body);
     // The name: the brand, the title, Home's card.

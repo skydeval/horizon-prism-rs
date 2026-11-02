@@ -2,9 +2,9 @@
 //! sidebar, each page's `<title>`, eyebrow and h1, the redirects from old
 //! addresses, and where Cancel and Back may go.
 //!
-//! Every page has a [`PageId`] and a [`PAGES`] row, built or not. Only the
-//! pages in [`MENU`] (and Appearance) exist: they are routed, linked and
-//! accepted as a way back. A page not built yet answers the plain 404 page.
+//! Every page has a [`PageId`] and a [`PAGES`] row. The pages in [`MENU`]
+//! (and Appearance) exist: they are routed, linked and accepted as a way
+//! back.
 
 use std::fmt::Write as _;
 
@@ -118,23 +118,8 @@ pub const MENU: &[(SectionKey, &[PageId])] = &[
     (SectionKey::Data, &[PageId::Indexing, PageId::Storage, PageId::Jobs, PageId::Problems]),
     (SectionKey::Private, &[PageId::Private]),
     (SectionKey::Apps, &[PageId::Apps, PageId::Services, PageId::PublicPage]),
+    (SectionKey::Network, &[PageId::Relays, PageId::AccountLookups, PageId::Profiles, PageId::Limits]),
     (SectionKey::System, &[PageId::Health, PageId::Stats, PageId::About, PageId::Audit, PageId::Settings]),
-];
-
-/// The pages that hold their own settings now. Every other key still
-/// renders on its old settings group page, apart from the Communities
-/// page's own forms.
-pub const SETTINGS_LIVE: &[PageId] = &[
-    PageId::Members,
-    PageId::Blocks,
-    PageId::Communities,
-    PageId::ThreadLens,
-    PageId::Indexing,
-    PageId::Storage,
-    PageId::Private,
-    PageId::Apps,
-    PageId::Services,
-    PageId::PublicPage,
 ];
 
 /// A tab of Communities · Refract.
@@ -271,9 +256,9 @@ pub const REDIRECTS: &[(&str, &str, &str)] = &[
     ("/admin/activity", "/admin/audit", ""),
 ];
 
-/// Old settings group pages with no settings left on them, `/admin/settings/{slug}`:
-/// the slug, the page holding most of what was there, and the fragment.
-/// They answer `308` to a GET; a POST to one of the old slugs still saves.
+/// The old settings group pages, `/admin/settings/{slug}`: the slug, the
+/// page holding most of what was there, and the fragment. They answer `308`
+/// to a GET; a POST to one of the old slugs still saves.
 pub const GROUP_REDIRECTS: &[(&str, &str, &str)] = &[
     ("communities", "/admin/communities", ""),
     ("blocks", "/admin/blocks", "settings"),
@@ -282,10 +267,12 @@ pub const GROUP_REDIRECTS: &[(&str, &str, &str)] = &[
     ("private", "/admin/private", "settings"),
     ("apps", "/admin/apps", ""),
     ("services", "/admin/services", ""),
+    ("limits", "/admin/limits", ""),
+    ("profiles", "/admin/profiles", ""),
+    ("lookups", "/admin/account-lookups", "settings"),
 ];
 
-/// Where an old group slug's GET now goes, once its page has no settings
-/// left.
+/// Where an old group slug's GET now goes.
 #[must_use]
 pub fn group_redirect(slug: &str) -> Option<(&'static str, &'static str)> {
     GROUP_REDIRECTS.iter().find(|(s, _, _)| *s == slug).map(|(_, to, fragment)| (*to, *fragment))
@@ -391,7 +378,7 @@ pub fn safe_back(back: &str) -> bool {
         return !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit());
     }
     if let Some(slug) = path.strip_prefix("/admin/settings/") {
-        return matches!(slug, "installed" | "running") || (OLD_GROUP_SLUGS.contains(&slug) && group_redirect(slug).is_none());
+        return matches!(slug, "installed" | "running");
     }
     false
 }
@@ -472,7 +459,9 @@ mod tests {
                 assert_eq!(id.page().section, Some(*key), "{id:?}");
             }
         }
-        assert_eq!(menu.len(), 21);
+        assert_eq!(menu.len(), 25);
+        // Every page is built.
+        assert!(PAGES.iter().all(|p| p.id.built()));
     }
 
     #[test]
@@ -485,12 +474,12 @@ mod tests {
         assert_eq!(PageId::Appearance.eyebrow(), "Your account");
         assert_eq!(Tab::Communities.title(), "Communities · Refract");
         assert_eq!(Tab::Accounts.title(), "Accounts · Communities · Refract");
-        assert!(PageId::Blocks.built() && PageId::Appearance.built() && PageId::Storage.built() && PageId::Private.built() && PageId::PublicPage.built() && !PageId::Relays.built());
+        assert!(PageId::Blocks.built() && PageId::Appearance.built() && PageId::Relays.built() && PageId::Limits.built());
+        assert_eq!(PageId::AccountLookups.title(), "Account lookups · lodestar");
+        assert_eq!(PageId::AccountLookups.eyebrow(), "Network · lodestar");
         assert_eq!(PageId::Private.title(), "Private posts · kryphocron");
         assert!(Tab::Accounts.built() && Tab::Pending.built() && PageId::ThreadLens.built());
         assert_eq!(Tab::Pending.title(), "Pending ends · Communities · Refract");
-        // A page holds its settings only once it is built.
-        assert!(SETTINGS_LIVE.iter().all(|id| id.built()));
     }
 
     #[test]
@@ -519,7 +508,9 @@ mod tests {
         assert_eq!(locate("/admin/private"), Some((PageId::Private, Current::Page, None)));
         assert_eq!(locate("/admin/apps"), Some((PageId::Apps, Current::Page, None)));
         assert_eq!(locate("/admin/public-page"), Some((PageId::PublicPage, Current::Page, None)));
-        assert_eq!(locate("/admin/relays"), None);
+        assert_eq!(locate("/admin/relays"), Some((PageId::Relays, Current::Page, None)));
+        assert_eq!(locate("/admin/account-lookups?open=advanced"), Some((PageId::AccountLookups, Current::Page, None)));
+        assert_eq!(locate("/admin/nowhere"), None);
     }
 
     /// Cancel goes only to a page of this admin that exists now.
@@ -533,7 +524,10 @@ mod tests {
             "/admin/communities/accounts?state=restored",
             "/admin/commands/12",
             "/admin/settings/running",
-            "/admin/settings/limits",
+            "/admin/relays",
+            "/admin/account-lookups?open=advanced",
+            "/admin/profiles",
+            "/admin/limits",
             "/admin/apps",
             "/admin/services",
             "/admin/public-page?open=advanced",
@@ -564,7 +558,10 @@ mod tests {
             "/admin/communities/accounts/not-a-did",
             "/admin/commands/12a",
             "/admin/commands/",
-            "/admin/relays",
+            "/admin/nowhere",
+            "/admin/settings/limits",
+            "/admin/settings/profiles",
+            "/admin/settings/lookups",
             "/admin/settings/apps",
             "/admin/settings/services",
             "/admin/settings/private",
@@ -599,6 +596,11 @@ mod tests {
         assert_eq!(group_redirect("private"), Some(("/admin/private", "settings")));
         assert_eq!(group_redirect("apps"), Some(("/admin/apps", "")));
         assert_eq!(group_redirect("services"), Some(("/admin/services", "")));
-        assert_eq!(group_redirect("limits"), None);
+        assert_eq!(group_redirect("limits"), Some(("/admin/limits", "")));
+        assert_eq!(group_redirect("profiles"), Some(("/admin/profiles", "")));
+        assert_eq!(group_redirect("lookups"), Some(("/admin/account-lookups", "settings")));
+        assert_eq!(group_redirect("nowhere"), None);
+        // Every old group redirects.
+        assert!(OLD_GROUP_SLUGS.iter().all(|s| group_redirect(s).is_some()));
     }
 }

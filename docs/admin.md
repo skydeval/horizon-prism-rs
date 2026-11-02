@@ -31,16 +31,20 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Data | Indexing | What Horizon-Prism indexes, the switch between kryphocron only and community, and a refill's progress. |
 | Data | Storage | Database size against its budget, Redis, account ids, disks and compression; the budget and how long records are kept. |
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
-| Data | Problems | Dead letters and stream state; replay or drop. |
+| Data | Problems | Dead letters; replay or drop. |
 | kryphocron | kryphocron | Reads, failed reads and stored counts; how deep threads go, how fresh reads must be, late notifications and how far back search reaches; timing floors under Advanced. |
 | Apps | What apps see | Email confirmation, live now, trending topics, texts for features Horizon-Prism does not offer, bookmark counts and where public videos play from. |
 | Apps | Extra services | Push notifications, age checks and contact import: passed on to their service or not offered. |
 | Apps | Public page | The public page on or off and its name, with a link to it while it is on. |
-| System | Health | Database, Redis, relays, disk and background checks. |
+| Network | Relays | Each relay's delay and host, the input rate, records waiting and processed, the stream state, and the relays kryphocron reads wait for (read-only). |
+| Network | Account lookups · lodestar | Lodestar's state and counts; its address, with its rate and longest wait under Advanced. |
+| Network | Profiles and caching | How long other networks' profiles are reused, and each network's background refresh. |
+| Network | Request limits | Every request limit in one table: per second and at once. |
+| System | Health | Database, Redis, relays, disk and background checks, with one line per feature. |
 | System | Stats | How much is indexed, table sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |
 | System | Audit log | Every change, who made it, how it ended, and sign-ins. |
-| System | All settings | Links to the pages that hold their own settings, and one page per remaining group. Each setting shows its current value, default, file value and when it applies; rarely changed ones sit under Advanced. Also read-only pages for install-time values and the full running configuration (no secrets). |
+| System | All settings | Links to the pages that hold their own settings. Each setting shows its current value, default, file value and when it applies; rarely changed ones sit under Advanced. Also read-only pages for install-time values and the full running configuration (no secrets). |
 | Your account | Appearance | Light, dark or the device's mode, a colour scheme and a font, for your account only. |
 
 Old admin addresses redirect to their new pages.
@@ -68,7 +72,7 @@ Commands that change state are queued and executed by the running `app`. The CLI
 | `scope` | `rebuild` | Run the scope check now. |
 | `backfill`, `resync` | | Re-index accounts. `resync --private-and-members` is the recovery step after a relay gap. |
 | `deadletter` | `list`, `replay`, `drop`, `sweep` | Records that failed to index. |
-| `stream` | `info` | Consumer lag and stream bounds. |
+| `stream` | `info` | The stream's state, as on Relays. |
 | `commands` | `list` | Queued admin commands and their state. |
 | `lists` | `sync`, `purge` | Copies of lists used by members' list mutes and blocks. |
 | `farsight` | `status`, `prime`, `forget` | Farsight (optional). |

@@ -1,6 +1,7 @@
 //! Stats (`/admin/stats`): how much is indexed, and the endpoints in use
-//! since Prism started, with one line each on the space used and the
-//! private posts stored, which Storage and Private posts show in full. Nothing here changes anything, and nothing counts a large
+//! since Prism started, with one line each on the space used, the private
+//! posts stored and account lookups, which Storage, Private posts and
+//! Account lookups show in full. Nothing here changes anything, and nothing counts a large
 //! table: big tables are Postgres's own estimates from the storage sampler,
 //! marked "about".
 
@@ -59,6 +60,8 @@ struct StatsPage {
     database: String,
     /// The private posts stored, in words.
     private_stored: String,
+    /// Lodestar, in words.
+    lodestar: String,
     groups: Vec<FigureGroup>,
     /// When the sampler last measured the tables.
     as_of: String,
@@ -109,24 +112,6 @@ fn holds(s: &Snapshot) -> Vec<Figure> {
             fig(label, v.map_or_else(|| "not measured yet".to_string(), count))
         })
         .collect()
-}
-
-/// Lodestar's calls since the start, in three words.
-fn lodestar(state: &AdminState, s: &Snapshot) -> FigureGroup {
-    use crate::identity::lodestar::{METRIC_CALLS, METRIC_SKIPPED};
-    let figures = if let Some(l) = &state.settings.lodestar {
-        let answered: f64 = ["answered", "not_found", "tombstoned"].iter().filter_map(|o| s.sum_where(METRIC_CALLS, "outcome", o)).sum();
-        let all = s.sum(METRIC_CALLS).unwrap_or(0.0);
-        vec![
-            fig("Server", l.host().to_string()),
-            fig("Answered by lodestar", count(answered)),
-            fig("Not answered (Prism asked the PLC directory)", count((all - answered).max(0.0))),
-            fig("Not asked (lodestar behind, or over its rate)", count(s.sum(METRIC_SKIPPED).unwrap_or(0.0))),
-        ]
-    } else {
-        vec![fig("Lodestar", "not set up; Prism asks the PLC directory")]
-    };
-    FigureGroup { title: "Account lookups (lodestar)", figures, note: "Counted since Prism started.".to_string() }
 }
 
 fn endpoint_rows(rows: Vec<usage::Row>) -> (Vec<EndpointRow>, Vec<NeverRow>) {
@@ -197,7 +182,6 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
         fig("Blocks of whole lists stored", about(rows_of(&s, "list_blocks"))),
     ];
     groups.push(FigureGroup { title: "Blocks", figures: blocks, note: "Prism keeps only blocks made by or against a member.".to_string() });
-    groups.push(lodestar(&state, &s));
 
     #[allow(clippy::cast_precision_loss)]
     let tables = stats::tables(&s)
@@ -221,6 +205,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             title: "Stats".to_string(),
             database: database_words(&state, Some(&s)),
             private_stored: super::private::stored_words(&s),
+            lodestar: super::network::summary(&state, &s),
             groups,
             as_of,
             tables,

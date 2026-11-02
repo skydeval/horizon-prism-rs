@@ -1,8 +1,8 @@
-//! About this server (`/admin/about`, formerly Instance) and the lexicons
-//! it serves, over HTTP:
-//! operator sign-in, every section from fixture state (relays by label and
-//! host, the refracted communities, the notices, the methods, the lexicons,
-//! the figures), no live feed, and the lexicon route.
+//! About this server (`/admin/about`, formerly Instance), the lexicons it
+//! serves, and Relays, over HTTP: operator sign-in; About's facts, what it
+//! serves and the methods and lexicons, with no status; Relays by label and
+//! host with the input rate, the records waiting, the private relays and the
+//! notices; no live feed, and the lexicon route.
 
 use chrono::{TimeDelta, Utc};
 
@@ -134,41 +134,12 @@ async fn instance_page_and_lexicons() {
         "Horizon-Prism, an AT Protocol AppView written in Rust.",
         env!("CARGO_PKG_VERSION"),
         "did:web:prism.example.com",
-        // Status: the probes, the audit guard with its cause, each relay by
-        // label with its host, the input rate, lookups and block lists.
-        "Prism can reach its database.",
-        "No data: Redis is not connected to these pages.",
-        "Prism stopped because its private-post audit log failed.",
-        "<td class=\"name\">relay-a<",
-        "<td class=\"list\">relay-a.example</td>",
-        "5 s behind",
-        "<td class=\"list\">relay-b.example</td>",
-        "never reported on this database",
-        "private posts wait for it",
-        "100.0 events a second, over the last 5 minutes",
-        "off (the PLC directory is asked)",
-        "The PLC directory is plc.example.",
-        "Farsight at blocks.example",
-        // Notices.
-        "Private posts are catching up",
-        "Prism is catching up with the network",
-        "Public data is being turned on.",
-        "Search is still being prepared.",
-        // What it does here.
-        "filling: public data is being refilled",
-        "This instance's own labels",
-        "None: Prism follows no labeler's stream.",
-        "community-a's labeler, for its members' restored accounts",
-        "did:plc:labelerofcommunitya000",
-        "read through its labeler",
-        "Refract is on.",
-        "<td class=\"name\">community-a</td>",
-        "pds.community-a.example",
-        "*.community-a.example",
-        "<td class=\"name\">community-b</td>",
-        "<code class=\"chip\">community-b.example</code>",
-        "network-b",
-        "Not configured",
+        "Running since",
+        // What it serves: one paragraph each, leading to its page.
+        "Public data is being turned on: Prism is refilling it, and answers public requests when that is done. — <a href=\"/admin/indexing\">Indexing</a>",
+        "Prism applies its own labels, as did:web:prism.example.com, and follows no labeler&#39;s stream. Restored accounts also carry the labels of their community&#39;s labeler (1 community has one). — <a href=\"/admin/labels\">Labels</a>",
+        "Refract is on: accounts other communities still host stay readable, for 2 listed communities (1 in use). — <a href=\"/admin/communities\">Communities</a>",
+        "Moderation policy: Not configured",
         // For developers.
         "test.instance.served",
         "Answered \"not offered here\"</h3>",
@@ -176,12 +147,12 @@ async fn instance_page_and_lexicons() {
         "app.bsky.feed.getTimeline",
         "app.nearhorizon.actor.getMembership",
         "href=\"/admin/lexicons/app/nearhorizon/actor/getMembership.json\"",
-        // Figures.
-        "about 12,345",
-        "about 678",
-        "Accounts Prism follows",
     ] {
         assert!(body.contains(text), "{text}: {body}");
+    }
+    // Its status is on Health and the feature pages, not here.
+    for gone in ["<h2>Status</h2>", "<h3>Relays</h3>", "<h2>Figures</h2>", "relay-a", "Prism can reach its database.", "Private posts are catching up", "about 12,345", "community-b.example"] {
+        assert!(!body.contains(gone), "{gone}: {body}");
     }
     // The served method is under its namespace, not among the 501s.
     let served_at = body.find("test.instance.served").expect("served");
@@ -203,5 +174,43 @@ async fn instance_page_and_lexicons() {
         let page = get(&alice, &url(missing)).await;
         assert_eq!(page.status, 404, "{missing}");
     }
+    h.db.drop_db().await;
+}
+
+/// Relays: each relay by label and host, how far behind, the input rate and
+/// the records waiting, the relays private posts wait for, read-only, and
+/// the notices of relays catching up.
+#[tokio::test]
+async fn relays_page() {
+    let inputs = HealthInputs { metrics: Some(Arc::new(Fixed(METRICS.to_string()))), ring: ring(), ..HealthInputs::default() };
+    let Some(h) = harness_config("admin_relays_page", quick(), true, inputs, config()).await else {
+        return;
+    };
+    let alice = complete_setup(&h, ALICE).await;
+    let page = get(&alice, &format!("{}/admin/relays", h.base)).await;
+    assert_eq!(page.status, 200, "{}", page.body);
+    let body = &page.body;
+    for text in [
+        "<h1>Relays</h1>",
+        "<p class=\"eyebrow\">Network</p>",
+        "<td class=\"name\">relay-a<",
+        "<td class=\"list\">relay-a.example</td>",
+        "5 s behind",
+        "<td class=\"list\">relay-b.example</td>",
+        "never reported on this database",
+        "private posts wait for it",
+        "<span class=\"l\">Input from the relays</span><span class=\"v\">100.0 events a second, over the last 5 minutes</span>",
+        "<span class=\"l\">Records waiting</span><span class=\"v\">200,000</span>",
+        "<span class=\"l\">Processed per second (last 5 minutes)</span><span class=\"v\">unknown</span>",
+        "<h2>Relays private posts wait for</h2>\n<p>relay-b</p>",
+        "restart Prism after changing it",
+        "The network stream&#39;s state is unknown: Redis is not connected to these pages.",
+        "Private posts are catching up",
+        "Prism is catching up with the network",
+    ] {
+        assert!(body.contains(text), "{text}: {body}");
+    }
+    // Read-only: no form but the sidebar's.
+    assert_eq!(body.matches("<form").count(), 1, "{body}");
     h.db.drop_db().await;
 }

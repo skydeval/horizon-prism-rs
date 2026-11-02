@@ -38,7 +38,7 @@ fn int(v: Option<&Value>) -> Option<i64> {
     }
 }
 
-/// The stream and its reader group, read for the admin UI's Problems page.
+/// The stream and its reader group, read for the admin UI's Relays page.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamInfo {
     pub length: Option<i64>,

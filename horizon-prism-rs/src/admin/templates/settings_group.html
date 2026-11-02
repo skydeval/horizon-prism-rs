@@ -1,9 +1,0 @@
-{% extends "base.html" %}
-{% block content %}
-<p class="muted"><a href="/admin/settings">All settings</a></p>
-<h1>{{ title }}</h1>
-
-{% if let Some(l) = lodestar %}<div class="banner">{{ l }}</div>{% endif %}
-
-{% include "settings_block.html" %}
-{% endblock %}

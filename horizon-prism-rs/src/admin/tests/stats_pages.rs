@@ -67,9 +67,9 @@ async fn stats_page_and_the_disk_tile() {
         // leading to their page.
         "Private posts stored: about 77 — <a href=\"/admin/private\">Private posts</a>",
         "2.0 GB",
-        // Blocks and lodestar.
+        // Blocks, and lodestar in one line, leading to its page.
         "Not kept since Prism started (no member involved)",
-        "not set up; Prism asks the PLC directory",
+        "Account lookups: not set up; Prism asks the PLC directory — <a href=\"/admin/account-lookups\">Account lookups</a>",
         // Endpoints.
         "Get timeline (posts and feeds)",
         "app.bsky.feed.getTimeline",
@@ -80,6 +80,7 @@ async fn stats_page_and_the_disk_tile() {
         assert!(page.body.contains(text), "{text}: {}", page.body);
     }
     assert!(!page.body.contains("<h2>Disks</h2>") && !page.body.contains("Disk holding") && !page.body.contains("Redis memory"), "{}", page.body);
+    assert!(!page.body.contains("Account lookups (lodestar)") && !page.body.contains("Answered by lodestar"), "{}", page.body);
     // The private table is listed under its label, its own name in grey.
     assert!(page.body.contains(&format!("Private posts<br><span class=\"muted tech\">{private}</span>")), "{}", page.body);
     assert!(!page.body.contains("With images") && !page.body.contains("Read in the new form"), "{}", page.body);

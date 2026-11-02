@@ -1,6 +1,5 @@
-//! Health, Jobs, Problems, Blocks (Farsight) and Home's tiles over HTTP
-//! (admin-ui design §6.1, §6.4, §6.6-§6.8, §9; T-A7 for their typed
-//! actions, T-A13 "no data" when a series is absent): the checks from the
+//! Health, Jobs, Problems, Blocks · Farsight and Home's tiles over HTTP,
+//! their typed actions, and "no data" when a series is absent: the checks from the
 //! snapshot ring, the key figures, failed jobs and "try again", the
 //! clean-up's check and typed run, the typed re-sync, the dead letters and
 //! their actions, Farsight not set up, and Home's attention list.
@@ -17,7 +16,7 @@ async fn queued(pool: &PgPool) -> Vec<Queued> {
     sqlx::query_as("SELECT command, args, requested_by FROM admin_commands ORDER BY id").fetch_all(pool).await.expect("commands")
 }
 
-/// A POST past the one-change-a-second limit (§5.6).
+/// A POST past the one-change-a-second limit.
 async fn post(b: &Browser, url: &str, form: &[(&str, &str)]) -> Page {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     b.post(url, form).await
@@ -88,16 +87,21 @@ async fn health_jobs_and_home() {
         "Prism is reading the network stream.",
         "bsky is up to date",
         "No data: none have been counted since Prism started.",
-        "Records waiting",
-        "200,000",
+        // The relays in one line, leading to Relays.
+        "<span class=\"l\">Relays</span><span class=\"v\">2 relays, slowest 4 s behind, 200,000 records waiting — <a href=\"/admin/relays\">Relays</a></span>",
+        "<span class=\"l\">Lodestar (account lookups)</span><span class=\"v\">off (the PLC directory is asked) — <a href=\"/admin/account-lookups\">Account lookups</a></span>",
         "1.0 GB of",
         "<span class=\"l\">Could not be read (last hour)</span><span class=\"v\">0 — <a href=\"/admin/private\">Private posts</a></span>",
         "url=/admin/health?auto=1",
     ] {
         assert!(health.body.contains(text), "{text}: {}", health.body);
     }
-    // The private posts' figures are on their page.
-    assert!(!health.body.contains("Read in the new form"), "{}", health.body);
+    // The private posts' and the relays' figures are on their pages.
+    assert!(!health.body.contains("Read in the new form") && !health.body.contains("Processed per second") && !health.body.contains("bsky delay"), "{}", health.body);
+    // Every relay's check leads to Relays.
+    assert!(health.body.contains("bsky is up to date (4 s behind). <a href=\"/admin/relays\">Relays</a>"), "{}", health.body);
+    let relays = get(&alice, &url("/admin/relays")).await;
+    assert!(relays.body.contains("<span class=\"l\">Processed per second (last 5 minutes)</span>") && relays.body.contains("<span class=\"l\">Records waiting</span><span class=\"v\">200,000</span>"), "{}", relays.body);
     let private = get(&alice, &url("/admin/private")).await;
     assert!(private.body.contains("<span class=\"l\">Read in the new form (text, links and embeds together)</span><span class=\"v\">7</span>"), "{}", private.body);
     assert!(private.body.contains("<span class=\"l\">Could not be read (last hour)</span><span class=\"v\">0</span>"), "{}", private.body);
@@ -108,7 +112,7 @@ async fn health_jobs_and_home() {
     // Jobs: a failed scope job of an account Prism follows can be tried
     // again; a list sync cannot. A failed job of an account Prism no longer
     // follows is counted, not listed, and not on Health; unavailable jobs are
-    // a column and a reasons table (actionable-warnings design §5).
+    // a column and a reasons table.
     sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 4), ('did:plc:un1', 4)").bind(BOB).execute(p).await.expect("scope");
     for (did, depth, state, error) in [
         (BOB, "scope", "failed", "getRepoStatus: HTTP 502"),
@@ -195,12 +199,14 @@ async fn health_jobs_and_home() {
     assert_eq!(farsight.status, 200);
     assert!(farsight.body.contains("Farsight is not set up"), "{}", farsight.body);
 
-    // Problems without Redis: said plainly.
+    // Problems without Redis: said plainly, the stream in one line leading
+    // to Relays.
     let problems = get(&alice, &url("/admin/problems")).await;
     assert_eq!(problems.status, 200);
-    assert!(problems.body.contains("could not read this list") && problems.body.contains("state is unknown"), "{}", problems.body);
+    assert!(problems.body.contains("could not read this list") && problems.body.contains("<p>Stream: unknown — <a href=\"/admin/relays\">Relays</a></p>"), "{}", problems.body);
+    assert!(!problems.body.contains("<h2>The network stream</h2>"), "{}", problems.body);
 
-    // A forged form changes nothing (T-A7).
+    // A forged form changes nothing.
     let before = queued(p).await.len();
     let forged = post(&alice, &url("/admin/jobs/scope-check"), &[("csrf", "forged")]).await;
     assert_eq!(forged.status, 403);
@@ -293,7 +299,7 @@ async fn problems_lists_dead_letters() {
     let dismiss = post(&alice, &format!("{}/admin/problems/dismiss", h.base), &[("csrf", &csrf), ("id", &id), ("confirm", "yes")]).await;
     assert_eq!(dismiss.status, 303, "{}", dismiss.body);
     assert_eq!(last_command(&queued(h.pool()).await), ("deadletter drop".to_string(), json!({"id": id}), Some(ALICE.to_string())));
-    // Clear out (actionable-warnings design §7.2): confirmed, then
+    // Clear out: confirmed, then
     // `deadletter sweep`.
     assert!(page.body.contains("action=\"/admin/problems/sweep\""), "{}", page.body);
     let confirm = post(&alice, &format!("{}/admin/problems/sweep", h.base), &[("csrf", &csrf)]).await;

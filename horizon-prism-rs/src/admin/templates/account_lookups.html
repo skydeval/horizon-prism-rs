@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p class="muted">Where Prism looks up who an account is, its handle and its server, before it asks the PLC directory.</p>
+<div class="banner">{{ state }}</div>
+
+<div class="card">
+<h2>Lookups</h2>
+{% for f in figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+<p class="muted">Counted since Prism started.</p>
+</div>
+
+<h2>Settings</h2>
+{% include "settings_block.html" %}
+{% endblock %}

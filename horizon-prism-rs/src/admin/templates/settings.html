@@ -34,18 +34,8 @@ used the values from app.toml instead. Change or clear them on their page.</div>
 
 <div class="card">
 <h2>On their own pages</h2>
-<p class="muted">These pages hold their settings beside what they show.</p>
+<p class="muted">Each page holds its settings beside what it shows.</p>
 <ul>{% for p in own %}<li><a href="{{ p.href }}">{{ p.label }}</a></li>{% endfor %}</ul>
-</div>
-
-{% if !groups.is_empty() %}<h2>By group</h2>{% endif %}
-<div class="grid">
-{% for g in groups %}
-<div class="card">
-<h2><a href="/admin/settings/{{ g.slug }}">{{ g.title }}</a></h2>
-<p class="muted">{{ g.summary }}</p>
-</div>
-{% endfor %}
 </div>
 
 <h2>Yours alone</h2>

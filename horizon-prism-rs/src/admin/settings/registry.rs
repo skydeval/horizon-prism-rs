@@ -1,15 +1,9 @@
-//! The settings the admin UI edits (admin-ui design §8.7): every editable
-//! key, its group, its title and plain explanation, its kind, whether it
+//! The settings the admin UI edits: every editable key, the page it
+//! belongs on, its title and plain explanation, its kind, whether it
 //! applies at once or after a restart, and whether a change needs a typed
 //! confirmation. This list is the whole set of editable keys; anything not
-//! here is read-only (§8.6). The default shown is read from
+//! here is read-only. The default shown is read from
 //! `FileConfig::default()` at the key's path.
-//!
-//! Beyond §8.7's eight groups: the four scope-recency keys in Group 2
-//! (scope-recency design §5), `private_notify.backfill_max_age_hours`,
-//! `private_search.max_age_days` and `video.playback` (private-video-pds
-//! design), and a ninth group for the lodestar keys (lodestar-reads design
-//! §2.14).
 
 use serde_json::{Map, Number, Value};
 
@@ -17,75 +11,6 @@ use super::live::is_live;
 use super::overlay::network_name_ok;
 use crate::admin::menu::PageId;
 use crate::config::{COMMUNITY_NETWORK, UtcTimeOfDay, pds_pattern};
-
-/// A page of settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Group {
-    Access,
-    Storage,
-    Private,
-    Blocks,
-    Apps,
-    Services,
-    Limits,
-    Profiles,
-    Lookups,
-    /// Refract's two live keys (refract design §9.1). Edited on the
-    /// Communities page, not a generic settings page, so it is not in
-    /// [`Group::ALL`].
-    Communities,
-}
-
-impl Group {
-    pub const ALL: [Self; 9] = [
-        Self::Access,
-        Self::Storage,
-        Self::Private,
-        Self::Blocks,
-        Self::Apps,
-        Self::Services,
-        Self::Limits,
-        Self::Profiles,
-        Self::Lookups,
-    ];
-
-    #[must_use]
-    pub fn slug(self) -> &'static str {
-        match self {
-            Self::Access => "access",
-            Self::Storage => "storage",
-            Self::Private => "private",
-            Self::Blocks => "blocks",
-            Self::Apps => "apps",
-            Self::Services => "services",
-            Self::Limits => "limits",
-            Self::Profiles => "profiles",
-            Self::Lookups => "lookups",
-            Self::Communities => "communities",
-        }
-    }
-
-    #[must_use]
-    pub fn title(self) -> &'static str {
-        match self {
-            Self::Access => "Who can use Prism",
-            Self::Storage => "What Prism stores",
-            Self::Private => "Private posts",
-            Self::Blocks => "Blocks (Farsight)",
-            Self::Apps => "What apps see",
-            Self::Services => "Extra services",
-            Self::Limits => "Limits",
-            Self::Profiles => "Profiles and caching",
-            Self::Lookups => "Account lookups",
-            Self::Communities => "Communities",
-        }
-    }
-
-    #[must_use]
-    pub fn from_slug(slug: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|g| g.slug() == slug)
-    }
-}
 
 /// What a setting holds, and how it is entered.
 #[derive(Debug, Clone, PartialEq)]
@@ -118,7 +43,7 @@ pub enum Kind {
     LiveNow,
     /// `topic | link | name | description`, one per line.
     Topics,
-    /// The Refract communities list, one JSON value (refract design §3.1):
+    /// The Refract communities list, one JSON value:
     /// edited on the Communities page, which saves the whole list.
     Communities,
 }
@@ -131,7 +56,7 @@ impl Kind {
     }
 }
 
-/// A typed confirmation (§5.5) for a change in one direction.
+/// A typed confirmation for a change in one direction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Typed {
     No,
@@ -154,9 +79,6 @@ pub struct Field {
 /// Settings explained together on a page.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Section {
-    /// The settings page it was on before each feature had its own page;
-    /// it renders there until its home page holds settings.
-    pub group: Group,
     /// The feature page it belongs on.
     pub home: PageId,
     /// Rarely changed: folded under Advanced on its page.
@@ -164,7 +86,7 @@ pub struct Section {
     /// Changed only through its page's own forms, never the generic save.
     pub own_form: bool,
     pub title: String,
-    /// The explanation (§8.7's text, verbatim where it has one).
+    /// The explanation.
     pub help: String,
     /// Applies at once; otherwise after a restart.
     pub live: bool,
@@ -206,17 +128,17 @@ fn field(key: &str, label: &str, kind: Kind) -> Field {
     Field { key: key.to_string(), label: label.to_string(), kind, typed: Typed::No }
 }
 
-fn section(group: Group, home: PageId, title: &str, help: &str, live: bool, fields: Vec<Field>) -> Section {
-    Section { group, home, advanced: false, own_form: false, title: title.to_string(), help: help.to_string(), live, fields }
+fn section(home: PageId, title: &str, help: &str, live: bool, fields: Vec<Field>) -> Section {
+    Section { home, advanced: false, own_form: false, title: title.to_string(), help: help.to_string(), live, fields }
 }
 
-fn one(group: Group, home: PageId, key: &str, title: &str, help: &str, kind: Kind) -> Section {
-    section(group, home, title, help, is_live(key), vec![field(key, title, kind)])
+fn one(home: PageId, key: &str, title: &str, help: &str, kind: Kind) -> Section {
+    section(home, title, help, is_live(key), vec![field(key, title, kind)])
 }
 
-fn many(group: Group, home: PageId, title: &str, help: &str, fields: Vec<Field>) -> Section {
+fn many(home: PageId, title: &str, help: &str, fields: Vec<Field>) -> Section {
     let live = fields.first().is_some_and(|f| is_live(&f.key));
-    section(group, home, title, help, live, fields)
+    section(home, title, help, live, fields)
 }
 
 const fn whole(min: i64, max: i64, unit: &'static str) -> Kind {
@@ -246,7 +168,7 @@ const FLOORS: [(&str, &str); 12] = [
     ("search_posts", "Search"),
 ];
 
-/// The rate classes (§8.7 Group 7), with what each limits.
+/// The rate classes, with what each limits.
 const RATE_CLASSES: [(&str, &str, &str); 13] = [
     ("anon_read", "Visitors not signed in", "Requests per second one visitor who is not signed in may make, and how many at once."),
     ("auth_read", "Signed-in accounts", "Requests per second one signed-in account may make to read, and how many at once."),
@@ -268,31 +190,29 @@ const RATE_CLASSES: [(&str, &str, &str); 13] = [
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn sections(networks: &[String]) -> Vec<Section> {
-    use Group::{Access, Apps, Blocks, Limits, Lookups, Private, Profiles, Services, Storage};
     let mut out = vec![
-        // Group 1.
-        one(Access, PageId::Members, "community.auto_enroll", "Auto-join", "Auto-join. When on, an account on one of the servers below becomes a member the first time it opens a Horizon app. When off, only the people you add are members.", Kind::Switch),
-        one(Access, PageId::Members, "community.enroll_pds_patterns", "Servers whose accounts may auto-join", "Servers whose accounts may auto-join. Empty means the servers of your own network. One per line: a server's name, or *. and a name for every server under it.", Kind::Hosts),
-        one(Access, PageId::Members, "community.max_members", "Member limit", "Auto-join stops once Prism has this many members. Members you add yourself are always accepted and count toward it.", whole(0, U32, "members")),
-        one(Access, PageId::Members, "community.max_auto_enroll_per_hour", "Auto-joins per hour", "The most accounts that may auto-join in one hour.", whole(0, U32, "accounts")),
-        one(Access, PageId::Members, "community.reindex_retry_secs", "When re-indexing members should try again", "When a member's indexing is interrupted after it was first finished (for example after Prism missed part of the network's stream), their app is told to try again after this many seconds. They stay members meanwhile.", whole(1, 3600, "seconds")).advanced(),
-        one(Access, PageId::Members, "community.never_ready_expiry_days", "Remove unfinished auto-joins after", "Auto-joined accounts that never finish their first sync are removed after this many days. 0 never removes them.", whole(0, 3650, "days")).advanced(),
-        one(Access, PageId::ThreadLens, "threadlens.access", "Who may use Thread Lens", "Who may use Thread Lens. 'Members' is only your members. 'Anyone signed in' also lets any account signed in to a Horizon app use it; their lookups use the part of Farsight's rate set aside for non-members.", Kind::Choice(ACCESS)),
-        // Group 2 (`indexing.public_scope` has its own form and command).
-        one(Storage, PageId::Indexing, "indexing.fill_max_wait_hours", "Longest wait for a refill", "When public data is turned back on, how long Prism waits for the last accounts to refill before answering public requests anyway.", whole(0, 8760, "hours")),
-        one(Storage, PageId::Storage, "retention.notification_days", "Keep notifications for", "Notifications older than this are deleted.", whole(1, 36_500, "days")),
-        one(Storage, PageId::Storage, "retention.tombstone_days", "Remember deleted records for", "How long Prism remembers deleted records, so a late copy of one is not stored again.", whole(1, 3650, "days")).advanced(),
-        one(Storage, PageId::Storage, "retention.max_age_days", "Delete public records older than", "Public records older than this are deleted, except those kept for members. 0 keeps them.", whole(0, 36_500, "days")),
-        one(Storage, PageId::Storage, "retention.run_at_utc", "Daily clean-up time", "When the daily clean-up runs (UTC).", Kind::TimeOfDay),
-        one(Storage, PageId::Storage, "storage.budget_bytes", "Storage budget", "The space the database may use, leaving room for the disk's other uses. Prism warns at 80% and 95% of it. Shown in GB. Empty means not set, and then nothing warns before the disk fills.", Kind::Gigabytes),
-        one(Storage, PageId::Storage, "scope.reply_quote_days", "Keep accounts members replied to or quoted", "How long an account a member replied to or quoted stays indexed after the member's last reply or quote. 0: replies and quotes never keep an account indexed.", whole(0, 3650, "days")),
-        one(Storage, PageId::Storage, "scope.like_repost_days", "Keep accounts members liked or reposted", "How long an account a member liked or reposted stays indexed after the member's last like or repost. 0: likes and reposts never keep an account indexed.", whole(0, 3650, "days")),
-        one(Storage, PageId::Storage, "scope.rebuild_grace_days", "Extra days before an account is removed", "Extra days an account nobody follows, subscribes to or has interacted with recently stays indexed before it is removed. 0 removes it at the next nightly check.", whole(0, 30, "days")).advanced(),
-        one(Storage, PageId::Storage, "scope.sweep_max_purges", "Most accounts removed per night", "The most accounts the nightly check removes at once; the rest go on later nights.", whole(1, 1_000_000, "accounts")).advanced(),
-        // Group 3.
-        one(Private, PageId::Private, "private_read.max_chain", "How deep private threads go", "How many replies deep Prism follows a private thread (1–100). Deeper serves deeper replies but reads more under heavy use.", whole(1, 100, "replies")),
+        // Members and Thread Lens.
+        one(PageId::Members, "community.auto_enroll", "Auto-join", "Auto-join. When on, an account on one of the servers below becomes a member the first time it opens a Horizon app. When off, only the people you add are members.", Kind::Switch),
+        one(PageId::Members, "community.enroll_pds_patterns", "Servers whose accounts may auto-join", "Servers whose accounts may auto-join. Empty means the servers of your own network. One per line: a server's name, or *. and a name for every server under it.", Kind::Hosts),
+        one(PageId::Members, "community.max_members", "Member limit", "Auto-join stops once Prism has this many members. Members you add yourself are always accepted and count toward it.", whole(0, U32, "members")),
+        one(PageId::Members, "community.max_auto_enroll_per_hour", "Auto-joins per hour", "The most accounts that may auto-join in one hour.", whole(0, U32, "accounts")),
+        one(PageId::Members, "community.reindex_retry_secs", "When re-indexing members should try again", "When a member's indexing is interrupted after it was first finished (for example after Prism missed part of the network's stream), their app is told to try again after this many seconds. They stay members meanwhile.", whole(1, 3600, "seconds")).advanced(),
+        one(PageId::Members, "community.never_ready_expiry_days", "Remove unfinished auto-joins after", "Auto-joined accounts that never finish their first sync are removed after this many days. 0 never removes them.", whole(0, 3650, "days")).advanced(),
+        one(PageId::ThreadLens, "threadlens.access", "Who may use Thread Lens", "Who may use Thread Lens. 'Members' is only your members. 'Anyone signed in' also lets any account signed in to a Horizon app use it; their lookups use the part of Farsight's rate set aside for non-members.", Kind::Choice(ACCESS)),
+        // Indexing and Storage (`indexing.public_scope` has its own form and command).
+        one(PageId::Indexing, "indexing.fill_max_wait_hours", "Longest wait for a refill", "When public data is turned back on, how long Prism waits for the last accounts to refill before answering public requests anyway.", whole(0, 8760, "hours")),
+        one(PageId::Storage, "retention.notification_days", "Keep notifications for", "Notifications older than this are deleted.", whole(1, 36_500, "days")),
+        one(PageId::Storage, "retention.tombstone_days", "Remember deleted records for", "How long Prism remembers deleted records, so a late copy of one is not stored again.", whole(1, 3650, "days")).advanced(),
+        one(PageId::Storage, "retention.max_age_days", "Delete public records older than", "Public records older than this are deleted, except those kept for members. 0 keeps them.", whole(0, 36_500, "days")),
+        one(PageId::Storage, "retention.run_at_utc", "Daily clean-up time", "When the daily clean-up runs (UTC).", Kind::TimeOfDay),
+        one(PageId::Storage, "storage.budget_bytes", "Storage budget", "The space the database may use, leaving room for the disk's other uses. Prism warns at 80% and 95% of it. Shown in GB. Empty means not set, and then nothing warns before the disk fills.", Kind::Gigabytes),
+        one(PageId::Storage, "scope.reply_quote_days", "Keep accounts members replied to or quoted", "How long an account a member replied to or quoted stays indexed after the member's last reply or quote. 0: replies and quotes never keep an account indexed.", whole(0, 3650, "days")),
+        one(PageId::Storage, "scope.like_repost_days", "Keep accounts members liked or reposted", "How long an account a member liked or reposted stays indexed after the member's last like or repost. 0: likes and reposts never keep an account indexed.", whole(0, 3650, "days")),
+        one(PageId::Storage, "scope.rebuild_grace_days", "Extra days before an account is removed", "Extra days an account nobody follows, subscribes to or has interacted with recently stays indexed before it is removed. 0 removes it at the next nightly check.", whole(0, 30, "days")).advanced(),
+        one(PageId::Storage, "scope.sweep_max_purges", "Most accounts removed per night", "The most accounts the nightly check removes at once; the rest go on later nights.", whole(1, 1_000_000, "accounts")).advanced(),
+        // Private posts.
+        one(PageId::Private, "private_read.max_chain", "How deep private threads go", "How many replies deep Prism follows a private thread (1–100). Deeper serves deeper replies but reads more under heavy use.", whole(1, 100, "replies")),
         many(
-            Private,
             PageId::Private,
             "Timing floors",
             "Timing floors. When on, private reads wait at least this long before answering, so the time taken does not hint at what exists. Off by default: private posts are friction, not secrecy. Setting some but not all leaves the unset ones untimed; the page warns.",
@@ -302,11 +222,10 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
                 .collect(),
         )
         .advanced(),
-        one(Private, PageId::Private, "private_read.membership_valid_for_secs", "How long apps trust a membership answer", "How long a Horizon app may act on a member's membership answer before it asks again (1 minute to 1 hour). After you remove a member, their app may still offer private posting for up to this long; private reads stop at once either way.", whole(60, 3600, "seconds")).advanced(),
-        one(Private, PageId::Private, "sync.head_max_age_secs", "How fresh private reads must be", "How old Prism's knowledge of an account's latest change may be before a private read checks it again (at most 10 minutes).", whole(0, 600, "seconds")),
-        one(Private, PageId::Private, "private_read.head_fallback", "Keep private posts readable while a relay is behind", "When a relay Prism reads private posts from falls behind, still serve a private post if Prism has every change of every account it depends on, checked per read. When off, private posts are unavailable until the relay catches up.", Kind::Switch),
+        one(PageId::Private, "private_read.membership_valid_for_secs", "How long apps trust a membership answer", "How long a Horizon app may act on a member's membership answer before it asks again (1 minute to 1 hour). After you remove a member, their app may still offer private posting for up to this long; private reads stop at once either way.", whole(60, 3600, "seconds")).advanced(),
+        one(PageId::Private, "sync.head_max_age_secs", "How fresh private reads must be", "How old Prism's knowledge of an account's latest change may be before a private read checks it again (at most 10 minutes).", whole(0, 600, "seconds")),
+        one(PageId::Private, "private_read.head_fallback", "Keep private posts readable while a relay is behind", "When a relay Prism reads private posts from falls behind, still serve a private post if Prism has every change of every account it depends on, checked per read. When off, private posts are unavailable until the relay catches up.", Kind::Switch),
         many(
-            Private,
             PageId::Private,
             "When apps should try again",
             "When a relay is behind, Prism tells apps to try again after a quarter of how far behind it is, at least the first value and at most the second.",
@@ -316,11 +235,10 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         )
         .advanced(),
-        one(Private, PageId::Private, "private_notify.backfill_max_age_hours", "Notify about late private posts for", "When Prism finds a private post while catching up rather than as it happens, it notifies people only if the post was made within this many hours, so an old post found late notifies nobody.", whole(0, 87_600, "hours")),
-        one(Private, PageId::Private, "private_search.max_age_days", "How far back private search reaches", "How far back a search of private posts reaches.", whole(1, 36_500, "days")),
-        // Group 4.
+        one(PageId::Private, "private_notify.backfill_max_age_hours", "Notify about late private posts for", "When Prism finds a private post while catching up rather than as it happens, it notifies people only if the post was made within this many hours, so an old post found late notifies nobody.", whole(0, 87_600, "hours")),
+        one(PageId::Private, "private_search.max_age_days", "How far back private search reaches", "How far back a search of private posts reaches.", whole(1, 36_500, "days")),
+        // Blocks.
         section(
-            Blocks,
             PageId::Blocks,
             "Fallback while Farsight is down",
             "When Farsight is down, ask another AppView which block lists apply. That AppView then learns which of your members' pages were loaded, while Farsight is down.",
@@ -331,7 +249,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         ),
         section(
-            Blocks,
             PageId::Blocks,
             "Remember blocks",
             "Remember block-list blocks Farsight has reported, so they still apply while Farsight is down. Turning it off deletes what was remembered when Prism restarts.",
@@ -339,7 +256,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             vec![Field { typed: Typed::TurningOff("OFF"), ..field("farsight.memory.enabled", "Remember blocks", Kind::Switch) }],
         ),
         many(
-            Blocks,
             PageId::Blocks,
             "How much is remembered",
             "How long and how many remembered blocks are kept.",
@@ -350,7 +266,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         ),
         many(
-            Blocks,
             PageId::Blocks,
             "Farsight lookups",
             "How many Farsight lookups Prism makes per second. Raise it if many non-members use Thread Lens.",
@@ -360,15 +275,14 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         )
         .advanced(),
-        // Group 5.
-        one(Apps, PageId::Apps, "unspecced.check_email_confirmed", "Ask users to confirm their email", "Tell apps to ask users to confirm their email.", Kind::Switch),
-        one(Apps, PageId::Apps, "unspecced.live_now", "Who may show 'live now'", "Accounts allowed to show a 'live now' badge, and the sites their link may point to. One account per line: its DID, then its sites, separated by spaces.", Kind::LiveNow),
-        one(Apps, PageId::Apps, "trends.descriptions", "Descriptions of trending topics", "Your own description for a trending topic. One per line: the topic without #, a colon, then the description.", Kind::Lines { left: "topic" }),
-        one(Apps, PageId::Apps, "trends.suggested_topics", "Suggested topics", "Topics always suggested, with their link and description. One per line: topic | link | name shown | description (the last two may be left out).", Kind::Topics),
-        one(Apps, PageId::Apps, "honest_501.status_url", "Link for features Prism does not offer", "The link apps show when Prism does not offer something.", Kind::Text),
-        one(Apps, PageId::Apps, "honest_501.messages", "Texts for features Prism does not offer", "Your own text for a feature Prism does not offer, per feature. One per line: the feature's technical name, a colon, then the text.", Kind::Lines { left: "feature" }),
+        // What apps see.
+        one(PageId::Apps, "unspecced.check_email_confirmed", "Ask users to confirm their email", "Tell apps to ask users to confirm their email.", Kind::Switch),
+        one(PageId::Apps, "unspecced.live_now", "Who may show 'live now'", "Accounts allowed to show a 'live now' badge, and the sites their link may point to. One account per line: its DID, then its sites, separated by spaces.", Kind::LiveNow),
+        one(PageId::Apps, "trends.descriptions", "Descriptions of trending topics", "Your own description for a trending topic. One per line: the topic without #, a colon, then the description.", Kind::Lines { left: "topic" }),
+        one(PageId::Apps, "trends.suggested_topics", "Suggested topics", "Topics always suggested, with their link and description. One per line: topic | link | name shown | description (the last two may be left out).", Kind::Topics),
+        one(PageId::Apps, "honest_501.status_url", "Link for features Prism does not offer", "The link apps show when Prism does not offer something.", Kind::Text),
+        one(PageId::Apps, "honest_501.messages", "Texts for features Prism does not offer", "Your own text for a feature Prism does not offer, per feature. One per line: the feature's technical name, a colon, then the text.", Kind::Lines { left: "feature" }),
         many(
-            Apps,
             PageId::Apps,
             "Texts while public data is off",
             "The text apps show while public data is off, or refilling. Empty uses Prism's own text.",
@@ -378,7 +292,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         ),
         many(
-            Apps,
             PageId::Apps,
             "Bookmark counts",
             "Whether apps see how many people bookmarked a post. In a small community a count of 1 can identify someone; 'above a floor' shows counts only from that number up.",
@@ -387,10 +300,9 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
                 field("bookmarks.count_floor", "From this number up", whole(1, U32, "bookmarks")),
             ],
         ),
-        one(Apps, PageId::Apps, "video.playback", "Where public videos play from", "Where apps play the videos of public posts from. 'Bluesky's video service' streams them from Bluesky, with a preview picture; 'the author's own server' plays the original file from the account's server, with no preview picture. Videos in private posts always play from the author's server, whatever this says.", Kind::Choice(PLAYBACK)),
-        // Group 6.
+        one(PageId::Apps, "video.playback", "Where public videos play from", "Where apps play the videos of public posts from. 'Bluesky's video service' streams them from Bluesky, with a preview picture; 'the author's own server' plays the original file from the account's server, with no preview picture. Videos in private posts always play from the author's server, whatever this says.", Kind::Choice(PLAYBACK)),
+        // Extra services.
         many(
-            Services,
             PageId::Services,
             "Extra services",
             "Whether Prism passes these requests on to the service set up for them at install ('on'), or answers that it does not offer them ('off'). 'On' is offered only when a service address was set at install.",
@@ -401,7 +313,7 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         ),
     ];
-    // Group 7.
+    // Request limits.
     for (class, title, help) in RATE_CLASSES {
         // Thread Lens's and Refract's rates sit on their own pages, folded.
         let home = match class {
@@ -410,7 +322,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             _ => None,
         };
         let s = many(
-            Limits,
             home.unwrap_or(PageId::Limits),
             title,
             help,
@@ -421,9 +332,8 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         );
         out.push(if home.is_some() { s.advanced() } else { s });
     }
-    // Group 8.
+    // Profiles and caching.
     out.push(many(
-        Profiles,
         PageId::Profiles,
         "Reusing profiles",
         "How long a profile from another network is reused before it is fetched again; and how long 'not found' is remembered.",
@@ -432,10 +342,9 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             field("cache.profile_negative_ttl_secs", "Remember 'not found' for", whole(1, 2_592_000, "seconds")),
         ],
     ));
-    out.push(one(Profiles, PageId::Profiles, "cache.profile_refresh_max", "Profiles waiting to be refreshed", "How many profiles may wait to be refreshed in the background.", whole(1, i64::MAX, "profiles")));
+    out.push(one(PageId::Profiles, "cache.profile_refresh_max", "Profiles waiting to be refreshed", "How many profiles may wait to be refreshed in the background.", whole(1, i64::MAX, "profiles")));
     for name in networks.iter().filter(|n| n.as_str() != COMMUNITY_NETWORK) {
         out.push(many(
-            Profiles,
             PageId::Profiles,
             &format!("Background refresh from {name}"),
             "How fast Prism refreshes profiles from this network in the background.",
@@ -445,9 +354,8 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
             ],
         ));
     }
-    // Group 9 (lodestar-reads design §2.14).
+    // Account lookups.
     out.push(one(
-        Lookups,
         PageId::AccountLookups,
         "identity.lodestar_url",
         "Lodestar",
@@ -456,7 +364,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
     ));
     out.push(
         many(
-            Lookups,
             PageId::AccountLookups,
             "Lodestar lookups",
             "How many lodestar lookups Prism makes per second, and how many at once.",
@@ -467,10 +374,9 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         )
         .advanced(),
     );
-    // Refract (refract design §3.1, §9.1).
+    // Refract.
     out.push(
         one(
-            Group::Communities,
             PageId::Communities,
             "refract.enabled",
             "Keep accounts other communities still host",
@@ -481,7 +387,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
     );
     out.push(
         one(
-            Group::Communities,
             PageId::Communities,
             "refract.communities",
             "Communities",
@@ -491,7 +396,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         .own_form(),
     );
     out.push(one(
-        Group::Apps,
         PageId::Communities,
         "refract.visitor_viewer_state",
         "Show visitors their own likes on kept accounts",
@@ -499,7 +403,6 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         Kind::Switch,
     ));
     out.push(one(
-        Group::Apps,
         PageId::PublicPage,
         "public_page.enabled",
         "Public page",
@@ -507,14 +410,13 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         Kind::Switch,
     ));
     out.push(one(
-        Group::Apps,
         PageId::PublicPage,
         "public_page.name",
         "Public page name",
         "The name at the top of the public page and in its browser tab. Empty uses this instance's address.",
         Kind::Text,
     ));
-    out.push(one(Lookups, PageId::AccountLookups, "identity.lodestar_timeout_ms", "Longest wait for lodestar", "How long Prism waits for one lodestar answer before it asks the PLC directory instead (100 to 10,000).", whole(100, 10_000, "milliseconds")).advanced());
+    out.push(one(PageId::AccountLookups, "identity.lodestar_timeout_ms", "Longest wait for lodestar", "How long Prism waits for one lodestar answer before it asks the PLC directory instead (100 to 10,000).", whole(100, 10_000, "milliseconds")).advanced());
     out
 }
 
@@ -540,7 +442,7 @@ pub fn known(key: &str) -> bool {
     lookup(key, &[]).is_some()
 }
 
-/// The unit a key is applied and set aside with (§8.2): keys only valid
+/// The unit a key is applied and set aside with: keys only valid
 /// together.
 #[must_use]
 pub fn unit_of(key: &str) -> String {
@@ -874,7 +776,7 @@ mod tests {
         FileConfig::default().constellation.networks.iter().map(|n| n.name.clone()).collect()
     }
 
-    /// T-A8, §8.7: every registry key parses at its path, and its default
+    /// Every registry key parses at its path, and its default
     /// is the one `FileConfig::default()` has. Each key's default is written
     /// alone (with the rest of its unit) into an empty file; the parsed
     /// configuration has that value and is otherwise the default.
@@ -905,18 +807,18 @@ mod tests {
             let back = parse(&f.kind, &form_text(&f.kind, &v), &ctx).unwrap_or_else(|e| panic!("{key}: {e}"));
             assert!(overlay::same(&back, &v), "{key}: {back} != {v}");
         }
-        // No duplicate keys, and none of §8.6's read-only ones.
+        // No duplicate keys, and none of the read-only ones.
         let mut sorted = all.clone();
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());
         for key in &all {
             for fixed in ["http.", "metrics.", "net.", "firehose.", "farsight.url", "admin.", "db.", "kryphocron.", "scope.policy", "indexing.public_scope"] {
-                assert!(!key.starts_with(fixed), "{key} is not editable (§8.6)");
+                assert!(!key.starts_with(fixed), "{key} is not editable");
             }
         }
         assert!(!all.iter().any(|k| k.contains("[community]")), "the community network has no background rate");
-        // The live keys are exactly §8.5's.
+        // The live keys are exactly those that apply at once.
         let live: Vec<&String> = all.iter().filter(|k| is_live(k)).collect();
         assert_eq!(live.len(), super::super::live::LIVE_KEYS.len());
     }

@@ -41,7 +41,7 @@ pub const WATCHED: &[&str] = &[
     crate::firehose::consumer::METRIC_GROUP_PRESENT,
     crate::firehose::consumer::METRIC_LAG,
     crate::firehose::consumer::METRIC_PROCESSED,
-    // The relays' input rate on the Instance page.
+    // The relays' input rate on the Relays page.
     crate::firehose::consumer::METRIC_STREAM_ADDED,
     crate::firehose::watermark::METRIC_DELAY,
     crate::firehose::deadletter::METRIC_DEAD_LETTERS,
@@ -453,7 +453,7 @@ pub struct Inputs {
     /// still has a line.
     pub relays: Vec<String>,
     /// `firehose.private_relays`: private reads wait for every one of them,
-    /// so one that has never reported is a problem, not a warning (#737).
+    /// so one that has never reported is a problem, not a warning.
     pub private_relays: Vec<String>,
     /// The disks (§10.1), read now.
     pub disks: Option<super::stats::Disks>,
@@ -659,7 +659,7 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
         let now = latest.as_ref().and_then(|s| delay_of(s.as_ref()));
         let held = ring.held_for(FIVE_MIN, |s| delay_of(s).map(|d| d > 120.0));
         let private = i.private_relays.contains(&relay);
-        out.push(match (held, now) {
+        let check = match (held, now) {
             (Held::NoData, _) => Check::no_data("Relay delay", &format!("{relay}: Prism needs five minutes of readings first.")),
             // No watermark, persisted or new: the relay has never reported.
             (Held::Yes, Some(d)) if d.is_infinite() && private => Check::new(
@@ -670,8 +670,7 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
                      Start its relay reader, or remove it from firehose.private_relays in app.toml and restart Prism; \
                      it cannot be changed here."
                 ),
-            )
-            .link("/admin/settings/running", "Running"),
+            ),
             (Held::Yes, Some(d)) if d.is_infinite() => Check::new("Relay delay", Level::Amber, format!("{relay} has never reported.")),
             (Held::Yes, d) if private => Check::new(
                 "Relay delay",
@@ -681,7 +680,9 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
             (Held::Yes, d) => Check::new("Relay delay", Level::Amber, format!("{relay} is {} behind.", minutes(d.unwrap_or(0.0)))),
             (Held::No, Some(d)) if d.is_finite() => Check::new("Relay delay", Level::Ok, format!("{relay} is up to date ({} s behind).", d.round())),
             (Held::No, _) => Check::new("Relay delay", Level::Ok, format!("{relay} is up to date.")),
-        });
+        };
+        // Relays shows each relay, and the private ones read-only.
+        out.push(check.link("/admin/relays", "Relays"));
     }
 
     out.push(match ring.rise(HOUR, |s| s.sum(crate::firehose::deadletter::METRIC_DEAD_LETTERS)) {
@@ -1195,7 +1196,7 @@ mod tests {
         assert_eq!(check(Some(ACCOUNT_ID_LIMIT / 2 + 1)).level, Level::Amber);
     }
 
-    /// #737: a private relay that has never reported is a Problem naming
+    /// A private relay that has never reported is a Problem naming
     /// it; one that is behind is a Warning; one that keeps up is fine.
     #[test]
     fn a_private_relay_that_never_reported_is_a_problem() {
@@ -1222,10 +1223,12 @@ mod tests {
         assert_eq!(level, Level::Red);
         assert!(text.starts_with("microcosm has never reported. Private posts wait for it, so every private read misses as stale."), "{text}");
         // The list is set in app.toml only, so the check says so and links
-        // Running, which shows it.
+        // Relays, which shows it read-only.
         assert!(text.contains("firehose.private_relays in app.toml") && text.contains("cannot be changed here"), "{text}");
         let link = checks(&inputs, &ring).into_iter().find(|c| c.name == "Relay delay" && c.text.starts_with("microcosm")).and_then(|c| c.link);
-        assert_eq!(link, Some(("/admin/settings/running", "Running")));
+        assert_eq!(link, Some(("/admin/relays", "Relays")));
+        // Every other relay's check links Relays too.
+        assert!(checks(&inputs, &ring).iter().filter(|c| c.name == "Relay delay").all(|c| c.link == Some(("/admin/relays", "Relays"))));
         assert_eq!(relay("bsky").0, Level::Ok);
         assert_eq!(relay("community-a"), (Level::Amber, "community-a is 15 minutes behind; private posts newer than that miss as stale.".to_string()));
     }

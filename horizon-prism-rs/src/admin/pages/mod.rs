@@ -17,10 +17,12 @@ pub mod labels;
 pub mod login;
 pub mod lookup;
 pub mod members;
+pub mod network;
 pub mod operators;
 pub mod private;
 pub mod problems;
 pub mod refract;
+pub mod relays;
 pub mod settings;
 pub mod setup;
 pub mod stats;
@@ -121,7 +123,7 @@ impl Nav {
     }
 
     /// A sub-page with a fixed parent: an account page, a command page,
-    /// Installed, Running and a settings group page.
+    /// Installed and Running.
     #[must_use]
     pub fn under(op: &Operator, id: PageId) -> Self {
         let tab = (id == PageId::Communities).then_some(Tab::Accounts);

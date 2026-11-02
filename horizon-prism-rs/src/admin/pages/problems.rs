@@ -1,10 +1,9 @@
-//! Problems (`/admin/problems`, admin-ui design §6.7): "Records Prism could
-//! not process", the newest 100 of the dead-letter stream by `XREVRANGE`,
-//! each with "try again" (`deadletter replay`) and "dismiss" (`deadletter
-//! drop`, confirmed), and "clear out" of the records the firehose would now
-//! set aside (`deadletter sweep`, confirmed; actionable-warnings design
-//! §7.2); and the network stream's state, the content of `admin stream
-//! info` in words.
+//! Problems (`/admin/problems`): "Records Prism could not process", the
+//! newest 100 of the dead-letter stream by `XREVRANGE`, each with "try
+//! again" (`deadletter replay`) and "dismiss" (`deadletter drop`,
+//! confirmed), and "clear out" of the records the firehose would now set
+//! aside (`deadletter sweep`, confirmed); and the network stream's state in
+//! one line, which Relays shows in full.
 
 use std::net::SocketAddr;
 
@@ -20,9 +19,7 @@ use serde::Deserialize;
 use super::{Confirm, Nav, confirmed, css, enqueue, hidden_field, message, render, when};
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
-use crate::admin::health::count;
 use crate::admin_executor::AdminCommand;
-use crate::cli::commands::stream_info::{self, StreamInfo};
 use crate::firehose::stream::parse_entry;
 
 /// Entries shown.
@@ -46,11 +43,12 @@ struct ProblemsPage {
     csrf: String,
     /// `None`: Redis could not be read.
     letters: Option<Vec<DeadLetter>>,
-    stream: Vec<String>,
+    /// The network stream in one phrase.
+    stream: String,
 }
 
 /// A stream id's time: its first part is milliseconds since the epoch.
-fn id_time(id: &str) -> String {
+pub fn id_time(id: &str) -> String {
     id.split_once('-')
         .and_then(|(ms, _)| ms.parse::<i64>().ok())
         .and_then(DateTime::from_timestamp_millis)
@@ -102,32 +100,6 @@ async fn dead_letters(state: &AdminState) -> Result<Vec<DeadLetter>, String> {
     Ok(out)
 }
 
-/// The stream's state in sentences.
-#[must_use]
-pub fn stream_words(info: &StreamInfo) -> Vec<String> {
-    let mut out = vec![match info.length {
-        Some(n) => format!("The network stream holds {} records waiting for Prism or kept for a while after.", count(n as f64)),
-        None => "The network stream's length is unknown.".to_string(),
-    }];
-    match &info.group {
-        None => out.push("Prism's reader is missing, so Prism is not reading the stream. The server's log says why.".to_string()),
-        Some(g) => {
-            out.push(match g.lag {
-                Some(0) => "Prism has read everything in it.".to_string(),
-                Some(n) => format!("{} records are not read yet.", count(n as f64)),
-                None => "Redis cannot say how far behind Prism is: part of the stream was dropped before Prism read it.".to_string(),
-            });
-            if let Some(p) = g.pending.filter(|p| *p > 0) {
-                out.push(format!("{} records are being processed now.", count(p as f64)));
-            }
-            if let Some(id) = &g.last_delivered_id {
-                out.push(format!("The last record read arrived at {}.", id_time(id)));
-            }
-        }
-    }
-    out
-}
-
 /// `GET /admin/problems`.
 pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap) -> Response {
     let op = match require(&state, &headers, peer, Need::Page, None).await {
@@ -141,13 +113,9 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             None
         }
     };
-    let fh = &state.settings.running.firehose;
-    let stream = match &state.health.redis {
-        None => vec!["The network stream's state is unknown: Redis is not connected to these pages.".to_string()],
-        Some(redis) => match stream_info::read(&mut redis.clone(), &fh.stream_key, &fh.group).await {
-            Ok(info) => stream_words(&info),
-            Err(_) => vec!["The network stream could not be read just now.".to_string()],
-        },
+    let stream = match super::relays::read_stream(&state).await {
+        Ok(info) => super::relays::stream_summary(&info),
+        Err(_) => "unknown".to_string(),
     };
     render(
         StatusCode::OK,
@@ -225,8 +193,7 @@ pub struct SweepForm {
     pub back: Option<String>,
 }
 
-/// `POST /admin/problems/sweep`: `deadletter sweep`, confirmed
-/// (actionable-warnings design §7.2).
+/// `POST /admin/problems/sweep`: `deadletter sweep`, confirmed.
 pub async fn sweep(State(state): State<AdminState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, Form(form): Form<SweepForm>) -> Response {
     let op = match require(&state, &headers, peer, Need::Change, Some(&form.csrf)).await {
         Ok(op) => op,
@@ -251,21 +218,11 @@ pub async fn sweep(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::commands::stream_info::GroupInfo;
 
     #[test]
-    fn ids_and_stream_words() {
+    fn ids_in_words() {
         assert!(is_stream_id("1697812345678-0"));
         assert!(!is_stream_id("abc-0") && !is_stream_id("123") && !is_stream_id("-1"));
         assert_eq!(id_time("1760918400000-3"), "2025-10-20 00:00 UTC");
-        let behind = StreamInfo {
-            length: Some(5000),
-            first_entry_id: Some("1-0".into()),
-            group: Some(GroupInfo { pending: Some(2), last_delivered_id: Some("1760918400000-0".into()), lag: Some(1234) }),
-        };
-        let words = stream_words(&behind).join(" ");
-        assert!(words.contains("5,000 records") && words.contains("1,234 records are not read yet") && words.contains("2 records are being processed"), "{words}");
-        let missing = StreamInfo { length: Some(1), first_entry_id: None, group: None };
-        assert!(stream_words(&missing).join(" ").contains("reader is missing"));
     }
 }

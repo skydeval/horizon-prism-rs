@@ -1,6 +1,5 @@
-//! The settings pages over HTTP (admin-ui design §6.3, §8; T-A7 for the
-//! typed settings, T-A15 for the running configuration): every group
-//! renders; a saved form queues one `settings set` with only the changed
+//! The settings pages over HTTP: every page that holds settings renders
+//! them; a saved form queues one `settings set` with only the changed
 //! fields and their versions; a value the form refuses, or an unconfirmed
 //! typed change, queues nothing; public data off is typed; the restart is
 //! refused without a supervisor; the two banners and Home's notice.
@@ -8,9 +7,8 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::admin::menu::SETTINGS_LIVE;
-use crate::admin::settings::registry::Group;
-use crate::admin::settings::view::{self, Place};
+use crate::admin::menu::MENU;
+use crate::admin::settings::registry;
 
 type Queued = (String, Value, Option<String>);
 
@@ -18,7 +16,7 @@ async fn queued(pool: &PgPool) -> Vec<Queued> {
     sqlx::query_as("SELECT command, args, requested_by FROM admin_commands ORDER BY id").fetch_all(pool).await.expect("commands")
 }
 
-/// A POST past the one-change-a-second limit (§5.6).
+/// A POST past the one-change-a-second limit.
 async fn post(b: &Browser, url: &str, form: &[(&str, &str)]) -> Page {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     b.post(url, form).await
@@ -32,18 +30,22 @@ async fn settings_pages_and_their_forms() {
     let alice = complete_setup(&h, ALICE).await;
     let p = h.pool();
     let url = |path: &str| format!("{}{path}", h.base);
-    // Every page that holds settings, and every group with settings left.
-    let networks: Vec<String> = Vec::new();
-    let mut homes: Vec<(String, &str)> = SETTINGS_LIVE.iter().map(|id| (id.page().href.to_string(), id.page().name)).collect();
-    homes.extend(Group::ALL.into_iter().filter(|g| !view::sections_at(Place::Group(*g), &networks).is_empty()).map(|g| (format!("/admin/settings/{}", g.slug()), g.title())));
+    // Every page that holds settings.
+    let sections = registry::sections(&[]);
+    let homes: Vec<(String, &str)> = MENU
+        .iter()
+        .flat_map(|(_, ids)| ids.iter())
+        .filter(|id| sections.iter().any(|s| s.home == **id))
+        .map(|id| (id.page().href.to_string(), id.page().name))
+        .collect();
     assert_eq!(homes.len(), 13);
     for (path, title) in homes {
         tokio::time::sleep(Duration::from_millis(120)).await;
         let page = alice.get(&url(&path)).await;
         assert_eq!(page.status, 200, "{path}: {}", page.body);
-        assert!(page.body.contains(title) && page.body.contains("technical name"), "{path}");
+        assert!(page.body.contains(title) && page.body.contains("action=\"/admin/settings/save\""), "{path}");
     }
-    // Past the ten-pages-a-second limit (§5.6).
+    // Past the ten-pages-a-second limit.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let index = alice.get(&url("/admin/settings")).await;
     assert!(index.body.contains("Set when Prism was installed") && !index.body.contains("What Prism stores") && !index.body.contains("Who can use Prism"), "{}", index.body);
@@ -76,7 +78,7 @@ async fn settings_pages_and_their_forms() {
     assert!(same.body.contains("Nothing changed"), "{}", same.body);
     assert_eq!(queued(p).await.len(), before);
 
-    // Typed (§8.7): turning the fallback on needs ON.
+    // Typed: turning the fallback on needs ON.
     let form = [("csrf", csrf.as_str()), ("farsight.fallback.enabled", "on")];
     let confirm = post(&alice, &url("/admin/settings/blocks"), &form).await;
     assert_eq!(confirm.status, 200);
@@ -157,7 +159,7 @@ async fn settings_pages_and_their_forms() {
     let emptied = post(&alice, &url("/admin/settings/save"), &[("csrf", &csrf), ("storage.budget_bytes", " "), ("version:storage.budget_bytes", "1")]).await;
     assert_eq!(emptied.status, 303, "{}", emptied.body);
     assert_eq!(queued(p).await.last().map(|q| q.1.clone()), Some(json!({"changes": [{"key": "storage.budget_bytes", "value": null, "base_version": 1}]})));
-    // A forged form changes nothing (T-A7).
+    // A forged form changes nothing.
     let before = queued(p).await.len();
     let forged = post(&alice, &url("/admin/settings/access"), &[("csrf", "forged"), ("threadlens.access", "members")]).await;
     assert_eq!(forged.status, 403);
