@@ -9,9 +9,9 @@ name: horizon-prism-rs
 x-horizon-firehose: &horizon-firehose
   build:
     # horizon-firehose publishes no image; build it from a pinned commit.
-    context: https://github.com/skydeval/horizon-firehose.git#0901576fa2ec25a25887b557e604fa71284195d4
+    context: https://github.com/skydeval/horizon-firehose.git#edd09f0e64125d6ef12b21d4920dfba5718b1d25:horizon-firehose
     dockerfile: Dockerfile
-  image: horizon-firehose:0901576fa2ec
+  image: horizon-firehose:edd09f0e6412
   environment:
     HF_CONFIG_PATH: /app/config/relay.toml
   depends_on:
