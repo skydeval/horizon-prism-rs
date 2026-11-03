@@ -779,12 +779,7 @@ impl Farsight {
     /// A short reason when Farsight did not answer.
     pub async fn status(&self) -> Result<serde_json::Value, &'static str> {
         let stats = self.inner.client.get_stats().await?;
-        let mut brief = serde_json::Map::new();
-        for key in ["version", "firehose", "sweep", "coverage", "freshness"] {
-            if let Some(v) = stats.get(key) {
-                brief.insert(key.to_string(), v.clone());
-            }
-        }
+        let mut brief = brief_of(&stats);
         brief.insert("read_breaker_open".to_string(), serde_json::Value::Bool(self.breaker_open()));
         brief.insert("cached_pair_answers".to_string(), serde_json::json!(self.cached()));
         Ok(serde_json::Value::Object(brief))
@@ -1742,6 +1737,44 @@ impl Lookup {
                 }
             }
         })
+    }
+}
+
+/// The parts of Farsight's `getStats` answer the brief shows: its version
+/// (`service.version`), firehose, sweep (`backfill.sweep`), coverage
+/// (`freshness.coverage`) and freshness. A part Farsight does not report
+/// is left out.
+fn brief_of(stats: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let parts = [
+        ("version", stats.pointer("/service/version")),
+        ("firehose", stats.get("firehose")),
+        ("sweep", stats.pointer("/backfill/sweep")),
+        ("coverage", stats.pointer("/freshness/coverage")),
+        ("freshness", stats.get("freshness")),
+    ];
+    parts.into_iter().filter_map(|(k, v)| v.map(|v| (k.to_string(), v.clone()))).collect()
+}
+
+#[cfg(test)]
+mod brief_tests {
+    use serde_json::json;
+
+    #[test]
+    fn the_brief_reads_getstats_where_farsight_puts_each_part() {
+        let stats = json!({
+            "service": {"version": "0.7.0", "hostname": "farsight.example.org"},
+            "counts": {},
+            "firehose": {"connected": true},
+            "backfill": {"sweep": {"cycle": 3, "state": "running"}},
+            "freshness": {"coverage": {"level": "complete"}},
+        });
+        let brief = super::brief_of(&stats);
+        assert_eq!(brief["version"], json!("0.7.0"));
+        assert_eq!(brief["firehose"], json!({"connected": true}));
+        assert_eq!(brief["sweep"], json!({"cycle": 3, "state": "running"}));
+        assert_eq!(brief["coverage"], json!({"level": "complete"}));
+        assert_eq!(brief["freshness"], json!({"coverage": {"level": "complete"}}));
+        assert!(super::brief_of(&json!({})).is_empty());
     }
 }
 
