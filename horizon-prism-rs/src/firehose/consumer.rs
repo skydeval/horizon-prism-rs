@@ -493,6 +493,8 @@ pub struct Consumer {
     /// The low-water entry, shared with whoever needs the consumer's own
     /// clock.
     low_water: Arc<LowWater>,
+    /// The stream-id milliseconds of the last Whole or Covered copy read.
+    covered: Arc<std::sync::atomic::AtomicI64>,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -545,7 +547,16 @@ impl Consumer {
             ),
             dedupe: Dedupe::new(Duration::from_secs(dedupe_window), dedupe_repos),
             low_water: Arc::default(),
+            covered: Arc::default(),
         }
+    }
+
+    /// The stream-id milliseconds of the last Whole or Covered copy read:
+    /// full indexing's continuity is off while it falls a window behind
+    /// the low-water entry.
+    #[must_use]
+    pub fn covered_clock(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        Arc::clone(&self.covered)
     }
 
     /// The low-water entry, read where the consumer's clock is needed.
@@ -1340,6 +1351,7 @@ impl Consumer {
         // The relay reader's stamp, remembered per relay label.
         let label = self.watermarks.label_for(event.relay()).to_string();
         let forgot = self.tiers.take_forgets();
+        let seen_before = self.tiers.seen(&label);
         let tier = self.tiers.tier(&label, event.cap());
         if self.tiers.observe(&label, event.cap()) || forgot {
             self.tiers.persist(&self.pool).await?;
@@ -1354,7 +1366,7 @@ impl Consumer {
                 let key = if dedupe { CopyKey::of(&sync.rev, CopyKind::Sync, tier, sync.cap.as_ref()) } else { None };
                 match key {
                     Some(k) if self.dedupe.drops(&sync.did, &k, Instant::now()) => Work::Done(Done::duplicate(&label, None)),
-                    key => Work::Sync { did: sync.did, key, label },
+                    key => Work::Sync { did: sync.did, rev: sync.rev, tier, key, label },
                 }
             }
             Event::Resume(resume) => {
@@ -1370,11 +1382,24 @@ impl Consumer {
                     "a relay reader reported events it did not publish"
                 );
                 metrics::counter!(METRIC_STREAM_EVENTS, "type" => "resume").increment(1);
+                // In full, a relay reader's real loss point is a gap: not an
+                // Aside relay's, and not a first dial of a label never seen.
+                let first_dial = resume.reason == crate::firehose::stream::ResumeReason::NoSavedCursor
+                    && !seen_before
+                    && label != super::watermark::UNKNOWN_RELAY;
+                if tier != super::tier::CopyTier::Aside && !first_dial && self.writer.scope().public_breadth() == crate::indexing::Breadth::Full {
+                    crate::indexing::crawl::relist::open_gap(&self.pool, "resume", Some(&label), true, serde_json::json!({ "reason": resume.reason.as_str(), "first_lost_seq": resume.first_lost_seq, "continues_from": resume.continues_from })).await?;
+                }
                 Work::Done(Done::nothing())
             }
             Event::Identity { kind, did, relay, active, status, .. } => Work::Identity { kind, did, relay, active, status, label },
             Event::Commit(commit) => {
                 self.coverage.observe(&commit.repo, &commit.rev, &label);
+                if tier != super::tier::CopyTier::Aside
+                    && let Some(ms) = entry.id_ms()
+                {
+                    self.covered.fetch_max(ms, Ordering::Relaxed);
+                }
                 tracing::debug!(
                     event = "firehose_ops",
                     id = %entry.id,

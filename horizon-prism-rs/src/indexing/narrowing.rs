@@ -110,6 +110,11 @@ fn full_only_steps() -> Vec<Step> {
         batched_composite("relay_account_status", &["account", "relay"], "ras", &format!("NOT {}", tracked(&did_of("ras.account"))), Bind::None),
         batched("identity_refresh", "did", "ir", &format!("NOT {} AND NOT {}", kept("ir.did"), tracked("ir.did")), Bind::None),
         batched_composite("full_crawl_groups", &["account", "grp"], "fg", "TRUE", Bind::None),
+        batched_composite("full_chain_links", &["account", "since", "rev"], "fl", "TRUE", Bind::None),
+        batched("full_relist_candidates", "account", "frc", "TRUE", Bind::None),
+        batched_composite("full_incomplete", &["grp", "account"], "fi", "TRUE", Bind::None),
+        batched("full_gaps", "id", "fgp", "TRUE", Bind::None),
+        batched("crawl_identity", "account", "ci", "TRUE", Bind::None),
         batched("full_crawl", "account", "fc", "TRUE", Bind::None),
         batched("refract_excluded", "account", "rx", "TRUE", Bind::None),
         // Last: the entry time bounds the steps above until here.
@@ -117,7 +122,14 @@ fn full_only_steps() -> Vec<Step> {
             "worker_state",
             "key",
             "w",
-            &format!("w.key IN ('{}', '{}')", super::full::GROUPS_KEY, super::full::SINCE_KEY),
+            &format!(
+                "w.key IN ('{}', '{}', '{}', '{}', '{}')",
+                super::full::GROUPS_KEY,
+                super::full::SINCE_KEY,
+                super::crawl::LIST_KEY,
+                super::crawl::RELIST_KEY,
+                super::crawl::groups_change::CHANGES_KEY
+            ),
             Bind::None,
         ),
     ]
@@ -125,7 +137,7 @@ fn full_only_steps() -> Vec<Step> {
 
 /// The narrowing sweep's steps, in order: every community scope step, then
 /// the full-only ones.
-pub const STEP_NAMES: [&str; 30] = [
+pub const STEP_NAMES: [&str; 35] = [
     "posts",
     "post_search",
     "likes",
@@ -153,6 +165,11 @@ pub const STEP_NAMES: [&str; 30] = [
     "relay_account_status",
     "identity_refresh",
     "full_crawl_groups",
+    "full_chain_links",
+    "full_relist_candidates",
+    "full_incomplete",
+    "full_gaps",
+    "crawl_identity",
     "full_crawl",
     "refract_excluded",
     "worker_state",
@@ -161,7 +178,7 @@ pub const STEP_NAMES: [&str; 30] = [
 /// The steps a drain from full runs after the drain's own tables: the
 /// shared tables full adds to that the drain does not touch, then the
 /// full-only ones.
-pub const FULL_DRAIN_STEP_NAMES: [&str; 14] = [
+pub const FULL_DRAIN_STEP_NAMES: [&str; 19] = [
     "post_search",
     "blocks",
     "actor_self_records",
@@ -173,6 +190,11 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 14] = [
     "relay_account_status",
     "identity_refresh",
     "full_crawl_groups",
+    "full_chain_links",
+    "full_relist_candidates",
+    "full_incomplete",
+    "full_gaps",
+    "crawl_identity",
     "full_crawl",
     "refract_excluded",
     "worker_state",
@@ -180,7 +202,7 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 14] = [
 
 /// A trial's narrowing: the narrowing's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_STEP_NAMES: [&str; 33] = [
+pub const TRIAL_STEP_NAMES: [&str; 38] = [
     "posts",
     "post_search",
     "likes",
@@ -211,6 +233,11 @@ pub const TRIAL_STEP_NAMES: [&str; 33] = [
     "relay_account_status",
     "identity_refresh",
     "full_crawl_groups",
+    "full_chain_links",
+    "full_relist_candidates",
+    "full_incomplete",
+    "full_gaps",
+    "crawl_identity",
     "full_crawl",
     "refract_excluded",
     "worker_state",
@@ -218,7 +245,7 @@ pub const TRIAL_STEP_NAMES: [&str; 33] = [
 
 /// A trial's drain from full: the drain's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 15] = [
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 20] = [
     "post_search",
     "blocks",
     "actor_self_records",
@@ -231,6 +258,11 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 15] = [
     "relay_account_status",
     "identity_refresh",
     "full_crawl_groups",
+    "full_chain_links",
+    "full_relist_candidates",
+    "full_incomplete",
+    "full_gaps",
+    "crawl_identity",
     "full_crawl",
     "refract_excluded",
     "worker_state",

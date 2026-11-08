@@ -149,6 +149,19 @@ pub struct FullConfig {
     /// Run the weekly counts repair while indexing the full network, in
     /// the form that locks no table.
     pub weekly_count_repair: bool,
+    /// What happens when the database volume's free space falls under
+    /// `pause_free_percent`. Live ingest never stops.
+    pub at_budget: AtBudget,
+    /// The free-space floor of `at_budget`, in percent of the volume.
+    pub pause_free_percent: u32,
+    /// Who moves an account up the crawl queue by reading it.
+    pub on_demand: OnDemand,
+    /// A periodic re-list of the relays, as a backstop; 0 never.
+    pub relist_every_days: u32,
+    /// Pages a second of every re-list pass.
+    pub relist_pages_per_sec: u32,
+    /// Pages a second of a status-only pass of the takedown relays.
+    pub status_pass_pages_per_sec: u32,
 }
 
 impl Default for FullConfig {
@@ -159,6 +172,90 @@ impl Default for FullConfig {
             takedown_relays: vec!["bsky".to_string()],
             suspended_purge_days: 30,
             weekly_count_repair: false,
+            at_budget: AtBudget::PauseCrawl,
+            pause_free_percent: 5,
+            on_demand: OnDemand::Members,
+            relist_every_days: 7,
+            relist_pages_per_sec: 5,
+            status_pass_pages_per_sec: 5,
+        }
+    }
+}
+
+/// `[full] at_budget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtBudget {
+    /// Pause the history crawl.
+    #[default]
+    PauseCrawl,
+    /// Nothing.
+    None,
+}
+
+/// `[full] on_demand`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnDemand {
+    /// Accounts members read move up the crawl queue.
+    #[default]
+    Members,
+    Off,
+}
+
+/// `[full_crawl] identity_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentitySource {
+    /// One directory read per repo, on the crawl's own budget.
+    #[default]
+    PerDid,
+    /// The directory's export, paged in bulk.
+    PlcExport,
+}
+
+/// `[full_crawl]`: full indexing's history crawl.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FullCrawlConfig {
+    /// Off: full indexing stores the network live only.
+    pub enabled: bool,
+    /// Repositories a second, overall.
+    pub repos_per_sec: u32,
+    /// Requests a second to one PDS host.
+    pub per_pds_rate_per_sec: u32,
+    /// Repositories fetched at once.
+    pub concurrency: u32,
+    /// A larger repository is read per collection instead.
+    pub max_car_bytes: u64,
+    /// Records older than this many days are not written; 0 writes all.
+    pub skip_older_than_days: u32,
+    pub identity_source: IdentitySource,
+    /// The crawl's own directory reads a second.
+    pub plc_rate_per_sec: u32,
+    /// Verify each repository's commit against the account's signing key.
+    pub verify_signatures: bool,
+    /// Retries of a failed repository before it stays incomplete.
+    pub max_attempts: u32,
+    /// How long a claimed repository is held before another claim may
+    /// take it.
+    pub claim_lease_secs: u32,
+}
+
+impl Default for FullCrawlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repos_per_sec: 20,
+            per_pds_rate_per_sec: 2,
+            concurrency: 4,
+            max_car_bytes: 67_108_864,
+            skip_older_than_days: 0,
+            identity_source: IdentitySource::PerDid,
+            plc_rate_per_sec: 10,
+            verify_signatures: true,
+            max_attempts: 10,
+            claim_lease_secs: 1800,
         }
     }
 }
@@ -2563,6 +2660,7 @@ pub struct FileConfig {
     pub metrics: MetricsConfig,
     pub indexing: IndexingConfig,
     pub full: FullConfig,
+    pub full_crawl: FullCrawlConfig,
     pub full_trial: FullTrialConfig,
     pub scope: ScopeConfig,
     pub community: CommunityConfig,

@@ -681,7 +681,7 @@ impl Hydrator {
         if rel.blocked_by.contains(&did) {
             return Ok(Err(ViewError::new("BlockedByActor", "Requester is blocked by actor")));
         }
-        if !self.stores_public_of(&did).await {
+        if !self.stores_group_of(&did, &[crate::config::FullGroup::Posts, crate::config::FullGroup::Reposts]).await {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
                 match self.upstream().author_feed(req, &did, limit, cursor, filter).await {

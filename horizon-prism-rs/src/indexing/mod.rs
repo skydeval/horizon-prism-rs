@@ -6,6 +6,7 @@ pub mod narrowing;
 pub mod public_fill;
 pub mod public_mode;
 pub mod public_sweep;
+pub mod crawl;
 pub mod trial;
 mod trial_check;
 #[cfg(test)]

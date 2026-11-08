@@ -37,7 +37,7 @@ impl Hydrator {
         if let Some((error, message)) = self.gate(req, &did).await?.profile_error() {
             return Ok(Err(ViewError::new(error, message)));
         }
-        if !self.stores_public_of(&did).await || cursor.is_some_and(|c| c.starts_with("P:")) {
+        if !self.stores_group_of(&did, &[crate::config::FullGroup::Polls]).await || cursor.is_some_and(|c| c.starts_with("P:")) {
             return match self.upstream().author_polls(req, &did, limit, cursor).await {
                 Some(v) => {
                     let (mut v, _, _) = self.normalized(viewer, req, v).await?;

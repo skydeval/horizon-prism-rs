@@ -159,6 +159,7 @@ mod tests {
             "0062_full_indexing",
             // Full trials and their record.
             "0063_full_trials",
+            "0064_full_crawl",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

@@ -196,6 +196,12 @@ impl Tiers {
         }
     }
 
+    /// Whether a stamp of `label` was ever seen (remembered across starts).
+    #[must_use]
+    pub fn seen(&self, label: &str) -> bool {
+        self.last.contains_key(label)
+    }
+
     /// The full-set collections a stamp's filter leaves out.
     #[must_use]
     pub fn left_out(&self, cap: Option<&Cap>) -> Vec<String> {

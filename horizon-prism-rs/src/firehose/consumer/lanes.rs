@@ -56,7 +56,7 @@ pub(super) enum Work {
     Done(Done),
     /// An entry that did not decode, with the reason.
     Undecodable(String),
-    Sync { did: String, key: Option<CopyKey>, label: String },
+    Sync { did: String, rev: String, tier: CopyTier, key: Option<CopyKey>, label: String },
     Identity { kind: IdentityKind, did: String, relay: Option<String>, active: Option<bool>, status: Option<String>, label: String },
     Commit { commit: Commit, label: String, tier: CopyTier, key: Option<CopyKey> },
 }
@@ -112,7 +112,7 @@ impl LowWater {
         self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
-    pub(super) fn set(&self, id: Option<&str>) {
+    pub(crate) fn set(&self, id: Option<&str>) {
         if let Some(id) = id {
             *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.to_string());
         }
@@ -159,9 +159,13 @@ impl Lane {
         match work {
             Work::Done(done) => Ok(done),
             Work::Undecodable(error) => self.undecodable(entry, error).await,
-            Work::Sync { did, key, label } => {
+            Work::Sync { did, rev, tier, key, label } => {
                 if self.duplicate_here(&did, key.as_ref()) {
                     return Ok(Done::duplicate(&label, None));
+                }
+                // In full, a repo reset is a hole in its chain at once.
+                if let Some(ms) = entry.id_ms() {
+                    self.writer.apply_sync(&did, &rev, tier, ms).await?;
                 }
                 let seen = self.committed(&did, key);
                 Ok(Done { seen, ..Done::nothing() })
@@ -219,12 +223,17 @@ impl Lane {
     ) -> Result<Done, ConsumerError> {
         // In full, a takedown relay's account statuses are recorded.
         if kind == IdentityKind::Account && active.is_some() {
-            let (full, relays) = {
+            let (full, relays, hides, groups) = {
                 let sets = self.writer.scope().read_guard().await;
-                (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone())
+                let hides = sets.full.takedown_relays.iter().any(|r| r.as_str() == label) && !sets.is_restored(did) && !sets.is_member(did);
+                let groups: Vec<String> = sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
+                (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone(), hides, groups)
             };
             if full && relays.iter().any(|r| r.as_str() == label) {
                 crate::indexing::full::record_relay_status(&self.pool, did, label, active, status).await?;
+                // The crawl follows the account: a deletion or a suspension
+                // refuses an in-flight crawl, a return to active queues one.
+                crate::indexing::crawl::state::account_status(&self.pool, did, active, status, hides, &groups).await?;
             } else if full && active == Some(false) && label == super::super::watermark::UNKNOWN_RELAY {
                 tracing::warn!(event = "firehose_unaliased_status", relay = ?relay, %did, "an account status from a relay URL with no label or alias; list it in firehose.relay_aliases if it stands in for a takedown relay");
             }
@@ -257,7 +266,7 @@ impl Lane {
         if let Some(db) = self.pool.connect_options().get_database() {
             crate::test_support::hooks::pause(crate::test_support::hooks::LANE_BEFORE_ENTRY, &format!("{db}/{}", commit.repo)).await;
         }
-        let report = self.apply(&commit, &label, tier).await?;
+        let report = self.apply(&commit, &label, tier, entry.id_ms()).await?;
         // A malformed op that could not matter is counted, not dead-lettered
         // (actionable-warnings design §6.3).
         let dropped = report.failed.iter().filter(|f| !f.matters).count();
@@ -298,7 +307,7 @@ impl Lane {
 
     /// The writer's call for one copy, retried in place when another
     /// lane's transaction conflicted with it.
-    async fn apply(&self, commit: &Commit, label: &str, tier: CopyTier) -> Result<ApplyReport, Transient> {
+    async fn apply(&self, commit: &Commit, label: &str, tier: CopyTier, stream_ms: Option<i64>) -> Result<ApplyReport, Transient> {
         // A tracked repo's chain is advanced only by a whole copy: any other
         // copy may have dropped a commit its filter left out, in every
         // public-indexing mode.
@@ -307,7 +316,7 @@ impl Lane {
         loop {
             let result = self
                 .writer
-                .apply_copy(Some(label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier)
+                .apply_live(Some(label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier, stream_ms)
                 .await;
             match result {
                 Err(t) if tries < CONFLICT_RETRIES && t.conflict().is_some() => {

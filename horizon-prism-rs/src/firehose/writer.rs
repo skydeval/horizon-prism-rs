@@ -134,6 +134,9 @@ pub enum WriteSource {
     /// `requestRecord`'s catch-up listing (private posting §3.8). Not live:
     /// private notifications follow the 48 h rule (§4.8).
     CatchUp,
+    /// Full indexing's history crawl: never notifies, never fans out, and
+    /// sends the private tier no notification, whatever a record's age.
+    Crawl,
 }
 
 /// What happened to one op.
@@ -892,6 +895,9 @@ pub struct Writer {
     /// Collect thread outline ops for firehose commits (thread outline
     /// design §3.1).
     outline: bool,
+    /// Accounts full indexing saw for the first time live, for their
+    /// takedown relays' status.
+    first_sight: Option<Arc<crate::indexing::crawl::FirstSight>>,
 }
 
 /// The live feed's view of one call's ops (admin-ui-live-feed design
@@ -947,7 +953,16 @@ impl Writer {
             applier: None,
             feed: None,
             outline: false,
+            first_sight: None,
         }
+    }
+
+    /// Tell `queue` about every account full indexing sees for the first
+    /// time live.
+    #[must_use]
+    pub fn with_first_sight(mut self, queue: Arc<crate::indexing::crawl::FirstSight>) -> Self {
+        self.first_sight = Some(queue);
+        self
     }
 
     /// Use the process's shared id interning rather than one of its own.
@@ -1110,6 +1125,29 @@ impl Writer {
         options: ApplyOptions,
         tier: super::tier::CopyTier,
     ) -> Result<ApplyReport, Transient> {
+        self.apply_live(relay, repo, rev, since, ops, options, tier, None).await
+    }
+
+    /// [`Writer::apply_copy`] for a copy read from the stream at
+    /// `stream_ms` (its entry id's milliseconds): in breadth Full, every
+    /// such copy also runs full indexing's continuity statements, written
+    /// or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn apply_live(
+        &self,
+        relay: Option<&str>,
+        repo: &str,
+        rev: &str,
+        since: Option<&str>,
+        ops: &[RawOp],
+        options: ApplyOptions,
+        tier: super::tier::CopyTier,
+        stream_ms: Option<i64>,
+    ) -> Result<ApplyReport, Transient> {
         // Firehose throughput design §2.4: a hung database, before the
         // nothing-to-write check so it holds every entry alike.
         #[cfg(test)]
@@ -1220,7 +1258,13 @@ impl Writer {
             || crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, "*");
         #[cfg(not(test))]
         let forced = false;
-        if !forced && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
+        // Full indexing's continuity: every live copy with a rev runs its
+        // statements, so the transaction always runs.
+        let continuity = match stream_ms {
+            Some(ms) if sets.public.breadth == crate::indexing::Breadth::Full && options.source == WriteSource::Firehose => Some(ms),
+            _ => None,
+        };
+        if !forced && continuity.is_none() && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
             let mut report = report_without_writes(repo, &prepared, &admissions, ops, sets, owner_side);
             report.outline = outline;
             drop(guard);
@@ -1234,6 +1278,10 @@ impl Writer {
         // before the transaction, so a rollback leaves no cached id that
         // does not exist.
         let keyed = self.op_ids(repo, &prepared, &admissions).await?;
+        let repo_id = match continuity {
+            Some(_) => self.ids.account_ids(&[repo.to_string()]).await?.get(repo).copied(),
+            None => None,
+        };
 
         let mut tx = self.pool.begin().await?;
         // 2 and 3: DID locks, then per-URI locks.
@@ -1278,6 +1326,7 @@ impl Writer {
         let mut report = ApplyReport { transaction: true, outline, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
         let mut copied = copy::Effects::default();
+        let mut failed_enabled = false;
         for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
             if owner_side {
                 self.owner_side(&mut tx, repo, rev, op, sets, &mut copied).await?;
@@ -1324,6 +1373,10 @@ impl Writer {
                 }
             };
             if let OpOutcome::Failed(error) = &outcome {
+                // A failed op of an enabled group (not a malformed one) is a
+                // hole in full indexing's chain at once.
+                failed_enabled |= !matches!(p, Prepared::Invalid(_))
+                    && crate::indexing::full::group_of(&op.collection).is_some_and(|g| sets.full.kinds.contains(&g));
                 report.failed.push(FailedOp {
                     index: i,
                     action: op.action,
@@ -1373,8 +1426,31 @@ impl Writer {
         for plan in &plans {
             self.scope.touch(&plan.holds);
         }
+        // Full indexing's continuity, after every write that fires a count
+        // trigger.
+        let mut first_sight = false;
+        if let (Some(stream_ms), Some(account)) = (continuity, repo_id) {
+            if tier == super::tier::CopyTier::Aside {
+                crate::indexing::crawl::continuity::on_aside(&mut tx, account, rev, stream_ms, relay.unwrap_or("other")).await?;
+            } else {
+                let groups: Vec<String> = sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
+                let copy = crate::indexing::crawl::continuity::Copy {
+                    account,
+                    rev,
+                    since,
+                    stream_ms,
+                    crawl_generation: i64::try_from(sets.public.crawl_generation).unwrap_or(i64::MAX),
+                    groups: &groups,
+                    failed: failed_enabled,
+                };
+                first_sight = crate::indexing::crawl::continuity::on_copy(&mut tx, &copy).await?.inserted;
+            }
+        }
         tx.commit().await?;
         drop(guard);
+        if first_sight && let Some(queue) = &self.first_sight {
+            queue.push(repo);
+        }
         if !entries.is_empty() {
             let counters = self.scope.trial_counters();
             for e in &entries {
@@ -1387,6 +1463,43 @@ impl Writer {
             tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
         }
         Ok(report)
+    }
+
+    /// A relay's `#sync` of `repo` at `rev`, read from the stream at
+    /// `stream_ms`: in breadth Full, a Whole or Covered copy is a hole in
+    /// full indexing's chain at once. Anything else writes nothing.
+    /// Returns whether a transaction ran.
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole.
+    pub async fn apply_sync(&self, repo: &str, rev: &str, tier: super::tier::CopyTier, stream_ms: i64) -> Result<bool, Transient> {
+        let guard = self.scope.read_guard().await;
+        if guard.public.breadth != crate::indexing::Breadth::Full || tier == super::tier::CopyTier::Aside || !proto_blue::syntax::Tid::is_valid(rev) {
+            return Ok(false);
+        }
+        let Some(account) = self.ids.account_ids(&[repo.to_string()]).await?.get(repo).copied() else {
+            return Ok(false);
+        };
+        let groups: Vec<String> = guard.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
+        let copy = crate::indexing::crawl::continuity::Copy {
+            account,
+            rev,
+            since: None,
+            stream_ms,
+            crawl_generation: i64::try_from(guard.public.crawl_generation).unwrap_or(i64::MAX),
+            groups: &groups,
+            failed: false,
+        };
+        let mut tx = self.pool.begin().await?;
+        lock_dids_shared(&mut tx, &[repo.to_string()]).await?;
+        let inserted = crate::indexing::crawl::continuity::on_sync(&mut tx, &copy).await?.inserted;
+        tx.commit().await?;
+        drop(guard);
+        if inserted && let Some(queue) = &self.first_sight {
+            queue.push(repo);
+        }
+        Ok(true)
     }
 
     /// Rule 4's owner-side rules for one op of a repo in `O_sub` (design-v3
@@ -2092,7 +2205,7 @@ impl Writer {
         let off = sets.public.mode.off_rule();
         let before_fill = options.source == WriteSource::Backfill
             && sets.public.last_fill_since.is_some_and(|since| u.created_at < since);
-        let notify = !off && !before_fill && !trial_row;
+        let notify = !off && !before_fill && !trial_row && options.source != WriteSource::Crawl;
         if member_list_block {
             let list_after = list_block_target(conn, &u.uri).await?;
             for list in [&list_before, &list_after].into_iter().flatten() {

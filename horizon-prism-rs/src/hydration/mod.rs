@@ -718,8 +718,41 @@ impl Hydrator {
     /// public-indexing mode is On and `did` is in S (public-indexing design
     /// §9.1). Filling is not On, so a fill in progress reads upstream.
     pub async fn stores_public_of(&self, did: &str) -> bool {
-        let sets = self.scope().read_guard().await;
-        sets.own_repo_local(did)
+        self.stores_group_of(did, &[crate::config::FullGroup::Posts]).await
+    }
+
+    /// The own-repo rule for `groups` of `did`'s records: the community
+    /// rule (the mode On and `did` in S); in breadth Full, an account
+    /// outside S and the members also with a current crawl mark of each
+    /// group. An account without one is moved up the crawl queue.
+    pub async fn stores_group_of(&self, did: &str, groups: &[crate::config::FullGroup]) -> bool {
+        let (on_demand, generation) = {
+            let sets = self.scope().read_guard().await;
+            if sets.own_repo_local(did) {
+                return true;
+            }
+            let full = sets.public.breadth == crate::indexing::Breadth::Full && sets.public.mode.is_on();
+            if !full || sets.full.history_cutoff || !groups.iter().all(|g| sets.full.kinds.contains(g)) {
+                return false;
+            }
+            (sets.full.on_demand.clone(), sets.public.crawl_generation)
+        };
+        let dids = [did.to_string()];
+        let mut local = !groups.is_empty();
+        for g in groups {
+            match crate::indexing::crawl::marks::marked(self.pool(), &dids, *g, generation).await {
+                Ok(m) if m.contains(did) => {}
+                Ok(_) => local = false,
+                Err(error) => {
+                    tracing::warn!(event = "full_marks_read_failed", %error, "reading crawl marks failed; reading today's source");
+                    return false;
+                }
+            }
+        }
+        if !local && let Some(q) = on_demand {
+            q.push(did);
+        }
+        local
     }
 
     /// Of `dids`, those whose per-DID state a public path may read: the

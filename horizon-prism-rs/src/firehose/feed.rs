@@ -363,7 +363,7 @@ impl From<WriteSource> for Source {
     fn from(s: WriteSource) -> Self {
         match s {
             WriteSource::Firehose => Self::Network,
-            WriteSource::Backfill => Self::Backfill,
+            WriteSource::Backfill | WriteSource::Crawl => Self::Backfill,
             WriteSource::IndexRequest => Self::Requested,
             WriteSource::CatchUp => Self::CatchUp,
         }

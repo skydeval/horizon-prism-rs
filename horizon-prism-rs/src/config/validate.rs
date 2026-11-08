@@ -605,7 +605,7 @@ fn with_leave(_cfg: &FileConfig, _value: &str, _intents: &[Intent], checked: Res
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 28] = [
+    let nonzero: [(&str, u64); 37] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.writer_lanes", u64::from(cfg.firehose.writer_lanes)),
         ("firehose.lane_queue", u64::from(cfg.firehose.lane_queue)),
@@ -634,11 +634,23 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("cache.viewer_private_ttl_secs", cfg.cache.viewer_private_ttl_secs),
         ("cache.viewer_private_max", cfg.cache.viewer_private_max),
         ("cache.viewer_private_per_viewer_max", cfg.cache.viewer_private_per_viewer_max),
+        ("full_crawl.repos_per_sec", u64::from(cfg.full_crawl.repos_per_sec)),
+        ("full_crawl.per_pds_rate_per_sec", u64::from(cfg.full_crawl.per_pds_rate_per_sec)),
+        ("full_crawl.concurrency", u64::from(cfg.full_crawl.concurrency)),
+        ("full_crawl.max_car_bytes", cfg.full_crawl.max_car_bytes),
+        ("full_crawl.plc_rate_per_sec", u64::from(cfg.full_crawl.plc_rate_per_sec)),
+        ("full_crawl.max_attempts", u64::from(cfg.full_crawl.max_attempts)),
+        ("full_crawl.claim_lease_secs", u64::from(cfg.full_crawl.claim_lease_secs)),
+        ("full.relist_pages_per_sec", u64::from(cfg.full.relist_pages_per_sec)),
+        ("full.status_pass_pages_per_sec", u64::from(cfg.full.status_pass_pages_per_sec)),
     ];
     for (key, value) in nonzero {
         if value == 0 {
             out.push(format!("{key} must be greater than 0"));
         }
+    }
+    if cfg.full.pause_free_percent > 98 {
+        out.push("full.pause_free_percent must be at most 98".to_string());
     }
     // No budget is allowed; a budget of nothing is not.
     if cfg.storage.budget_bytes == Some(0) {

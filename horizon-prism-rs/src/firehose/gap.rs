@@ -144,6 +144,15 @@ pub async fn run_gap_transaction_clearing(
     if let Some(ms) = outline_since_ms {
         crate::thread_outline::raise_stored_complete_since(&mut tx, ms).await?;
     }
+    // In full, entries were lost: the gap is resolved by a re-list.
+    if guard.public.breadth == crate::indexing::Breadth::Full && cause != GapCause::Operator {
+        let kind = if cause == GapCause::GroupRecreated { "recreated" } else { "trim" };
+        sqlx::query("INSERT INTO full_gaps (kind, blocking, detail) VALUES ($1, true, $2)")
+            .bind(kind)
+            .bind(serde_json::json!({ "cause": cause.as_str() }))
+            .execute(&mut *tx)
+            .await?;
+    }
     // Last, in the firehose writer's order (`members` → jobs →
     // `sync_state`, §3.3). No counter: a settle holding the key commits
     // first and is cleared here; one after it reads the new epoch.

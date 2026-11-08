@@ -285,7 +285,8 @@ pub fn collection_nsid(id: i16) -> Option<&'static str> {
 const TID_ALPHABET: &[u8] = b"234567abcdefghijklmnopqrstuvwxyz";
 
 /// A valid TID's unsigned 64-bit value.
-fn tid_u64(s: &str) -> Option<u64> {
+#[must_use]
+pub fn tid_u64(s: &str) -> Option<u64> {
     if !proto_blue::syntax::Tid::is_valid(s) {
         return None;
     }

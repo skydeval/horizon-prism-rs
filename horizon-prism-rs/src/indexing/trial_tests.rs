@@ -244,7 +244,7 @@ async fn shift(scope: &ScopeState, ends_at: Option<DateTime<Utc>>, started_at: O
 /// From community a trial is On, Full with the trial running and its
 /// baseline; it ends back in On, Community with no fill and passes. A start
 /// is refused while one runs, with an undropped record, in Full, Filling,
-/// Draining, Narrowing or Held, and with `--history`.
+/// Draining, Narrowing or Held.
 #[tokio::test]
 async fn a_trial_from_community_returns_to_community() {
     let Some(db) = fresh_db("trial_community").await else {
@@ -252,8 +252,6 @@ async fn a_trial_from_community_returns_to_community() {
     };
     let p = &db.pool;
     let (pi, scope, _w) = stack(p, ScopeValue::Community, None).await;
-    let refused = pi.start_trial(Bounds { history: true, ..bounds() }, "cli").await.expect_err("history is not built");
-    assert!(refused.0.contains("--history"), "{refused}");
     let started = pi.start_trial(bounds(), "cli").await.expect("start");
     assert_eq!((started.from, started.action), (ScopeValue::Community, "breadth"));
     assert_eq!((scope.public_mode(), scope.public_breadth()), (PublicMode::On, Breadth::Full));

@@ -274,7 +274,7 @@ pub enum FullTrialAction {
         /// End when the database volume's free space falls under this share.
         #[arg(long)]
         end_below_free_percent: Option<u32>,
-        /// Crawl history too (not built yet: refused).
+        /// Crawl history too, as `[full_crawl]` says.
         #[arg(long)]
         history: bool,
         /// The confirm word: FULL.

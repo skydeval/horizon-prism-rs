@@ -98,7 +98,7 @@ pub struct PrivateOp {
 /// looked at, so the store costs the same whoever subscribes.
 #[must_use]
 pub fn fans_out(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
-    source != WriteSource::Backfill && Utc::now().signed_duration_since(created_at) <= max_age
+    !matches!(source, WriteSource::Backfill | WriteSource::Crawl) && Utc::now().signed_duration_since(created_at) <= max_age
 }
 
 /// Whether a public record's write notifies (private posting §4.8, C-11): a
@@ -107,7 +107,7 @@ pub fn fans_out(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono:
 /// `max_age`.
 #[must_use]
 pub fn notifies(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
-    source == WriteSource::Firehose || Utc::now().signed_duration_since(created_at) <= max_age
+    source == WriteSource::Firehose || (source != WriteSource::Crawl && Utc::now().signed_duration_since(created_at) <= max_age)
 }
 
 /// Whether a private post's write notifies (private-embeds design §6 rule
@@ -116,7 +116,7 @@ pub fn notifies(source: WriteSource, created_at: DateTime<Utc>, max_age: chrono:
 /// rewriting its old posts so notifies no one again.
 #[must_use]
 pub fn notifies_post(source: WriteSource, created: bool, created_at: DateTime<Utc>, max_age: chrono::Duration) -> bool {
-    (source == WriteSource::Firehose && created) || Utc::now().signed_duration_since(created_at) <= max_age
+    (source == WriteSource::Firehose && created) || (source != WriteSource::Crawl && Utc::now().signed_duration_since(created_at) <= max_age)
 }
 
 /// A public record naming a private post (private posting §4.8), as the

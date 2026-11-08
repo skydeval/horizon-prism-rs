@@ -474,7 +474,17 @@ pub enum Class {
 }
 
 /// The tables full writes only in breadth Full: the exit empties them.
-pub const FULL_ONLY: [&str; 4] = ["full_crawl", "full_crawl_groups", "relay_account_status", "refract_excluded"];
+pub const FULL_ONLY: [&str; 9] = [
+    "full_crawl",
+    "full_crawl_groups",
+    "relay_account_status",
+    "refract_excluded",
+    "full_chain_links",
+    "full_relist_candidates",
+    "full_gaps",
+    "full_incomplete",
+    "crawl_identity",
+];
 
 /// The coverage table: every table of the schema in one class. A table in
 /// no class fails the coverage test, so a new table must be placed here.
@@ -706,7 +716,11 @@ pub fn confirm_text(from: ScopeValue, bounds: Bounds, warnings: &[String], last_
     if let Some(b) = first_bound {
         out.push(format!("At the measured growth, the {b} bound ends the trial first."));
     }
-    out.push("Not exercised: the history crawl (live only), labelers' history (subscribed from now), and notifications or private-tier effects of the trial's rows (members get only the start mode's).".to_string());
+    out.push(if bounds.history {
+        "With history: the crawl fetches accounts outside S and the members as [full_crawl] says; S and the members are not crawled, and a crawl removes only rows the trial recorded. Not exercised: labelers' history (subscribed from now), and notifications or private-tier effects of the trial's rows (members get only the start mode's).".to_string()
+    } else {
+        "Not exercised: the history crawl (live only), labelers' history (subscribed from now), and notifications or private-tier effects of the trial's rows (members get only the start mode's).".to_string()
+    });
     out.push("Removed at the end: every row the trial stored that the start mode would not have. Not restored: accounts first seen during the trial stay interned, caches refill on demand, and the database keeps the freed space for reuse until the reclaim step. The free-space floor leaves room for the exit itself, whose deletes free no disk until then.".to_string());
     out.push("Run again with --confirm FULL to start.".to_string());
     out
@@ -732,9 +746,6 @@ impl PublicIndexing {
     /// [`Refused`] in plain words; a database error as its text.
     pub async fn start_trial(&self, bounds: Bounds, actor: &str) -> Result<Started, Refused> {
         let db = |e: sqlx::Error| Refused(e.to_string());
-        if bounds.history {
-            return Err(Refused("--history is not built yet: a trial runs live only until the history crawl lands.".into()));
-        }
         let from = self.refusal().await.map_err(db)??;
         let measured_at = now();
         let id: i64 = sqlx::query_scalar("INSERT INTO full_trials (\"from\", \"to\", state, bounds) VALUES ($1, $1, 'measuring', $2) RETURNING id")
@@ -758,7 +769,7 @@ impl PublicIndexing {
             ends_at: started_at + bounds.duration(),
             max_added_bytes: bounds.max_added_bytes(),
             end_below_free_percent: bounds.end_below_free_percent,
-            history: false,
+            history: bounds.history,
             baseline_db_bytes: baseline_db,
             start_last_fill_since: None,
             ended_by: None,

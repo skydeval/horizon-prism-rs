@@ -103,6 +103,13 @@ pub struct FullSets {
     /// Accounts whose deletion purge runs without the scope write guard:
     /// writers re-read it after taking their DID locks.
     pub purge_markers: Arc<ExcludedSet>,
+    /// Accounts members read whose history the crawl has not marked: moved
+    /// up the crawl queue (`[full] on_demand = "members"`).
+    pub on_demand: Option<Arc<crate::indexing::crawl::OnDemand>>,
+    /// A history cutoff is set (`[full_crawl] skip_older_than_days`):
+    /// crawled accounts outside S and the members keep reading today's
+    /// sources, so an aged-out record never reads as missing.
+    pub history_cutoff: bool,
 }
 
 /// A small concurrent set of DIDs (bounded by the Refract communities).
@@ -384,6 +391,14 @@ impl ScopeState {
     /// # Errors
     ///
     /// Any database error.
+    /// The crawl's inputs on the read path: the on-demand queue (none when
+    /// `[full] on_demand = "off"`) and whether a history cutoff is set.
+    pub async fn set_crawl_reads(&self, on_demand: Option<Arc<crate::indexing::crawl::OnDemand>>, history_cutoff: bool) {
+        let mut sets = self.write_guard().await;
+        sets.full.on_demand = on_demand;
+        sets.full.history_cutoff = history_cutoff;
+    }
+
     pub async fn load_full(&self, pool: &PgPool, full: &crate::config::FullConfig, relay_labels: &[String]) -> Result<(), sqlx::Error> {
         let excluded: Vec<String> = sqlx::query_scalar("SELECT d.did FROM refract_excluded x JOIN dids d ON d.id = x.account")
             .fetch_all(pool)

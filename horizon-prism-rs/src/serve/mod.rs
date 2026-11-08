@@ -379,7 +379,17 @@ pub async fn run() -> Result<Stopped, StartupError> {
     let live_hub = cfg.file.admin.web_ui.then(|| crate::admin::live::Hub::new(cfg.file.admin.live_feed_snippets));
     // One id interning for the process: every writer shares its cache.
     let ids = crate::db::ids::Ids::new(pool.clone());
-    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private)).with_ids(ids);
+    // Full indexing's crawl queues: accounts first seen live, and accounts
+    // members read.
+    let first_sight = Arc::new(crate::indexing::crawl::FirstSight::new(crate::indexing::crawl::QUEUE_CAP));
+    let on_demand = Arc::new(crate::indexing::crawl::OnDemand::new(crate::indexing::crawl::QUEUE_CAP));
+    scope
+        .set_crawl_reads(
+            (cfg.file.full.on_demand == crate::config::OnDemand::Members).then(|| Arc::clone(&on_demand)),
+            cfg.file.full_crawl.skip_older_than_days > 0,
+        )
+        .await;
+    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private)).with_ids(ids).with_first_sight(Arc::clone(&first_sight));
     let writer = match &live_hub {
         Some(hub) => writer.with_feed(hub.tap()),
         None => writer,
@@ -617,6 +627,36 @@ pub async fn run() -> Result<Stopped, StartupError> {
         None => consumer,
     };
     let throughput = consumer.throughput_shared();
+    // Full indexing's history crawl, sweeper and re-list, on the
+    // consumer's clocks; idle outside breadth Full.
+    {
+        let relays: Vec<crate::indexing::crawl::task::Relay> = fh
+            .relay_labels
+            .iter()
+            .filter_map(|(url, label)| crate::indexing::crawl::client::relay_base(url).map(|base| crate::indexing::crawl::task::Relay { label: label.clone(), base }))
+            .collect();
+        let source = crate::indexing::crawl::client::NetCrawlSource::new(
+            nets.internal().client().clone(),
+            resolver.clone(),
+            cfg.file.full_crawl.plc_rate_per_sec,
+            cfg.file.full_crawl.per_pds_rate_per_sec,
+        );
+        let crawler = crate::indexing::crawl::task::Crawler::new(
+            writer.clone(),
+            Arc::new(source),
+            cfg.file.full_crawl.clone(),
+            cfg.file.full.clone(),
+            relays,
+            public.tier_board(),
+            fh.old_filtered_relays.clone(),
+            fh.dedupe_window_secs,
+        )
+        .with_clocks(consumer.low_water(), consumer.covered_clock())
+        .with_stream(redis.clone(), &fh.stream_key)
+        .with_data_dir(&cfg.env.data_dir)
+        .with_queues(Arc::clone(&first_sight), Arc::clone(&on_demand));
+        tasks.push(crawler.spawn());
+    }
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
 
