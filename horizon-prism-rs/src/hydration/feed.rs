@@ -449,7 +449,7 @@ impl Hydrator {
         uri: &str,
         quoting: &str,
     ) -> Result<Option<PublicEmit<Value>>, sqlx::Error> {
-        if is_private_uri(uri) || !self.scope().read_guard().await.public.mode.is_on() {
+        if is_private_uri(uri) || !self.scope().public_reads_local() {
             return Ok(None);
         }
         let wanted = [uri.to_string()];
@@ -681,7 +681,7 @@ impl Hydrator {
         if rel.blocked_by.contains(&did) {
             return Ok(Err(ViewError::new("BlockedByActor", "Requester is blocked by actor")));
         }
-        if !self.in_scope(&did).await {
+        if !self.stores_public_of(&did).await {
             // Out-of-scope subject: the cascade (item 7).
             return Ok(
                 match self.upstream().author_feed(req, &did, limit, cursor, filter).await {

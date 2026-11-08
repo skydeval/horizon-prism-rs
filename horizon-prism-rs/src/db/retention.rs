@@ -164,6 +164,12 @@ pub trait RetentionInputs: Send + Sync {
     async fn subscription_tombstones_aged(&self) -> Result<(), sqlx::Error> {
         Ok(())
     }
+
+    /// The record groups full indexing stores for every account, while the
+    /// breadth is Full: their scope steps delete nothing. Empty otherwise.
+    async fn full_groups(&self) -> Vec<crate::config::FullGroup> {
+        Vec::new()
+    }
 }
 
 /// A bind parameter for one retention statement.
@@ -182,8 +188,8 @@ pub(crate) struct Step {
     /// parameter that follows the step's own bind.
     pub(crate) sql: String,
     /// Per-DID steps: the query listing DIDs that have deletable rows.
-    candidates: Option<String>,
-    bind: Bind,
+    pub(crate) candidates: Option<String>,
+    pub(crate) bind: Bind,
 }
 
 const NOT_IN_SCOPE: &str = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = {col})";
@@ -221,7 +227,7 @@ fn member_among(exprs: &[String]) -> String {
 }
 
 /// `DELETE FROM <table> WHERE <key> IN (SELECT <key> FROM <table> <alias> WHERE <pred> LIMIT n)`.
-fn batched(table: &'static str, key: &str, alias: &str, pred: &str, bind: Bind) -> Step {
+pub(crate) fn batched(table: &'static str, key: &str, alias: &str, pred: &str, bind: Bind) -> Step {
     Step {
         table,
         sql: format!(
@@ -300,7 +306,7 @@ fn did_of(col: &str) -> String {
 
 /// Class S / M deletes (§4.4 retention predicates), in dependency order:
 /// content first, then derived counts, then identity rows.
-fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
+pub(crate) fn scope_steps(private_row_authors: Vec<String>) -> Vec<Step> {
     let subject_member = |alias: &str| member_among(&[did_of(&format!("{alias}.subj_author"))]);
     let mut steps = vec![
         // A post's search row and odd references go with it.
@@ -596,7 +602,7 @@ fn age_cap_steps(max_age_days: u32) -> Vec<Step> {
 /// Run one batch under the scope read guard. The guard is taken before the
 /// statement acquires a pool connection and released after it commits (a
 /// single statement is its own transaction).
-async fn run_batch(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result<u64, sqlx::Error> {
+pub(crate) async fn run_batch(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step) -> Result<u64, sqlx::Error> {
     let guard = scope.read().await;
     let query = sqlx::query::<sqlx::Postgres>(&step.sql);
     let query = match &step.bind {
@@ -739,7 +745,9 @@ impl RetentionTask for PublicRetention {
         settings: &RetentionSettings,
     ) -> Result<RetentionReport, sqlx::Error> {
         let private_authors = self.inputs.private_row_authors().await?;
+        let full = self.inputs.full_groups().await;
         let mut steps = scope_steps(private_authors);
+        steps.retain(|s| !crate::indexing::full::retention_skips(s.table, &full));
         steps.extend(age_cap_steps(settings.max_age_days));
         steps.extend(time_steps(settings));
         let mut report = run_steps(pool, scope, &steps).await?;

@@ -719,7 +719,7 @@ impl Hydrator {
     /// §9.1). Filling is not On, so a fill in progress reads upstream.
     pub async fn stores_public_of(&self, did: &str) -> bool {
         let sets = self.scope().read_guard().await;
-        sets.public.mode.is_on() && sets.in_scope(did)
+        sets.own_repo_local(did)
     }
 
     /// Of `dids`, those whose per-DID state a public path may read: the
@@ -727,10 +727,31 @@ impl Hydrator {
     /// DID's rows exist only because of private facts (a private owner,
     /// the author of a private reply), and are treated as absent.
     pub(crate) async fn readable_dids(&self, dids: &[String]) -> Vec<String> {
-        let scope = self.scope().read_guard().await;
-        // Refract's R-live is public by construction: an account Bluesky
-        // withholds and a community serves (refract design §5.5).
-        dids.iter().filter(|d| scope.in_scope(d) || scope.is_member(d) || scope.is_restored(d)).cloned().collect()
+        let (mut out, rest, kinds) = {
+            let scope = self.scope().read_guard().await;
+            // Refract's R-live is public by construction: an account Bluesky
+            // withholds and a community serves (refract design §5.5).
+            let (inside, rest): (Vec<String>, Vec<String>) =
+                dids.iter().cloned().partition(|d| scope.in_scope(d) || scope.is_member(d) || scope.is_restored(d));
+            let full = scope.public.breadth == crate::indexing::Breadth::Full;
+            (inside, if full { rest } else { Vec::new() }, scope.full.kinds.clone())
+        };
+        // In full, also an account with a public record stored for its own
+        // sake: a profile, or a row it authored in an enabled group's table.
+        // Never the bare existence of an `actors` row. One query.
+        if !rest.is_empty() {
+            let tables = crate::indexing::full::authored_tables(&kinds);
+            let mut arms = vec!["EXISTS (SELECT 1 FROM actors a WHERE a.id = d.id AND a.profile_rev IS NOT NULL)".to_string()];
+            arms.extend(tables.iter().map(|t| format!("EXISTS (SELECT 1 FROM {t} x WHERE x.author = d.id)")));
+            let sql = format!("SELECT d.did FROM dids d WHERE d.did = ANY($1) AND ({})", arms.join(" OR "));
+            match sqlx::query_scalar::<_, String>(&sql).bind(&rest).fetch_all(self.pool()).await {
+                Ok(found) => out.extend(found),
+                Err(error) => tracing::warn!(event = "readable_dids_failed", %error, "reading which accounts full stores failed; they read as absent"),
+            }
+        }
+        // The caller's order.
+        let keep: HashSet<&String> = out.iter().collect();
+        dids.iter().filter(|d| keep.contains(d)).cloned().collect()
     }
 
     /// Of `dids`, those whose per-DID state `req` may read: all of them in
@@ -755,7 +776,21 @@ impl Hydrator {
         let snapshot = self.refract_snapshot(req).await;
         let check = req.refract_check();
         let view = crate::refract::RefractView { snapshot: &snapshot, check: &check };
-        crate::moderation::gate_many_among(self.pool(), subjects, Some(&readable), view).await
+        // In full, a takedown relay's suspension hides an account, unless
+        // it is a member or Refract lists it.
+        let (relays, members, restored) = if self.scope().public_breadth() != crate::indexing::Breadth::Full {
+            (Vec::new(), HashSet::new(), Arc::default())
+        } else {
+            let sets = self.scope().read_guard().await;
+            if sets.public.breadth == crate::indexing::Breadth::Full && !sets.full.takedown_relays.is_empty() {
+                (sets.full.takedown_relays.clone(), sets.members.clone(), Arc::clone(&sets.restored))
+            } else {
+                (Vec::new(), HashSet::new(), Arc::default())
+            }
+        };
+        let exempt = |did: &str| members.contains(did) || restored.contains_key(did);
+        let suspensions = (!relays.is_empty()).then_some(crate::moderation::RelaySuspensions { relays: &relays, exempt: &exempt });
+        crate::moderation::gate_many_suspended(self.pool(), subjects, Some(&readable), view, suspensions).await
     }
 
     /// The request's Refract snapshot (refract design §4.2): built on the
@@ -1014,7 +1049,7 @@ impl Hydrator {
                 .await?;
         // Activity subscriptions feed only a 501 surface unless the
         // public-indexing mode is On (public-indexing design §9.2).
-        let subscribed: Vec<(String, bool, bool)> = if self.scope().public_mode().is_on() {
+        let subscribed: Vec<(String, bool, bool)> = if self.scope().public_reads_local() {
             sqlx::query_as(
                 "SELECT subject_did, post, reply FROM activity_subscriptions WHERE subscriber_did = $1 AND subject_did = ANY($2)",
             )
@@ -1273,7 +1308,7 @@ impl Hydrator {
         // A post the viewer bookmarked (design-v3 §8.2). Bookmarks are a 501
         // surface unless the public-indexing mode is On, so the field is
         // left out (public-indexing design §9.2).
-        if self.scope().public_mode().is_on() {
+        if self.scope().public_reads_local() {
             let bookmarked: Vec<String> = sqlx::query_scalar("SELECT post_uri FROM bookmarks WHERE viewer_did = $1 AND post_uri = ANY($2)")
                 .bind(me)
                 .bind(uris)

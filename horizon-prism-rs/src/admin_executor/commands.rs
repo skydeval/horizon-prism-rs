@@ -1135,17 +1135,18 @@ mod tests {
         assert!(AdminCommand::parse("deadletter drop", &json!({"id": "x"})).is_err());
         assert!(AdminCommand::parse("purge everything", &json!({})).is_err());
         // The public-indexing commands round-trip, wait on no purge, and
-        // refuse `full`.
+        // refuse an unknown value.
         for cmd in [
             AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly },
             AdminCommand::IndexingPublicScope { value: ScopeValue::Community },
+            AdminCommand::IndexingPublicScope { value: ScopeValue::Full },
             AdminCommand::IndexingStatus,
         ] {
             let (name, args) = cmd.to_row();
             assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
             assert_eq!(cmd.did(), None);
         }
-        assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "full"})).is_err());
+        assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "everything"})).is_err());
         // The operator commands (admin-ui design §11) round-trip and wait
         // on no purge; arguments are checked as the design says.
         for cmd in [

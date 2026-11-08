@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 
 use super::public_mode::{
-    Phase, PublicIndexing, PublicMode, PublicState, ScopeValue, Spawn, SweepState, Transition, g64, now, parse_ts, replace_if, rfc3339,
+    Breadth, Phase, PublicIndexing, ScopeValue, SweepList, SweepState, Transition, g64, now, parse_ts, replace_if, rfc3339,
+    spawn_of, state_of,
 };
 use crate::db::retention::BATCH_PAUSE;
 
@@ -183,10 +184,31 @@ impl Cursor {
     }
 }
 
-/// §3.5 step 2.2: a stored sweep state that validates.
+/// §3.5 step 2.2: a stored sweep state that validates, checked against
+/// its own list (a state stored without one is `today`).
 #[must_use]
 pub fn valid_state(v: &Value) -> Option<SweepState> {
+    let list = match v.get("list") {
+        None | Some(Value::Null) => SweepList::Today,
+        Some(l) => SweepList::parse(l.as_str()?)?,
+    };
     let name = v.get("table")?.as_str()?;
+    // A narrowing step, or one of the steps a full drain runs after the
+    // tables: no cursor.
+    let step = match list {
+        SweepList::Today => false,
+        SweepList::Full => super::narrowing::FULL_DRAIN_STEP_NAMES.contains(&name),
+        SweepList::Narrowing => {
+            if !super::narrowing::STEP_NAMES.contains(&name) {
+                return None;
+            }
+            true
+        }
+    };
+    if step {
+        let last_advanced_at = parse_ts(v.get("last_advanced_at")?)?;
+        return Some(SweepState { table: name.to_string(), after: Value::Null, last_advanced_at, list });
+    }
     let table = TABLES.iter().find(|t| t.name == name)?;
     let mut after = v.get("after").cloned().unwrap_or(Value::Null);
     if Cursor::from_json(table.key, &after).is_none() {
@@ -199,7 +221,7 @@ pub fn valid_state(v: &Value) -> Option<SweepState> {
         after = Value::Null;
     }
     let last_advanced_at = parse_ts(v.get("last_advanced_at")?)?;
-    Some(SweepState { table: name.to_string(), after, last_advanced_at })
+    Some(SweepState { table: name.to_string(), after, last_advanced_at, list })
 }
 
 /// A window of keys, in key order.
@@ -264,7 +286,21 @@ impl PublicIndexing {
     }
 
     /// One batch of §7.2, steps 1–6 (the pause excluded).
+    #[cfg(test)]
     pub(super) async fn sweep_batch(&self, generation: u64, table: usize, after: Option<&Cursor>, n: u64) -> Result<Batch, sqlx::Error> {
+        self.sweep_batch_in(SweepList::Today, generation, table, after, n).await
+    }
+
+    /// [`Self::sweep_batch`] for a sweep of `list`: a full drain moves on
+    /// from the last table to its steps.
+    pub(super) async fn sweep_batch_in(
+        &self,
+        list: SweepList,
+        generation: u64,
+        table: usize,
+        after: Option<&Cursor>,
+        n: u64,
+    ) -> Result<Batch, sqlx::Error> {
         let t = &TABLES[table];
         // 1. The guard before the connection.
         let guard = self.scope.read_guard().await;
@@ -289,10 +325,12 @@ impl PublicIndexing {
         // 3. The window, with no predicate on the rows.
         let window = select_window(&mut tx, t, after, n).await?;
         let Some(last) = window.last() else {
-            let Some(next) = TABLES.get(table + 1) else {
-                return Ok(Batch::SweepDone);
+            let next = match (TABLES.get(table + 1), list) {
+                (Some(next), _) => next.name,
+                (None, SweepList::Full) => super::narrowing::FULL_DRAIN_STEP_NAMES[0],
+                (None, _) => return Ok(Batch::SweepDone),
             };
-            let sweep = SweepState { table: next.name.to_string(), after: Value::Null, last_advanced_at: now() };
+            let sweep = SweepState { table: next.to_string(), after: Value::Null, last_advanced_at: now(), list };
             let n = sqlx::query(
                 "UPDATE worker_state SET value = jsonb_set(value, '{sweep}', $3), updated_at = now() \
                  WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2",
@@ -338,6 +376,10 @@ impl PublicIndexing {
 
     /// The sweep task: batches until the last table ends, then §7.5.
     pub(super) async fn run_sweep(self, generation: u64, state: SweepState) {
+        let list = state.list;
+        if let Some(step) = super::narrowing::step_index(list, &state.table) {
+            return self.run_steps(generation, list, step).await;
+        }
         let mut table = TABLES.iter().position(|t| t.name == state.table).unwrap_or(0);
         let mut after = Cursor::from_json(TABLES[table].key, &state.after).flatten();
         let mut last_advanced = state.last_advanced_at;
@@ -347,14 +389,14 @@ impl PublicIndexing {
         loop {
             let name = TABLES[table].name;
             let started = Instant::now();
-            match self.sweep_batch(generation, table, after.as_ref(), n).await {
+            match self.sweep_batch_in(list, generation, table, after.as_ref(), n).await {
                 Ok(Batch::Exit) => return,
                 Ok(Batch::Superseded) => return Self::superseded("sweep", generation),
                 Ok(Batch::SweepDone) => {
                     // A failed end is retried; the end's own checks make a
                     // retry safe.
                     loop {
-                        match self.end_sweep(generation).await {
+                        match self.end_sweep_of(list, generation).await {
                             Ok(()) => return,
                             Err(error) => {
                                 tracing::error!(event = "public_sweep_failed", table = name, %error, "ending the sweep failed; retrying");
@@ -378,6 +420,10 @@ impl PublicIndexing {
                         _ => {
                             tracing::info!(event = "public_sweep_table_done", table = name, "swept table");
                             table += 1;
+                            if table == TABLES.len() {
+                                // A full drain goes on with its steps.
+                                return self.run_steps(generation, list, 0).await;
+                            }
                             after = None;
                             n = self.start_window(table);
                         }
@@ -424,17 +470,26 @@ impl PublicIndexing {
     /// §7.5: under the write guard, conditional on the phase and the
     /// generation, Off, or Filling when `pending` is set. The fill pass is
     /// spawned after the commit.
+    #[cfg(test)]
     pub(super) async fn end_sweep(&self, generation: u64) -> Result<(), sqlx::Error> {
+        self.end_sweep_of(SweepList::Today, generation).await
+    }
+
+    /// The end of a sweep of `list`. A drain ends Off, or Filling when
+    /// `pending` is set (Filling, Full for `full`); a narrowing ends in
+    /// Filling, Community, whose fill re-syncs S.
+    pub(super) async fn end_sweep_of(&self, list: SweepList, generation: u64) -> Result<(), sqlx::Error> {
         let mut sets = self.scope.write_guard().await;
         if sets.public.generation != generation {
             return Ok(());
         }
+        let phase = list.phase();
         let mut tx = self.pool.begin().await?;
         let pending: Option<Value> = sqlx::query_scalar(
             "SELECT coalesce(value->'pending', 'null'::jsonb) FROM worker_state \
              WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2 FOR UPDATE",
         )
-        .bind(Phase::Draining.as_str())
+        .bind(phase.as_str())
         .bind(g64(generation))
         .fetch_optional(&mut *tx)
         .await?;
@@ -444,30 +499,37 @@ impl PublicIndexing {
         };
         let next = generation + 1;
         let at = now();
-        let filling = pending == json!(ScopeValue::Community.as_str());
-        let t = if filling {
-            Transition::filling(next, at)
+        let cg = sets.public.crawl_generation;
+        let (t, value) = if phase == Phase::Narrowing {
+            (Transition::filling(next, at).in_breadth(Breadth::Community, cg), None)
+        } else if pending == json!(ScopeValue::Community.as_str()) {
+            (Transition::filling(next, at).in_breadth(Breadth::Community, cg), Some(ScopeValue::Community))
+        } else if pending == json!(ScopeValue::Full.as_str()) {
+            (Transition::filling(next, at).in_breadth(Breadth::Full, cg), Some(ScopeValue::Full))
         } else {
-            Transition::settled(Phase::Off, next, at, sets.public.last_fill_since)
+            (Transition::settled(Phase::Off, next, at, sets.public.last_fill_since).in_breadth(Breadth::Community, cg), None)
         };
-        if !replace_if(&mut tx, Phase::Draining, generation, &t).await? {
+        if !replace_if(&mut tx, phase, generation, &t).await? {
             Self::superseded("sweep", generation);
             return Ok(());
         }
-        if filling {
+        if let Some(value) = value {
             sqlx::query("UPDATE operator_settings SET value = $2, updated_at = now() WHERE key = $1")
                 .bind(super::public_mode::SETTING_KEY)
-                .bind(ScopeValue::Community.to_json())
+                .bind(value.to_json())
                 .execute(&mut *tx)
                 .await?;
         }
+        if t.breadth == Breadth::Full {
+            super::full::reset_groups(&mut tx, cg, &self.full_kinds).await?;
+        }
         tx.commit().await?;
-        let mode = if filling { PublicMode::Filling } else { PublicMode::Off };
-        self.set_state(&mut sets, PublicState { mode, generation: next, last_fill_since: t.last_fill_since });
+        let state = state_of(&t);
+        self.set_state(&mut sets, state);
         drop(sets);
-        tracing::info!(event = "public_sweep_done", mode = mode.as_str(), generation = next, "the sweep ended");
-        if let Some(fill) = t.fill {
-            drop(self.spawn(Spawn::Fill { generation: next, fill }));
+        tracing::info!(event = "public_sweep_done", list = list.as_str(), mode = state.mode.as_str(), breadth = state.breadth.as_str(), generation = next, "the sweep ended");
+        if let Some(task) = spawn_of(&t) {
+            drop(self.spawn(task));
         }
         Ok(())
     }

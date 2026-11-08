@@ -99,7 +99,7 @@ async fn instance_page_and_lexicons() {
     let _ = crate::admin::usage::path("test", "test.instance.served");
     {
         let mut sets = h.scope.write_guard().await;
-        h.scope.set_public(&mut sets, PublicState { mode: PublicMode::Filling, generation: 2, last_fill_since: None });
+        h.scope.set_public(&mut sets, PublicState { mode: PublicMode::Filling, generation: 2, last_fill_since: None, ..PublicState::default() });
     }
 
     // Operator sign-in: a stranger goes to the sign-in page, and so does a

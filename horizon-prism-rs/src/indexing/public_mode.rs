@@ -108,21 +108,73 @@ impl PublicMode {
     }
 }
 
-/// `ScopeSets.public`: the mode, the generation of its phase (§3.4), and
-/// the start of the most recent fill (§8.3).
+/// How much of the network public indexing covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum Breadth {
+    /// S and the members.
+    Community,
+    /// Every account, for the enabled record groups.
+    Full,
+    /// Leaving full for community: admission is S's, and the rows full
+    /// added are being deleted.
+    Narrowing,
+}
+
+impl Breadth {
+    pub const ALL: [Self; 3] = [Self::Community, Self::Full, Self::Narrowing];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Community => "community",
+            Self::Full => "full",
+            Self::Narrowing => "narrowing",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.as_str() == s)
+    }
+
+    #[must_use]
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The inverse of [`Self::as_u8`]. An unknown value reads as
+    /// Narrowing, which admits only S and reads every account's own records
+    /// upstream.
+    #[must_use]
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Community,
+            1 => Self::Full,
+            _ => Self::Narrowing,
+        }
+    }
+}
+
+/// `ScopeSets.public`: the mode, the breadth, the generation of its phase
+/// (§3.4), the start of the most recent fill (§8.3), and the crawl
+/// generation full indexing's crawl marks belong to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicState {
     pub mode: PublicMode,
     pub generation: u64,
     pub last_fill_since: Option<DateTime<Utc>>,
+    pub breadth: Breadth,
+    pub crawl_generation: u64,
 }
 
-/// `(On, 0, None)`: today's behaviour. Startup overwrites it before any
-/// writer runs, so production never sees it; tests that build the scope
-/// sets by default keep their behaviour (§3.5).
+/// `(On, 0, None)`, Community: today's behaviour. Startup overwrites it
+/// before any writer runs, so production never sees it; tests that build
+/// the scope sets by default keep their behaviour (§3.5).
 impl Default for PublicState {
     fn default() -> Self {
-        Self { mode: PublicMode::On, generation: 0, last_fill_since: None }
+        Self { mode: PublicMode::On, generation: 0, last_fill_since: None, breadth: Breadth::Community, crawl_generation: 0 }
     }
 }
 
@@ -171,6 +223,7 @@ impl PublicModeSettings {
 pub enum ScopeValue {
     KryphocronOnly,
     Community,
+    Full,
 }
 
 impl ScopeValue {
@@ -179,6 +232,7 @@ impl ScopeValue {
         match self {
             Self::KryphocronOnly => "kryphocron_only",
             Self::Community => "community",
+            Self::Full => "full",
         }
     }
 
@@ -187,6 +241,7 @@ impl ScopeValue {
         match s {
             "kryphocron_only" => Some(Self::KryphocronOnly),
             "community" => Some(Self::Community),
+            "full" => Some(Self::Full),
             _ => None,
         }
     }
@@ -197,13 +252,13 @@ impl ScopeValue {
         Value::String(self.as_str().to_string())
     }
 
-    /// The file's value. `full` never gets here: validation refuses it at
-    /// startup (`validate.rs`), so it maps to the safe value.
+    /// The file's value.
     #[must_use]
     pub fn from_config(scope: PublicScope) -> Self {
         match scope {
             PublicScope::Community => Self::Community,
-            PublicScope::KryphocronOnly | PublicScope::Full => Self::KryphocronOnly,
+            PublicScope::KryphocronOnly => Self::KryphocronOnly,
+            PublicScope::Full => Self::Full,
         }
     }
 }
@@ -236,6 +291,8 @@ pub enum Phase {
     Filling,
     Draining,
     Off,
+    /// Full to community: the narrowing sweep runs.
+    Narrowing,
 }
 
 impl Phase {
@@ -246,6 +303,7 @@ impl Phase {
             Self::Filling => "filling",
             Self::Draining => "draining",
             Self::Off => "off",
+            Self::Narrowing => "narrowing",
         }
     }
 
@@ -256,7 +314,60 @@ impl Phase {
             "filling" => Some(Self::Filling),
             "draining" => Some(Self::Draining),
             "off" => Some(Self::Off),
+            "narrowing" => Some(Self::Narrowing),
             _ => None,
+        }
+    }
+}
+
+/// Which tables a sweep deletes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepList {
+    /// Draining from community: the drain's own tables.
+    Today,
+    /// Draining from full: the drain's own tables, then the tables full
+    /// adds to.
+    Full,
+    /// Narrowing: the rows full added beyond community's.
+    Narrowing,
+}
+
+impl SweepList {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Full => "full",
+            Self::Narrowing => "narrowing",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "today" => Some(Self::Today),
+            "full" => Some(Self::Full),
+            "narrowing" => Some(Self::Narrowing),
+            _ => None,
+        }
+    }
+
+    /// The phase the sweep runs in.
+    #[must_use]
+    pub fn phase(self) -> Phase {
+        match self {
+            Self::Today | Self::Full => Phase::Draining,
+            Self::Narrowing => Phase::Narrowing,
+        }
+    }
+
+    /// The name of the list's first table or step.
+    #[must_use]
+    pub fn first_table(self) -> &'static str {
+        match self {
+            Self::Today | Self::Full => public_sweep::TABLES[0].name,
+            Self::Narrowing => super::narrowing::STEP_NAMES[0],
         }
     }
 }
@@ -264,20 +375,22 @@ impl Phase {
 /// `public_transition.sweep` (§3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SweepState {
-    /// A table of §7.4's order.
+    /// A table of the drain's order, or a narrowing step.
     pub table: String,
     /// Null before the table's first batch; else its last window key,
     /// encoded by the table's key (§3.2).
     pub after: Value,
     #[serde(serialize_with = "ser_ts")]
     pub last_advanced_at: DateTime<Utc>,
+    /// The sweep's table list; a state stored without one is `today`.
+    pub list: SweepList,
 }
 
 impl SweepState {
     /// The sweep at its start: the first table, no cursor.
     #[must_use]
-    pub fn first(now: DateTime<Utc>) -> Self {
-        Self { table: public_sweep::TABLES[0].name.to_string(), after: Value::Null, last_advanced_at: now }
+    pub fn first(list: SweepList, now: DateTime<Utc>) -> Self {
+        Self { table: list.first_table().to_string(), after: Value::Null, last_advanced_at: now, list }
     }
 }
 
@@ -335,25 +448,64 @@ pub struct Transition {
     pub last_fill_since: Option<DateTime<Utc>>,
     pub sweep: Option<SweepState>,
     pub fill: Option<FillState>,
+    /// A stored transition without it reads as Community.
+    pub breadth: Breadth,
+    /// Kept here only, so it commits with every phase change; a stored
+    /// transition without it reads as 0.
+    pub crawl_generation: u64,
+    /// Narrowing only: whether S's fill had finished when it began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s_filled: Option<bool>,
 }
 
 impl Transition {
-    /// On or Off, with nothing running.
+    /// On or Off, with nothing running, in breadth Community.
     #[must_use]
     pub fn settled(phase: Phase, generation: u64, now: DateTime<Utc>, last_fill_since: Option<DateTime<Utc>>) -> Self {
-        Self { phase, generation, since: Some(now), pending: None, last_fill_since, sweep: None, fill: None }
+        Self {
+            phase,
+            generation,
+            since: Some(now),
+            pending: None,
+            last_fill_since,
+            sweep: None,
+            fill: None,
+            breadth: Breadth::Community,
+            crawl_generation: 0,
+            s_filled: None,
+        }
     }
 
     /// §7.1: Draining, the sweep at its first table.
     #[must_use]
     pub fn draining(generation: u64, now: DateTime<Utc>, last_fill_since: Option<DateTime<Utc>>) -> Self {
-        Self { sweep: Some(SweepState::first(now)), ..Self::settled(Phase::Draining, generation, now, last_fill_since) }
+        Self { sweep: Some(SweepState::first(SweepList::Today, now)), ..Self::settled(Phase::Draining, generation, now, last_fill_since) }
     }
 
     /// §8.2: Filling, a fresh fill; `last_fill_since` is `fill.since`.
     #[must_use]
     pub fn filling(generation: u64, now: DateTime<Utc>) -> Self {
         Self { fill: Some(FillState::fresh(now)), ..Self::settled(Phase::Filling, generation, now, Some(now)) }
+    }
+
+    /// Narrowing from full: the narrowing sweep at its first step.
+    #[must_use]
+    pub fn narrowing(generation: u64, now: DateTime<Utc>, last_fill_since: Option<DateTime<Utc>>, s_filled: bool) -> Self {
+        Self {
+            sweep: Some(SweepState::first(SweepList::Narrowing, now)),
+            breadth: Breadth::Narrowing,
+            s_filled: Some(s_filled),
+            ..Self::settled(Phase::Narrowing, generation, now, last_fill_since)
+        }
+    }
+
+    /// The same transition in `breadth` at `crawl_generation`: every
+    /// constructor keeps them through this.
+    #[must_use]
+    pub fn in_breadth(mut self, breadth: Breadth, crawl_generation: u64) -> Self {
+        self.breadth = breadth;
+        self.crawl_generation = crawl_generation;
+        self
     }
 
     /// The stored JSON.
@@ -406,7 +558,9 @@ pub(super) enum Validated {
     Valid(Transition),
     /// The parsed generation (0 when it does not parse) and
     /// `last_fill_since` (null when it does not parse).
-    Held { generation: u64, last_fill_since: Option<DateTime<Utc>> },
+    /// The crawl generation is kept when it parses, so leaving Held for
+    /// full never reuses one.
+    Held { generation: u64, last_fill_since: Option<DateTime<Utc>>, crawl_generation: u64 },
 }
 
 /// §3.5 step 2, as a pure function. Also returns the bad sweep value when
@@ -414,25 +568,51 @@ pub(super) enum Validated {
 pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Value>) {
     // 2.1: the generation and `last_fill_since`.
     let generation = raw.get("generation").and_then(Value::as_u64);
+    let held_crawl = raw.get("crawl_generation").and_then(Value::as_u64).unwrap_or(0);
     let last_fill_since = match raw.get("last_fill_since") {
         None | Some(Value::Null) => Ok(None),
         Some(v) => parse_ts(v).map(Some).ok_or(()),
     };
     let (Some(generation), Ok(last_fill_since)) = (generation, last_fill_since) else {
-        let held = Validated::Held { generation: generation.unwrap_or(0), last_fill_since: last_fill_since.ok().flatten() };
+        let held = Validated::Held { generation: generation.unwrap_or(0), last_fill_since: last_fill_since.ok().flatten(), crawl_generation: held_crawl };
         return (held, None);
     };
-    let held = Validated::Held { generation, last_fill_since };
+    let held = Validated::Held { generation, last_fill_since, crawl_generation: held_crawl };
+    // The breadth and the crawl generation: missing keys read as
+    // Community and 0; anything else that does not parse is Held.
+    let breadth = match raw.get("breadth") {
+        None | Some(Value::Null) => Breadth::Community,
+        Some(v) => match v.as_str().and_then(Breadth::parse) {
+            Some(b) => b,
+            None => return (held, None),
+        },
+    };
+    let crawl_generation = match raw.get("crawl_generation") {
+        None | Some(Value::Null) => 0,
+        Some(v) => match v.as_u64() {
+            Some(g) => g,
+            None => return (held, None),
+        },
+    };
     let phase = raw.get("phase").and_then(Value::as_str).and_then(Phase::parse);
-    // 2.2: a draining sweep state that does not validate is reset.
+    // 2.2: a sweep state that does not validate is reset, to the first
+    // table of the list it names (or of the phase's list).
     let mut reset = None;
-    let sweep = if phase == Some(Phase::Draining) {
+    let sweep = if matches!(phase, Some(Phase::Draining | Phase::Narrowing)) {
         let stored = raw.get("sweep").cloned().unwrap_or(Value::Null);
+        let fallback = if phase == Some(Phase::Narrowing) { SweepList::Narrowing } else { SweepList::Today };
         match public_sweep::valid_state(&stored) {
-            Some(s) => Some(s),
+            Some(s) if s.list.phase() == phase.unwrap_or(Phase::Draining) => Some(s),
+            Some(_) => return (held, None),
             None => {
+                let list = stored
+                    .get("list")
+                    .and_then(Value::as_str)
+                    .and_then(SweepList::parse)
+                    .filter(|l| Some(l.phase()) == phase)
+                    .unwrap_or(fallback);
                 reset = Some(stored);
-                Some(SweepState::first(now))
+                Some(SweepState::first(list, now))
             }
         }
     } else {
@@ -451,6 +631,7 @@ pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Va
     let pending = match raw.get("pending") {
         None | Some(Value::Null) => None,
         Some(Value::String(s)) if s == "community" => Some(ScopeValue::Community),
+        Some(Value::String(s)) if s == "full" => Some(ScopeValue::Full),
         Some(_) => return (held, reset),
     };
     let Some(phase) = phase else {
@@ -460,8 +641,25 @@ pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Va
     if pending.is_some() && phase != Phase::Draining {
         return (held, reset);
     }
+    // Narrowing is the breadth of the narrowing phase, and only of it; it
+    // stores whether S's fill had finished.
+    let s_filled = raw.get("s_filled").and_then(Value::as_bool);
+    if (phase == Phase::Narrowing) != (breadth == Breadth::Narrowing) || (phase == Phase::Narrowing && s_filled.is_none()) {
+        return (held, reset);
+    }
     let since = raw.get("since").and_then(parse_ts);
-    let t = Transition { phase, generation, since, pending, last_fill_since, sweep, fill };
+    let t = Transition {
+        phase,
+        generation,
+        since,
+        pending,
+        last_fill_since,
+        sweep,
+        fill,
+        breadth,
+        crawl_generation,
+        s_filled: if phase == Phase::Narrowing { s_filled } else { None },
+    };
     (Validated::Valid(t), reset)
 }
 
@@ -526,27 +724,45 @@ impl Spawn {
 
 /// §3.5 step 3: the mode, and the task that would resume.
 pub(super) fn map(value: Option<ScopeValue>, v: &Validated) -> (PublicState, Option<Spawn>) {
-    let held = |generation, last_fill_since| (PublicState { mode: PublicMode::Held, generation, last_fill_since }, None);
+    let held = |generation, last_fill_since, crawl_generation| {
+        (PublicState { mode: PublicMode::Held, generation, last_fill_since, breadth: Breadth::Community, crawl_generation }, None)
+    };
     let t = match v {
-        Validated::Held { generation, last_fill_since } => return held(*generation, *last_fill_since),
+        Validated::Held { generation, last_fill_since, crawl_generation } => {
+            return held(*generation, *last_fill_since, *crawl_generation);
+        }
         Validated::Valid(t) => t,
     };
-    let state = |mode| PublicState { mode, generation: t.generation, last_fill_since: t.last_fill_since };
+    let state = |mode| PublicState {
+        mode,
+        generation: t.generation,
+        last_fill_since: t.last_fill_since,
+        breadth: t.breadth,
+        crawl_generation: t.crawl_generation,
+    };
     let generation = t.generation;
-    match (value, t.phase, t.pending, &t.sweep, &t.fill) {
-        (Some(ScopeValue::Community), Phase::On, None, _, _) => (state(PublicMode::On), None),
-        (Some(ScopeValue::Community), Phase::Filling, None, _, Some(fill)) => {
-            let task = match (fill.stage, fill.waiting_since) {
-                (FillStage::Waiting, Some(waiting_since)) => Spawn::Checker { generation, waiting_since },
-                _ => Spawn::Fill { generation, fill: fill.clone() },
-            };
-            (state(PublicMode::Filling), Some(task))
+    let fill_task = |fill: &FillState| match (fill.stage, fill.waiting_since) {
+        (FillStage::Waiting, Some(waiting_since)) => Spawn::Checker { generation, waiting_since },
+        _ => Spawn::Fill { generation, fill: fill.clone() },
+    };
+    match (value, t.phase, t.breadth, t.pending, &t.sweep, &t.fill) {
+        (Some(ScopeValue::Community), Phase::On, Breadth::Community, None, _, _)
+        | (Some(ScopeValue::Full), Phase::On, Breadth::Full, None, _, _) => (state(PublicMode::On), None),
+        (Some(ScopeValue::Community), Phase::Filling, Breadth::Community, None, _, Some(fill))
+        | (Some(ScopeValue::Full), Phase::Filling, Breadth::Full, None, _, Some(fill)) => {
+            (state(PublicMode::Filling), Some(fill_task(fill)))
         }
-        (Some(ScopeValue::KryphocronOnly), Phase::Draining, _, Some(sweep), _) => {
+        // Narrowing serves S once S's fill has finished, and answers 501
+        // before, as Filling does.
+        (Some(ScopeValue::Community), Phase::Narrowing, Breadth::Narrowing, None, Some(sweep), _) => {
+            let mode = if t.s_filled == Some(true) { PublicMode::On } else { PublicMode::Filling };
+            (state(mode), Some(Spawn::Sweep { generation, sweep: sweep.clone() }))
+        }
+        (Some(ScopeValue::KryphocronOnly), Phase::Draining, Breadth::Community, _, Some(sweep), _) => {
             (state(PublicMode::Draining), Some(Spawn::Sweep { generation, sweep: sweep.clone() }))
         }
-        (Some(ScopeValue::KryphocronOnly), Phase::Off, None, _, _) => (state(PublicMode::Off), None),
-        _ => held(t.generation, t.last_fill_since),
+        (Some(ScopeValue::KryphocronOnly), Phase::Off, Breadth::Community, None, _, _) => (state(PublicMode::Off), None),
+        _ => held(t.generation, t.last_fill_since, t.crawl_generation),
     }
 }
 
@@ -573,6 +789,9 @@ pub(super) struct Progress {
     pub fill_remaining: Option<i64>,
     /// Jobs still running when the fill bound fired (§8.5).
     pub fill_incomplete: Option<i64>,
+    /// Why the edited file value could not be applied at the last start;
+    /// the running value stays.
+    pub file_apply_error: Option<String>,
 }
 
 /// The switch: its stored state, its in-memory mode, and its background
@@ -583,6 +802,8 @@ pub struct PublicIndexing {
     pub(super) scope: ScopeState,
     pub(super) settings: PublicModeSettings,
     pub(super) progress: Arc<Mutex<Progress>>,
+    /// `[full] kinds`: the groups full indexing stores for every account.
+    pub(super) full_kinds: Vec<crate::config::FullGroup>,
     #[cfg(test)]
     pub(super) hooks: Arc<hooks::Hooks>,
 }
@@ -595,9 +816,23 @@ impl PublicIndexing {
             scope,
             settings,
             progress: Arc::default(),
+            full_kinds: crate::config::FullGroup::ALL.to_vec(),
             #[cfg(test)]
             hooks: Arc::default(),
         }
+    }
+
+    /// With `[full] kinds`.
+    #[must_use]
+    pub fn with_full_kinds(mut self, kinds: &[crate::config::FullGroup]) -> Self {
+        self.full_kinds = kinds.to_vec();
+        self
+    }
+
+    /// The in-memory breadth (the mirror; no guard).
+    #[must_use]
+    pub fn breadth(&self) -> Breadth {
+        self.scope.public_breadth()
     }
 
     /// The in-memory mode (the mirror; no guard).
@@ -695,20 +930,29 @@ impl PublicIndexing {
         self.trace("memory");
         // Step 5: an operator edit, against the mapped mode.
         if let Some(value) = s5 {
-            let applied = self.apply_scope(value, "file").await?;
-            sqlx::query("UPDATE operator_settings SET file_value = $2, updated_by = 'file', updated_at = now() WHERE key = $1")
-                .bind(SETTING_KEY)
-                .bind(f.to_json())
-                .execute(&self.pool)
-                .await?;
-            tracing::info!(event = "public_scope_file_applied", value = value.as_str(), action = applied.action, "the edited app.toml value was applied");
-            if applied.spawn.is_some() {
-                task = applied.spawn;
+            // A failure never stops the start: the running value stays, and
+            // status says why.
+            match self.apply_scope(value, "file").await {
+                Ok(applied) => {
+                    sqlx::query("UPDATE operator_settings SET file_value = $2, updated_by = 'file', updated_at = now() WHERE key = $1")
+                        .bind(SETTING_KEY)
+                        .bind(f.to_json())
+                        .execute(&self.pool)
+                        .await?;
+                    tracing::info!(event = "public_scope_file_applied", value = value.as_str(), action = applied.action, "the edited app.toml value was applied");
+                    if applied.spawn.is_some() {
+                        task = applied.spawn;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(event = "public_scope_file_apply_failed", value = value.as_str(), %error, "the edited app.toml value could not be applied; the running value stays");
+                    self.progress(|p| p.file_apply_error = Some(error.to_string()));
+                }
             }
             self.trace("s5");
         }
         let mode = self.mode();
-        tracing::info!(event = "public_indexing_started", mode = mode.as_str(), task = task.as_ref().map(Spawn::kind), "public indexing state loaded");
+        tracing::info!(event = "public_indexing_started", mode = mode.as_str(), breadth = self.breadth().as_str(), task = task.as_ref().map(Spawn::kind), "public indexing state loaded");
         Ok(task)
     }
 
@@ -734,10 +978,16 @@ impl PublicIndexing {
         let Some((stored, file_value)) = row else {
             // S1 or S2: seed both rows.
             let present = public_data_present(&self.pool).await?;
-            let (value, updated_by) = if present { (ScopeValue::Community, "upgrade") } else { (f.value, "startup") };
+            // A fresh install whose file says `full` is seeded Off and enters
+            // full through the command's transaction (S5's path).
+            let (value, updated_by) = match (present, f.value) {
+                (true, _) => (ScopeValue::Community, "upgrade"),
+                (false, ScopeValue::Full) => (ScopeValue::KryphocronOnly, "startup"),
+                (false, v) => (v, "startup"),
+            };
             let phase = match value {
                 ScopeValue::Community => Phase::On,
-                ScopeValue::KryphocronOnly => Phase::Off,
+                ScopeValue::KryphocronOnly | ScopeValue::Full => Phase::Off,
             };
             let t = Transition::settled(phase, 1, now(), None);
             let mut tx = self.pool.begin().await?;
@@ -754,7 +1004,7 @@ impl PublicIndexing {
             if present {
                 not_applied(&value.to_json());
             }
-            return Ok(None);
+            return Ok((!present && f.value == ScopeValue::Full).then_some(ScopeValue::Full));
         };
         let record = async {
             sqlx::query("UPDATE operator_settings SET file_value = $2 WHERE key = $1")
@@ -766,6 +1016,11 @@ impl PublicIndexing {
         };
         match file_value {
             // S3: first sight.
+            // A first sight of `full` is applied, as a fresh install's is.
+            None if f.value == ScopeValue::Full => {
+                record.await?;
+                Ok(Some(ScopeValue::Full))
+            }
             None => {
                 record.await?;
                 not_applied(&stored);
@@ -795,45 +1050,94 @@ impl PublicIndexing {
         let mut sets = self.scope.write_guard().await;
         let current = sets.public;
         let next = current.generation + 1;
+        let cg = current.crawl_generation;
         let at = now();
         let noop = |action| Applied { action, mode: current.mode, generation: current.generation, spawn: None };
-        let change = match (current.mode, value) {
-            // A Held exit takes the parsed generation (0 when it did not
-            // parse) + 1 and the parsed `last_fill_since`: exactly what
-            // memory holds.
-            (PublicMode::On | PublicMode::Filling | PublicMode::Held, ScopeValue::KryphocronOnly) => {
-                Transition::draining(next, at, current.last_fill_since)
-            }
-            (PublicMode::Off | PublicMode::Held, ScopeValue::Community) => Transition::filling(next, at),
-            (PublicMode::Draining, _) => {
-                // Set or clear `pending` (§8.1); nothing else changes. A
-                // literal, so the JSON null is never an SQL NULL.
-                let pending = match value {
-                    ScopeValue::Community => "'\"community\"'::jsonb",
-                    ScopeValue::KryphocronOnly => "'null'::jsonb",
-                };
-                let n = sqlx::query(&format!(
-                    "UPDATE worker_state SET value = jsonb_set(value, '{{pending}}', {pending}), updated_at = now() \
-                     WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2 \
-                       AND coalesce(value->'pending', 'null'::jsonb) <> {pending}"
-                ))
-                .bind(Phase::Draining.as_str())
-                .bind(g64(current.generation))
-                .execute(&self.pool)
-                .await?
-                .rows_affected();
-                drop(sets);
-                return Ok(noop(match (value, n) {
-                    (_, 0) => "no_op",
-                    (ScopeValue::Community, _) => "pending_set",
-                    (ScopeValue::KryphocronOnly, _) => "pending_cleared",
-                }));
-            }
-            (PublicMode::On | PublicMode::Filling, ScopeValue::Community) | (PublicMode::Off, ScopeValue::KryphocronOnly) => {
-                return Ok(noop("no_op"));
-            }
+        if current.mode == PublicMode::Draining {
+            // Set or clear `pending` (§8.1); nothing else changes. A
+            // literal, so the JSON null is never an SQL NULL.
+            let pending = match value {
+                ScopeValue::Community => "'\"community\"'::jsonb",
+                ScopeValue::Full => "'\"full\"'::jsonb",
+                ScopeValue::KryphocronOnly => "'null'::jsonb",
+            };
+            let n = sqlx::query(&format!(
+                "UPDATE worker_state SET value = jsonb_set(value, '{{pending}}', {pending}), updated_at = now() \
+                 WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2 \
+                   AND coalesce(value->'pending', 'null'::jsonb) <> {pending}"
+            ))
+            .bind(Phase::Draining.as_str())
+            .bind(g64(current.generation))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            drop(sets);
+            return Ok(noop(match (value, n) {
+                (_, 0) => "no_op",
+                (ScopeValue::Community | ScopeValue::Full, _) => "pending_set",
+                (ScopeValue::KryphocronOnly, _) => "pending_cleared",
+            }));
+        }
+        let draining = |list: SweepList, crawl_generation: u64| Transition {
+            sweep: Some(SweepState::first(list, at)),
+            ..Transition::draining(next, at, current.last_fill_since).in_breadth(Breadth::Community, crawl_generation)
         };
+        // Every way into full writes `last_fill_since = now`: nothing
+        // written from then on announces history.
+        let full_on = || Transition::settled(Phase::On, next, at, Some(at)).in_breadth(Breadth::Full, cg);
+        let fresh_full_fill = |crawl_generation: u64| Transition::filling(next, at).in_breadth(Breadth::Full, crawl_generation);
         let mut tx = self.pool.begin().await?;
+        let change = match (current.mode, current.breadth, value) {
+            // Narrowing takes no `pending`: a switch stops it.
+            (_, Breadth::Narrowing, ScopeValue::Community) => return Ok(noop("no_op")),
+            (_, Breadth::Narrowing, ScopeValue::KryphocronOnly) => draining(SweepList::Full, cg),
+            (_, Breadth::Narrowing, ScopeValue::Full) => {
+                // A new crawl generation; back to On when S's fill had
+                // finished, else a fresh fill.
+                if current.mode == PublicMode::On {
+                    full_on().in_breadth(Breadth::Full, cg + 1)
+                } else {
+                    fresh_full_fill(cg + 1)
+                }
+            }
+            // Leaving full bumps the crawl generation.
+            (PublicMode::On | PublicMode::Filling, Breadth::Full, ScopeValue::KryphocronOnly) => draining(SweepList::Full, cg + 1),
+            (PublicMode::On | PublicMode::Filling | PublicMode::Held, _, ScopeValue::KryphocronOnly) => draining(SweepList::Today, cg),
+            (PublicMode::On, Breadth::Full, ScopeValue::Community) => {
+                Transition { crawl_generation: cg + 1, ..Transition::narrowing(next, at, current.last_fill_since, true) }
+            }
+            (PublicMode::Filling, Breadth::Full, ScopeValue::Community) => {
+                Transition { crawl_generation: cg + 1, ..Transition::narrowing(next, at, current.last_fill_since, false) }
+            }
+            (PublicMode::Off | PublicMode::Held, _, ScopeValue::Community) => Transition::filling(next, at).in_breadth(Breadth::Community, cg),
+            (PublicMode::Off, _, ScopeValue::Full) => fresh_full_fill(cg),
+            // A Held state may have come from full: a new crawl generation.
+            (PublicMode::Held, _, ScopeValue::Full) => fresh_full_fill(cg + 1),
+            // The breadth-only change: no sweep, no fill.
+            (PublicMode::On, Breadth::Community, ScopeValue::Full) => full_on(),
+            // The fill's stored state is copied forward; its task restarts
+            // from it under the new generation.
+            (PublicMode::Filling, Breadth::Community, ScopeValue::Full) => {
+                let raw: Option<Value> = sqlx::query_scalar(
+                    "SELECT value->'fill' FROM worker_state \
+                     WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2 FOR UPDATE",
+                )
+                .bind(Phase::Filling.as_str())
+                .bind(g64(current.generation))
+                .fetch_optional(&mut *tx)
+                .await?;
+                let Some(fill) = raw.as_ref().and_then(valid_fill) else {
+                    // Not the stored phase: only a hand edit does that.
+                    Self::superseded("command", current.generation);
+                    return Ok(noop("no_op"));
+                };
+                Transition { fill: Some(fill), ..Transition::settled(Phase::Filling, next, at, Some(at)) }.in_breadth(Breadth::Full, cg)
+            }
+            (PublicMode::On | PublicMode::Filling, Breadth::Community, ScopeValue::Community)
+            | (PublicMode::On | PublicMode::Filling, Breadth::Full, ScopeValue::Full)
+            | (PublicMode::Off, _, ScopeValue::KryphocronOnly) => return Ok(noop("no_op")),
+            (PublicMode::Draining, _, _) => unreachable!("handled above"),
+        };
         sqlx::query(
             "INSERT INTO operator_settings (key, value, updated_by) VALUES ($1, $2, $3) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()",
@@ -844,16 +1148,34 @@ impl PublicIndexing {
         .execute(&mut *tx)
         .await?;
         upsert_transition(&mut tx, &change).await?;
+        if change.breadth == Breadth::Full && current.breadth != Breadth::Full {
+            super::full::reset_groups(&mut tx, change.crawl_generation, &self.full_kinds).await?;
+        }
         tx.commit().await?;
-        let (mode, spawn, action) = match (&change.sweep, &change.fill) {
-            (Some(sweep), _) => (PublicMode::Draining, Spawn::Sweep { generation: next, sweep: sweep.clone() }, "draining"),
-            (_, Some(fill)) => (PublicMode::Filling, Spawn::Fill { generation: next, fill: fill.clone() }, "filling"),
-            (None, None) => unreachable!("a command's phase change starts the sweep or the fill"),
+        let state = state_of(&change);
+        let spawn = spawn_of(&change);
+        let action = match (change.phase, current.breadth == change.breadth) {
+            (Phase::Draining, _) => "draining",
+            (Phase::Narrowing, _) => "narrowing",
+            (Phase::Filling, _) => "filling",
+            (_, false) => "breadth",
+            _ => "no_op",
         };
-        self.set_state(&mut sets, PublicState { mode, generation: next, last_fill_since: change.last_fill_since });
+        self.set_state(&mut sets, state);
         drop(sets);
-        tracing::info!(event = "public_scope_applied", value = value.as_str(), from = current.mode.as_str(), to = mode.as_str(), generation = next, updated_by, "public indexing phase changed");
-        Ok(Applied { action, mode, generation: next, spawn: Some(spawn) })
+        tracing::info!(
+            event = "public_scope_applied",
+            value = value.as_str(),
+            from = current.mode.as_str(),
+            from_breadth = current.breadth.as_str(),
+            to = state.mode.as_str(),
+            breadth = state.breadth.as_str(),
+            generation = next,
+            crawl_generation = state.crawl_generation,
+            updated_by,
+            "public indexing phase changed"
+        );
+        Ok(Applied { action, mode: state.mode, generation: next, spawn })
     }
 
     /// `admin indexing status` and the health block (§10): the row, the
@@ -879,6 +1201,7 @@ impl PublicIndexing {
         let sweep = match raw.get("sweep") {
             Some(s) if s.is_object() => json!({
                 "table": s.get("table"),
+                "list": s.get("list"),
                 "after": s.get("after"),
                 "deleted": p.sweep_deleted,
                 "batch_rows": p.sweep_batch_rows,
@@ -913,6 +1236,10 @@ impl PublicIndexing {
         Ok(json!({
             "value": value,
             "mode": mode.as_str(),
+            "breadth": self.breadth().as_str(),
+            "crawl_generation": field("crawl_generation"),
+            "s_filled": field("s_filled"),
+            "file_apply_error": p.file_apply_error,
             "phase": field("phase"),
             "generation": field("generation"),
             "pending": field("pending"),
@@ -970,6 +1297,32 @@ async fn upsert_transition(conn: &mut PgConnection, t: &Transition) -> Result<()
     .execute(conn)
     .await?;
     Ok(())
+}
+
+/// The in-memory state a stored transition stands for.
+pub(super) fn state_of(t: &Transition) -> PublicState {
+    let mode = match t.phase {
+        Phase::On => PublicMode::On,
+        Phase::Filling => PublicMode::Filling,
+        Phase::Draining => PublicMode::Draining,
+        Phase::Off => PublicMode::Off,
+        Phase::Narrowing if t.s_filled == Some(true) => PublicMode::On,
+        Phase::Narrowing => PublicMode::Filling,
+    };
+    PublicState { mode, generation: t.generation, last_fill_since: t.last_fill_since, breadth: t.breadth, crawl_generation: t.crawl_generation }
+}
+
+/// The task a stored transition runs.
+pub(super) fn spawn_of(t: &Transition) -> Option<Spawn> {
+    let generation = t.generation;
+    match (&t.sweep, &t.fill) {
+        (Some(sweep), _) => Some(Spawn::Sweep { generation, sweep: sweep.clone() }),
+        (_, Some(fill)) => Some(match (fill.stage, fill.waiting_since) {
+            (FillStage::Waiting, Some(waiting_since)) => Spawn::Checker { generation, waiting_since },
+            _ => Spawn::Fill { generation, fill: fill.clone() },
+        }),
+        (None, None) => None,
+    }
 }
 
 /// The whole transition, written only if the stored phase and generation
@@ -1081,7 +1434,7 @@ mod tests {
     /// defaults to a day.
     #[test]
     fn defaults() {
-        assert_eq!(PublicState::default(), PublicState { mode: PublicMode::On, generation: 0, last_fill_since: None });
+        assert_eq!(PublicState::default(), PublicState { mode: PublicMode::On, generation: 0, last_fill_since: None, ..PublicState::default() });
         let settings = PublicModeSettings::from_config(&IndexingConfig::default());
         assert_eq!(settings.fill_max_wait, Duration::from_secs(24 * 3600));
         assert_eq!(settings.check_every, Duration::from_secs(30));
@@ -1103,6 +1456,7 @@ mod tests {
                                      "since": "2026-10-14T12:00:00.123456Z", "waiting_since": null}));
         assert_eq!(validate(&v, at), (Validated::Valid(t), None));
         let d = Transition::draining(5, at, None).to_json();
-        assert_eq!(d["sweep"], json!({"table": "feed_items", "after": null, "last_advanced_at": "2026-10-14T12:00:00.123456Z"}));
+        assert_eq!(d["sweep"], json!({"table": "feed_items", "after": null, "last_advanced_at": "2026-10-14T12:00:00.123456Z", "list": "today"}));
+        assert_eq!((&d["breadth"], &d["crawl_generation"], d.get("s_filled")), (&json!("community"), &json!(0), None));
     }
 }

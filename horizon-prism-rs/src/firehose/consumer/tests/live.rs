@@ -122,7 +122,7 @@ impl Fixture {
         let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
         {
             let mut guard = scope.write_guard().await;
-            scope.set_public(&mut guard, PublicState { mode: opts.mode, generation: 1, last_fill_since: None });
+            scope.set_public(&mut guard, PublicState { mode: opts.mode, generation: 1, last_fill_since: None, ..PublicState::default() });
         }
         let writer = Writer::new(db.pool.clone(), scope, Arc::new(DisabledPrivateTier));
         if opts.create_group {

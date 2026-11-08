@@ -77,7 +77,7 @@ pub async fn add_reader_labels(ladder: &Ladder, req: &Requester, nodes: &mut [Le
     }
     // One `getPosts` per home network and 25 posts, as the ladder groups
     // them, and with the ladder's rule for the community network (C4).
-    let public_on = h.scope().public_mode().is_on();
+    let public_on = h.scope().public_reads_local();
     let mut groups: Vec<(Option<String>, Vec<String>)> = Vec::new();
     for uri in wanted {
         let author = uri_author(&uri).unwrap_or_default();

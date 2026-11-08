@@ -68,7 +68,7 @@ public_nameservers = []
 internal_nameservers = []
 
 [indexing]
-# kryphocron_only | community | full (full is refused). Default: kryphocron_only.
+# kryphocron_only | community | full. Default: kryphocron_only.
 # Set this, or run `admin indexing public-scope`, to change it (design §3.3).
 # public_scope = "kryphocron_only"
 fill_max_wait_hours = 24
@@ -857,9 +857,15 @@ fn services_and_features_are_validated_at_load() {
 }
 
 #[test]
-fn full_public_scope_is_refused() {
-    let p = invalid_problems(load("[indexing]\npublic_scope = \"full\"\n"));
-    assert!(has(&p, "indexing.public_scope = \"full\" is not built yet"));
+fn full_public_scope_is_accepted_with_its_groups() {
+    let cfg = load("[indexing]\npublic_scope = \"full\"\n").expect("valid");
+    assert_eq!(cfg.file.indexing.public_scope, Some(PublicScope::Full));
+    assert_eq!(cfg.file.full.kinds, crate::config::FullGroup::ALL.to_vec());
+    let posts = load("[full]\nkinds = [\"posts\", \"starter_packs\"]\n").expect("valid");
+    assert_eq!(posts.file.full.kinds, vec![crate::config::FullGroup::Posts, crate::config::FullGroup::StarterPacks]);
+    let p = invalid_problems(load("[full]\nkinds = [\"posts\", \"posts\"]\n"));
+    assert!(has(&p, "full.kinds: \"posts\" is listed twice"));
+    assert!(load("[full]\nkinds = [\"everything\"]\n").is_err());
 }
 
 /// `kryphocron_only` parses; an absent key is
@@ -1389,7 +1395,7 @@ fn did_freshness_must_precede_staleness() {
 
 #[test]
 fn every_problem_is_reported_at_once() {
-    let text = "[indexing]\npublic_scope = \"full\"\n[firehose]\nprivate_relays = [\"nope\"]\nbatch_size = 0\n";
+    let text = "[full]\nkinds = [\"posts\", \"posts\"]\n[firehose]\nprivate_relays = [\"nope\"]\nbatch_size = 0\n";
     let p = invalid_problems(load(text));
     assert!(p.len() >= 3, "{p:?}");
     let err = ConfigError::Invalid(p);

@@ -29,6 +29,25 @@ pub enum RecordKind {
 }
 
 impl RecordKind {
+    /// The full-indexing record group of a public kind; `None` for the
+    /// private kinds and the plural records (stored for any author anyway).
+    #[must_use]
+    pub fn full_group(self) -> Option<crate::config::FullGroup> {
+        use crate::config::FullGroup as G;
+        Some(match self {
+            Self::Post | Self::PublicRootGate | Self::Table("threadgates" | "postgates") => G::Posts,
+            Self::Like => G::Likes,
+            Self::Repost => G::Reposts,
+            Self::Follow => G::Follows,
+            Self::Block | Self::Table("list_blocks") => G::Blocks,
+            Self::Table("lists" | "list_items" | "list_optouts") => G::Lists,
+            Self::Profile | Self::Table("labeler_services" | "actor_self_records") => G::Profiles,
+            Self::Table("starter_packs") => G::StarterPacks,
+            Self::Table("nearhorizon_poll_posts") => G::Polls,
+            Self::Table(_) | Self::PrivatePost | Self::PrivateGate => return None,
+        })
+    }
+
     /// Private-tier kinds (`Kryphocron(Private)`, and gates of private posts).
     #[must_use]
     pub fn is_private(self) -> bool {
@@ -89,6 +108,9 @@ pub enum AdmitRule {
     /// The plural rule (plural-pronouns design §2.2): a record of the four
     /// pronouns and plural collections, by any author, in every mode.
     Plural,
+    /// Full indexing's arm of rule 1: any author's public record of an
+    /// enabled group, while the breadth is Full.
+    Full,
 }
 
 /// Why an op was rejected.
@@ -103,6 +125,14 @@ pub enum RejectReason {
     /// Rule M (member-blocks-only design §2): a block kind whose author is
     /// not a member and that names no member.
     NoMemberSide,
+    /// Full indexing's arm would admit it, but the copy came from a relay
+    /// whose filter leaves out what full stores.
+    Aside,
+    /// Full indexing's arm, for an account a takedown relay reports
+    /// suspended (checked after the DID locks).
+    Suspended,
+    /// Full indexing's arm, for a deleted account.
+    Deleted,
 }
 
 impl RejectReason {
@@ -114,6 +144,9 @@ impl RejectReason {
             Self::NotInScope => "not_in_scope",
             Self::PublicOff => "public_off",
             Self::NoMemberSide => "no_member_side",
+            Self::Aside => "aside",
+            Self::Suspended => "suspended",
+            Self::Deleted => "deleted",
         }
     }
 }
@@ -229,6 +262,16 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     }
     if removed_subject {
         return Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved));
+    }
+    // Rule 1's full arm: after S, Refract and the member rules; never a
+    // private kind; an account whose Refract restoration ended stays out.
+    // The copy's tier and the account's status are checked by the writer.
+    if sets.public.breadth == crate::indexing::Breadth::Full
+        && !input.kind.is_private()
+        && input.kind.full_group().is_some_and(|g| sets.full.kinds.contains(&g))
+        && !sets.full.excluded.contains(&input.author)
+    {
+        return Admission::Admit(AdmitRule::Full);
     }
     Admission::Reject(RejectReason::NotInScope)
 }

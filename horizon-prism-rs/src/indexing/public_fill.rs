@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 
-use super::public_mode::{FillPart, FillStage, FillState, Phase, PublicIndexing, PublicMode, PublicState, Spawn, Transition, g64, now, replace_if};
+use super::public_mode::{Breadth, FillPart, FillStage, FillState, Phase, PublicIndexing, PublicMode, PublicState, Spawn, Transition, g64, now, replace_if};
 use crate::aggregations::rebuild::repair_counts;
 use crate::firehose::jobs;
 
@@ -187,25 +187,31 @@ impl PublicIndexing {
         if check_memory && self.scope.read_guard().await.public.generation != generation {
             return Ok(());
         }
-        #[cfg(test)]
-        self.hooks.repairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let started = Instant::now();
-        repair_counts(&self.pool).await?;
-        metrics::histogram!(METRIC_REPAIR_SECONDS).record(started.elapsed().as_secs_f64());
+        // In full, the locking repair would stop ingest for hours, and no
+        // read uses local counts until a group's history is complete: it
+        // is skipped.
+        if self.breadth() != Breadth::Full {
+            #[cfg(test)]
+            self.hooks.repairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            repair_counts(&self.pool).await?;
+            metrics::histogram!(METRIC_REPAIR_SECONDS).record(started.elapsed().as_secs_f64());
+        }
         let mut sets = self.scope.write_guard().await;
         if check_memory && sets.public.generation != generation {
             return Ok(());
         }
         let next = generation + 1;
         let last_fill_since = sets.public.last_fill_since;
-        let t = Transition::settled(Phase::On, next, now(), last_fill_since);
+        let (breadth, crawl_generation) = (sets.public.breadth, sets.public.crawl_generation);
+        let t = Transition::settled(Phase::On, next, now(), last_fill_since).in_breadth(breadth, crawl_generation);
         let mut tx = self.pool.begin().await?;
         if !replace_if(&mut tx, Phase::Filling, generation, &t).await? {
             Self::superseded("checker", generation);
             return Ok(());
         }
         tx.commit().await?;
-        self.set_state(&mut sets, PublicState { mode: PublicMode::On, generation: next, last_fill_since });
+        self.set_state(&mut sets, PublicState { mode: PublicMode::On, generation: next, last_fill_since, breadth, crawl_generation });
         drop(sets);
         tracing::info!(event = "public_fill_done", generation = next, repair_secs = started.elapsed().as_secs_f64(), "public indexing is on");
         Ok(())

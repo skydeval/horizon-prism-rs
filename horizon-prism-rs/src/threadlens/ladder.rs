@@ -196,7 +196,7 @@ impl Ladder {
                 // takes the community path in every mode (refract design
                 // §7.5).
                 let restored = self.hydrator.refract_snapshot(req).await.is_restored(author);
-                if !(restored || !home.is_community() || !self.hydrator.scope().public_mode().is_on()) {
+                if !(restored || !home.is_community() || !self.hydrator.scope().public_reads_local()) {
                     continue;
                 }
                 cascade.insert(uri.clone(), CascadeOutcome::Skipped);

@@ -282,7 +282,20 @@ impl Refract {
             sqlx::query(sql).bind(did).execute(&mut *tx).await?;
         }
         drop_empty_scopes(&mut tx).await?;
+        // In full, an ended account is not admitted again for its own sake
+        // unless it is a member (re-checked when Refract lists it again).
+        let exclude = sets.public.breadth == crate::indexing::Breadth::Full && !sets.is_member(did);
+        if exclude {
+            sqlx::query("INSERT INTO dids (did) VALUES ($1) ON CONFLICT (did) DO NOTHING").bind(did).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO refract_excluded (account) SELECT id FROM dids WHERE did = $1 ON CONFLICT (account) DO UPDATE SET checked_at = now()")
+                .bind(did)
+                .execute(&mut *tx)
+                .await?;
+        }
         tx.commit().await?;
+        if exclude {
+            sets.full.excluded.insert(did);
+        }
         super::state::refresh(&self.inner.pool, &mut sets, Some(&[did.to_string()]), &communities).await?;
         drop(sets);
         tracing::info!(event = "refract_purge_ended", did, rows = total, "a Refract purge finished");

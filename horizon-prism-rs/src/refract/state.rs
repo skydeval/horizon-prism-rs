@@ -145,6 +145,21 @@ pub async fn refresh(pool: &PgPool, sets: &mut ScopeSets, dids: Option<&[String]
             }),
         }
     }
+    // Refract lists an account again: full indexing admits it again.
+    let relisted: Vec<String> = facts
+        .iter()
+        .filter(|(did, f)| matches!(f.state, State::Candidate | State::Restored | State::Grace) && sets.full.excluded.contains(did))
+        .map(|(did, _)| did.clone())
+        .collect();
+    if !relisted.is_empty() {
+        sqlx::query("DELETE FROM refract_excluded x USING dids d WHERE d.id = x.account AND d.did = ANY($1)")
+            .bind(&relisted)
+            .execute(pool)
+            .await?;
+        for did in &relisted {
+            sets.full.excluded.remove(did);
+        }
+    }
     // Labels count only from the DID's own community's labeler, and only
     // for a DID in R or `ending`; a candidate's never hide anything (§4.2).
     for (labeler, subject, did, exp) in labels {

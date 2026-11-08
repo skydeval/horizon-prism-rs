@@ -1152,7 +1152,19 @@ impl Consumer {
                 metrics::counter!(METRIC_STREAM_EVENTS, "type" => "resume").increment(1);
                 Ok(EntryPath::NoTx)
             }
-            Event::Identity { kind, did, relay, active, .. } => {
+            Event::Identity { kind, did, relay, active, status, .. } => {
+                // In full, a takedown relay's account statuses are recorded.
+                if kind == IdentityKind::Account && active.is_some() {
+                    let (full, relays) = {
+                        let sets = self.writer.scope().read_guard().await;
+                        (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone())
+                    };
+                    if full && relays.contains(&label) {
+                        crate::indexing::full::record_relay_status(&self.pool, &did, &label, active, status.as_deref()).await?;
+                    } else if full && active == Some(false) && label == super::watermark::UNKNOWN_RELAY {
+                        tracing::warn!(event = "firehose_unaliased_status", relay = ?relay, %did, "an account status from a relay URL with no label or alias; list it in firehose.relay_aliases if it stands in for a takedown relay");
+                    }
+                }
                 if self.outline.is_some()
                     && let Some(key) = crate::thread_outline::ops::status_relay(&self.watermarks, relay.as_deref())
                 {
@@ -1194,7 +1206,7 @@ impl Consumer {
         let options = ApplyOptions { advance_applied_rev: tier == CopyTier::Whole, ..self.apply_options() };
         let report = self
             .writer
-            .apply_commit(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options)
+            .apply_copy(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier)
             .await?;
         // A malformed op that could not matter is counted, not dead-lettered
         // (actionable-warnings design §6.3).

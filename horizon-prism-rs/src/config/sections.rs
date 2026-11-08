@@ -68,7 +68,7 @@ pub enum PublicScope {
     KryphocronOnly,
     /// Public records of members and the accounts around them.
     Community,
-    /// The whole public network. Not built yet: refused by validation.
+    /// The whole public network, for the groups `[full] kinds` enables.
     Full,
 }
 
@@ -121,6 +121,18 @@ impl FullGroup {
     }
 }
 
+/// `[full] suspended_accounts`: who is served of the accounts a takedown
+/// relay reports suspended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspendedAccounts {
+    /// Only those Refract lists.
+    #[default]
+    RefractOnly,
+    /// All of them, whenever any relay carries them.
+    All,
+}
+
 /// `[full]`: what full indexing stores.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -128,11 +140,14 @@ pub struct FullConfig {
     /// The record groups stored for every account. A group not listed
     /// follows community rules.
     pub kinds: Vec<FullGroup>,
+    pub suspended_accounts: SuspendedAccounts,
+    /// Relay labels whose `#account` statuses count as a suspension.
+    pub takedown_relays: Vec<String>,
 }
 
 impl Default for FullConfig {
     fn default() -> Self {
-        Self { kinds: FullGroup::ALL.to_vec() }
+        Self { kinds: FullGroup::ALL.to_vec(), suspended_accounts: SuspendedAccounts::RefractOnly, takedown_relays: vec!["bsky".to_string()] }
     }
 }
 

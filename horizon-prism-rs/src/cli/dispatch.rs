@@ -208,10 +208,14 @@ pub enum HostAction {
 #[derive(Debug, Subcommand)]
 pub enum IndexingAction {
     /// Set what Prism indexes: kryphocron_only (stored public data is
-    /// deleted in the background) or community (it is refilled).
+    /// deleted in the background), community (it is refilled) or full (the
+    /// whole network, from now on).
     PublicScope {
-        /// kryphocron_only | community
+        /// kryphocron_only | community | full
         value: String,
+        /// The confirm word: FULL to switch to full, COMMUNITY to leave it.
+        #[arg(long)]
+        confirm: Option<String>,
     },
     /// The setting, the running mode and phase, progress and any error.
     Status,
@@ -409,8 +413,8 @@ impl AdminCmd {
             },
             Self::Lists { action: ListsAction::Sync { uri } } => AdminCommand::ListsSync { uri: uri.clone() },
             Self::Lists { action: ListsAction::Purge { did } } => AdminCommand::ListsPurge { did: did.clone() },
-            Self::Indexing { action: IndexingAction::PublicScope { value } } => AdminCommand::IndexingPublicScope {
-                value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only or community, not {value:?}"))?,
+            Self::Indexing { action: IndexingAction::PublicScope { value, .. } } => AdminCommand::IndexingPublicScope {
+                value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only, community or full, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
             Self::Refract { action: RefractAction::Check { did } } => AdminCommand::RefractCheck { did: did.clone() },
@@ -421,6 +425,50 @@ impl AdminCmd {
         let (command, args) = cmd.to_row();
         AdminCommand::parse(command, &args).map_err(|e| e.to_string())
     }
+}
+
+/// The confirm word a switch into or out of full needs: `FULL` to switch to
+/// full, after its warnings; `COMMUNITY` to leave full for community.
+fn scope_word(value: ScopeValue, running_full: bool) -> Option<&'static str> {
+    match value {
+        ScopeValue::Full => Some("FULL"),
+        ScopeValue::Community if running_full => Some("COMMUNITY"),
+        _ => None,
+    }
+}
+
+/// Ask for the confirm word, showing what the switch means.
+async fn confirm_scope(pool: &PgPool, cfg: &crate::config::AppConfig, value: ScopeValue, confirm: Option<&str>) -> Result<(), String> {
+    let breadth: Option<String> = sqlx::query_scalar("SELECT value->>'breadth' FROM worker_state WHERE key = 'public_transition'")
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten();
+    let Some(word) = scope_word(value, breadth.as_deref() == Some("full")) else {
+        return Ok(());
+    };
+    if confirm == Some(word) {
+        return Ok(());
+    }
+    let mut text = Vec::new();
+    if value == ScopeValue::Full {
+        let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(pool).await.ok();
+        let free = crate::indexing::full::database_free_bytes(&cfg.env.data_dir);
+        text.push("Switching to full: Prism stores and serves the public network for the enabled record groups.".to_string());
+        text.extend(crate::indexing::full::warnings(
+            &cfg.file.full.kinds,
+            used.and_then(|u| u64::try_from(u).ok()),
+            free,
+            cfg.file.storage.budget_bytes,
+        ));
+    } else {
+        text.push(
+            "Leaving full for community: the rows full added are deleted in the background, then S is refilled; public requests answer 501 during that refill."
+                .to_string(),
+        );
+    }
+    text.push(format!("Run again with --confirm {word} to switch."));
+    Err(text.join("\n"))
 }
 
 /// Insert the row and notify `serve`, in one transaction. Returns the id.
@@ -626,6 +674,13 @@ pub async fn run(args: &AdminArgs) -> u8 {
             return 1;
         }
     };
+    if let (AdminCmd::Indexing { action: IndexingAction::PublicScope { confirm, .. } }, Some(AdminCommand::IndexingPublicScope { value })) =
+        (&args.command, &early)
+        && let Err(e) = confirm_scope(&pool, &cfg, *value, confirm.as_deref()).await
+    {
+        eprintln!("{e}");
+        return 2;
+    }
     let cmd = match early {
         Some(c) => c,
         None => match settings_change(&args.command, &cfg, &pool).await {
@@ -692,10 +747,17 @@ mod tests {
                 depth: Some(Depth::Authz)
             })
         );
-        let off = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "kryphocron_only".into() } };
+        let off = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "kryphocron_only".into(), confirm: None } };
         assert_eq!(off.to_command(), Ok(AdminCommand::IndexingPublicScope { value: ScopeValue::KryphocronOnly }));
-        let full = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "full".into() } };
-        assert!(full.to_command().is_err());
+        let full = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "full".into(), confirm: None } };
+        assert_eq!(full.to_command(), Ok(AdminCommand::IndexingPublicScope { value: ScopeValue::Full }));
+        let wide = AdminCmd::Indexing { action: IndexingAction::PublicScope { value: "everything".into(), confirm: None } };
+        assert!(wide.to_command().is_err());
+        // The confirm words: FULL into full, COMMUNITY out of it.
+        assert_eq!(scope_word(ScopeValue::Full, false), Some("FULL"));
+        assert_eq!(scope_word(ScopeValue::Community, true), Some("COMMUNITY"));
+        assert_eq!(scope_word(ScopeValue::Community, false), None);
+        assert_eq!(scope_word(ScopeValue::KryphocronOnly, true), None);
         let status = AdminCmd::Indexing { action: IndexingAction::Status };
         assert_eq!(status.to_command(), Ok(AdminCommand::IndexingStatus));
         let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";

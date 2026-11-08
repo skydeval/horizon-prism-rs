@@ -271,6 +271,9 @@ pub mod hooks {
     pub const RECOVERY_SWEEP_BEFORE_ADD: &str = "i715_recovery_sweep_before_add";
     /// #715: a purge, its batches done, before its end. Key: the DID.
     pub const PURGE_BEFORE_END: &str = "i715_purge_before_end";
+    /// The unguarded deletion marker: after the concurrent marker, before
+    /// its row commits.
+    pub const PURGE_AFTER_MARKER_MAP: &str = "full_purge_after_marker_map";
     /// S10, #722: a job's or catch-up's settle, before its transaction and
     /// the gap lock. Key: `<database>/<did>` ([`pause_in`]).
     pub const SETTLE_BEFORE_GAP_LOCK: &str = "s10_settle_before_gap_lock";

@@ -422,7 +422,7 @@ async fn data_pages_hold_their_settings() {
     // accounts left and when the longest wait ends.
     {
         let mut sets = h.scope.write_guard().await;
-        h.scope.set_public(&mut sets, crate::indexing::PublicState { mode: crate::indexing::PublicMode::Filling, generation: 2, last_fill_since: None });
+        h.scope.set_public(&mut sets, crate::indexing::PublicState { mode: crate::indexing::PublicMode::Filling, generation: 2, last_fill_since: None, ..crate::indexing::PublicState::default() });
     }
     let jobs = get(&alice, &url("/admin/jobs")).await;
     assert!(jobs.body.contains("Public requests come back when it is done. — <a href=\"/admin/indexing\">Indexing</a></div>"), "{}", jobs.body);

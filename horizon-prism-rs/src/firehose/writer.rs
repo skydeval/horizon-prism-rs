@@ -46,6 +46,8 @@ pub const SENTINEL_REV: &str = "2222222222222";
 pub const METRIC_SKIPPED: &str = "firehose_ops_skipped_total";
 /// Metric: LWW skips.
 pub const METRIC_LWW_SKIPPED: &str = "lww_skipped";
+/// Metric: full-arm ops of Aside copies that were dropped, by relay.
+pub const METRIC_ASIDE_DROPPED: &str = "firehose_aside_dropped_total";
 
 /// A commit op's action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1050,6 +1052,26 @@ impl Writer {
         ops: &[RawOp],
         options: ApplyOptions,
     ) -> Result<ApplyReport, Transient> {
+        self.apply_copy(relay, repo, rev, since, ops, options, super::tier::CopyTier::Whole).await
+    }
+
+    /// [`Writer::apply_commit`] for one relay's copy of a commit, of
+    /// `tier`: full indexing's arm admits nothing from an Aside copy.
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn apply_copy(
+        &self,
+        relay: Option<&str>,
+        repo: &str,
+        rev: &str,
+        since: Option<&str>,
+        ops: &[RawOp],
+        options: ApplyOptions,
+        tier: super::tier::CopyTier,
+    ) -> Result<ApplyReport, Transient> {
         // Firehose throughput design §2.4: a hung database, before the
         // nothing-to-write check so it holds every entry alike.
         #[cfg(test)]
@@ -1083,7 +1105,14 @@ impl Writer {
         let mut lock_dids: Vec<String> = vec![repo.to_string()];
         for p in &prepared {
             if let Prepared::Upsert(u) = p {
-                let a = admit(&u.input, sets);
+                let mut a = admit(&u.input, sets);
+                // An Aside copy's full-arm ops are dropped, counted per relay;
+                // S's, the members' and member-involved ops are admitted as
+                // in community.
+                if a == Admission::Admit(AdmitRule::Full) && tier == super::tier::CopyTier::Aside {
+                    metrics::counter!(METRIC_ASIDE_DROPPED, "relay" => relay.unwrap_or("other").to_string()).increment(1);
+                    a = Admission::Reject(RejectReason::Aside);
+                }
                 // A grow-only post grows scope as an admitted one does, so
                 // its subjects' shared locks join the same sorted pass.
                 let plan = if matches!(a, Admission::Admit(_) | Admission::GrowOnly) {
@@ -1164,6 +1193,27 @@ impl Writer {
         // 2 and 3: DID locks, then per-URI locks.
         lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
+        // After the locks: an account whose deletion purge runs without the
+        // scope write guard is re-read here, and full's arm checks the
+        // account's status. Every op of the commit is the repo's own.
+        let full_arm = admissions.contains(&Some(Admission::Admit(AdmitRule::Full)));
+        let marked = sets.full.purge_markers.contains(repo);
+        if marked || full_arm {
+            let refusal = if marked { Some(RejectReason::Purging(PurgeKind::AccountDeleted)) } else { full_arm_refusal(&mut tx, repo, sets).await? };
+            if let Some(reason) = refusal {
+                for (a, plan) in admissions.iter_mut().zip(plans.iter_mut()) {
+                    let drop = if marked {
+                        matches!(a, Some(Admission::Admit(_) | Admission::GrowOnly))
+                    } else {
+                        *a == Some(Admission::Admit(AdmitRule::Full))
+                    };
+                    if drop {
+                        *a = Some(Admission::Reject(reason));
+                        *plan = GrowthPlan::default();
+                    }
+                }
+            }
+        }
         // The repo's owner lock, once, before any op's row locks, when an op
         // may change its owner rows: a private post upsert or a private
         // delete (private-audiences design §11). The later takes inside
@@ -1958,7 +2008,7 @@ impl Writer {
         // Feed items only for public records whose author is in S, and for
         // a repost only of a post: an update that reposts anything else
         // takes the old item away.
-        if !off && sets.in_scope(author) {
+        if !off && (sets.in_scope(author) || full_feed(sets, &u.body)) {
             match (&u.body, ids) {
                 (Body::Post(p), Some(OpIds::Post(k))) => {
                     let kind = if p.reply_parent.is_some() { FEED_REPLY } else { FEED_POST };
@@ -2199,7 +2249,10 @@ impl Writer {
         // A plural record's delete always leaves one (plural-pronouns design
         // §2.3), so a listing that read the record first cannot store it.
         let plural = d.kind == RecordKind::Table(rows::PLURAL_TABLE);
-        if removed || author_in_scope || in_r_or_candidate || plural || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
+        // In full, every public delete of an enabled group, so the crawl
+        // never writes back a record deleted since its CAR.
+        let full = sets.public.breadth == crate::indexing::Breadth::Full && d.kind.full_group().is_some_and(|g| sets.full.kinds.contains(&g));
+        if removed || author_in_scope || in_r_or_candidate || plural || full || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
             tombstones::put(&mut *conn, &d.uri, rev, Put::Highest).await?;
         }
         // The URI's feed items and notifications go with the record, unless
@@ -2358,6 +2411,40 @@ async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<
         .fetch_optional(conn)
         .await
         .map(Option::flatten)
+}
+
+/// Full's post-lock status check: a deleted account, or one a takedown
+/// relay reports non-active while `suspended_accounts = "refract_only"`
+/// and Refract does not list it, has no record admitted by full's arm.
+async fn full_arm_refusal(conn: &mut PgConnection, repo: &str, sets: &ScopeSets) -> Result<Option<RejectReason>, sqlx::Error> {
+    let relays: &[String] = if sets.is_restored(repo) { &[] } else { &sets.full.takedown_relays };
+    let status: Option<String> = sqlx::query_scalar(
+        "SELECT CASE \
+           WHEN EXISTS (SELECT 1 FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = $1 AND a.account_status = 'deleted') THEN 'deleted' \
+           WHEN EXISTS (SELECT 1 FROM relay_account_status r JOIN dids d ON d.id = r.account WHERE d.did = $1 AND r.relay = ANY($2)) THEN 'suspended' \
+         END",
+    )
+    .bind(repo)
+    .bind(relays)
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(match status.as_deref() {
+        Some("deleted") => Some(RejectReason::Deleted),
+        Some("suspended") => Some(RejectReason::Suspended),
+        _ => None,
+    })
+}
+
+/// In full, a post's or a repost's feed item is written for any author whose
+/// group is on.
+fn full_feed(sets: &ScopeSets, body: &Body) -> bool {
+    use crate::config::FullGroup;
+    let group = match body {
+        Body::Post(_) => FullGroup::Posts,
+        Body::Repost(_) => FullGroup::Reposts,
+        _ => return false,
+    };
+    sets.public.breadth == crate::indexing::Breadth::Full && sets.full.kinds.contains(&group)
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {
@@ -5129,7 +5216,7 @@ mod tests {
 
         async fn set_public(w: &Writer, mode: PublicMode, last_fill_since: Option<DateTime<Utc>>) {
             let mut sets = w.scope().write_guard().await;
-            w.scope().set_public(&mut sets, PublicState { mode, generation: 1, last_fill_since });
+            w.scope().set_public(&mut sets, PublicState { mode, generation: 1, last_fill_since, ..PublicState::default() });
         }
 
         async fn count(pool: &PgPool, sql: &str) -> i64 {

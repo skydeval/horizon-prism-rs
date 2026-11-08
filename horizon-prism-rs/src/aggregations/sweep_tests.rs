@@ -386,7 +386,7 @@ async fn a_reply_holds_its_subjects_for_the_window_under_the_off_rule() {
     };
     {
         let mut s = t.scope.write_guard().await;
-        t.scope.set_public(&mut s, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None });
+        t.scope.set_public(&mut s, PublicState { mode: PublicMode::Off, generation: 1, last_fill_since: None, ..PublicState::default() });
     }
     let writer = Writer::new(t.p().clone(), t.scope.clone(), Arc::new(DisabledPrivateTier));
     let parent = format!("at://{A}/app.bsky.feed.post/1");

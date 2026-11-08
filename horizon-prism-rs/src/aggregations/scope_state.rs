@@ -19,7 +19,7 @@ use crate::config::{ScopePolicy, ScopeWindows};
 use crate::db::locks::uri_author;
 use crate::db::{ScopeGuard, ScopeReadGuard};
 use crate::identity::PersistencePolicy;
-use crate::indexing::{PublicMode, PublicState};
+use crate::indexing::{Breadth, PublicMode, PublicState};
 use crate::private_tier::PrivateTier;
 
 /// A purge kind (§6.11.7).
@@ -76,7 +76,93 @@ pub struct ScopeSets {
     /// What the gate hides for Refract (refract design §4.2), swapped on
     /// change.
     pub refract_hidden: Arc<crate::refract::RefractHidden>,
+    /// What full indexing admits: the enabled groups, and the accounts
+    /// excluded after their Refract restoration ended.
+    pub full: FullSets,
 }
+
+/// Full indexing's admission inputs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FullSets {
+    /// `[full] kinds`, set at startup.
+    pub kinds: Vec<crate::config::FullGroup>,
+    /// Accounts whose Refract restoration ended: shared by every snapshot,
+    /// changed without the scope lock after the write that changes the
+    /// table commits.
+    pub excluded: Arc<ExcludedSet>,
+    /// The takedown relays whose non-active statuses hide an account and
+    /// keep its records out, under `suspended_accounts = "refract_only"`;
+    /// empty under `"all"`.
+    pub takedown_relays: Vec<String>,
+    /// Every takedown relay, whatever `suspended_accounts` says: their
+    /// statuses are recorded.
+    pub status_relays: Vec<String>,
+    /// Accounts whose deletion purge runs without the scope write guard:
+    /// writers re-read it after taking their DID locks.
+    pub purge_markers: Arc<ExcludedSet>,
+}
+
+/// A small concurrent set of DIDs (bounded by the Refract communities).
+#[derive(Default)]
+pub struct ExcludedSet(std::sync::RwLock<HashSet<String>>);
+
+impl ExcludedSet {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, HashSet<String>> {
+        self.0.read().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashSet<String>> {
+        self.0.write().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[must_use]
+    pub fn contains(&self, did: &str) -> bool {
+        self.read().contains(did)
+    }
+
+    pub fn insert(&self, did: &str) {
+        self.write().insert(did.to_string());
+    }
+
+    pub fn remove(&self, did: &str) {
+        self.write().remove(did);
+    }
+
+    /// Replace the whole set.
+    pub fn replace(&self, dids: HashSet<String>) {
+        *self.write() = dids;
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.read().len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// Bytes the set holds, roughly, for Health.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.read().iter().map(|d| d.len() + 48).sum()
+    }
+}
+
+impl std::fmt::Debug for ExcludedSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.read().iter()).finish()
+    }
+}
+
+impl PartialEq for ExcludedSet {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other) || *self.read() == *other.read()
+    }
+}
+
+impl Eq for ExcludedSet {}
 
 /// What the copy rule looks up for every list-item write: which lists are
 /// subscribed, whose changes are tracked, and how full each is. Set only
@@ -104,6 +190,16 @@ impl Subscribed {
 }
 
 impl ScopeSets {
+    /// The own-repo rule: whether `did`'s own public records are read from
+    /// the local copy. In community, the mode is On and `did` is in S. In
+    /// full the same for S and the members; any other account would need a
+    /// current crawl mark of the record's group, which only the crawl
+    /// writes, so it reads today's sources. While narrowing, never.
+    #[must_use]
+    pub fn own_repo_local(&self, did: &str) -> bool {
+        self.public.mode.is_on() && self.public.breadth != Breadth::Narrowing && self.in_scope(did)
+    }
+
     #[must_use]
     pub fn is_member(&self, did: &str) -> bool {
         self.members.contains(did)
@@ -162,12 +258,15 @@ pub struct ScopeState {
     /// `ScopeSets.public.mode`, readable without the guard (the endpoint
     /// gate, public-indexing design §3.5). Stored under the write guard.
     public_mirror: Arc<AtomicU8>,
+    /// `ScopeSets.public.breadth`, likewise.
+    breadth_mirror: Arc<AtomicU8>,
 }
 
 impl ScopeState {
     #[must_use]
     pub fn new(sets: ScopeSets, policy: ScopePolicy, max_follow_scope_per_member: u32) -> Self {
         let mirror = AtomicU8::new(sets.public.mode.as_u8());
+        let breadth = AtomicU8::new(sets.public.breadth.as_u8());
         Self {
             sets: Arc::new(RwLock::new(sets)),
             policy,
@@ -175,6 +274,7 @@ impl ScopeState {
             windows: ScopeWindows::default(),
             touched: Arc::default(),
             public_mirror: Arc::new(mirror),
+            breadth_mirror: Arc::new(breadth),
         }
     }
 
@@ -220,12 +320,56 @@ impl ScopeState {
     pub fn set_public(&self, sets: &mut ScopeSets, public: PublicState) {
         sets.public = public;
         self.public_mirror.store(public.mode.as_u8(), Ordering::Release);
+        self.breadth_mirror.store(public.breadth.as_u8(), Ordering::Release);
     }
 
     /// The public-indexing mode, read from the mirror without the guard.
     #[must_use]
     pub fn public_mode(&self) -> PublicMode {
         PublicMode::from_u8(self.public_mirror.load(Ordering::Acquire))
+    }
+
+    /// Set full indexing's groups and read the accounts excluded after
+    /// their Refract restoration ended.
+    ///
+    /// # Errors
+    ///
+    /// Any database error.
+    pub async fn load_full(&self, pool: &PgPool, full: &crate::config::FullConfig, relay_labels: &[String]) -> Result<(), sqlx::Error> {
+        let excluded: Vec<String> = sqlx::query_scalar("SELECT d.did FROM refract_excluded x JOIN dids d ON d.id = x.account")
+            .fetch_all(pool)
+            .await?;
+        let mut relays = Vec::new();
+        for r in &full.takedown_relays {
+            if relay_labels.contains(r) {
+                relays.push(r.clone());
+            } else {
+                tracing::warn!(event = "full_takedown_relay_set_aside", relay = %r, "full.takedown_relays: not a label in firehose.relay_labels; set aside");
+            }
+        }
+        if relays.is_empty() {
+            tracing::warn!(event = "full_no_takedown_relay", "full.takedown_relays names no configured relay: suspended_accounts has no effect");
+        }
+        let mut sets = self.write_guard().await;
+        sets.full.kinds = full.kinds.clone();
+        sets.full.excluded.replace(excluded.into_iter().collect());
+        sets.full.takedown_relays = if full.suspended_accounts == crate::config::SuspendedAccounts::RefractOnly { relays.clone() } else { Vec::new() };
+        sets.full.status_relays = relays;
+        Ok(())
+    }
+
+    /// Whether S's public data is read locally at all: the mode is On and
+    /// the breadth is not Narrowing (the own-repo rule's mode test), read
+    /// from the mirrors without the guard.
+    #[must_use]
+    pub fn public_reads_local(&self) -> bool {
+        self.public_mode().is_on() && self.public_breadth() != Breadth::Narrowing
+    }
+
+    /// The public-indexing breadth, read from the mirror without the guard.
+    #[must_use]
+    pub fn public_breadth(&self) -> Breadth {
+        Breadth::from_u8(self.breadth_mirror.load(Ordering::Acquire))
     }
 
     /// Load the sets from the database at startup (§9.3).
@@ -352,6 +496,7 @@ impl ScopeState {
         let mut fresh = load_sets(pool, private).await?;
         let mut sets = self.write_guard().await;
         fresh.public = sets.public;
+        fresh.full = sets.full.clone();
         fresh.restored = Arc::clone(&sets.restored);
         fresh.candidates = std::mem::take(&mut sets.candidates);
         fresh.refract_hidden = Arc::clone(&sets.refract_hidden);
@@ -420,6 +565,7 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
         restored: Arc::default(),
         candidates: HashMap::new(),
         refract_hidden: Arc::default(),
+        full: FullSets::default(),
     };
     // Members are always in S (reason bit 1), even before a rebuild wrote it.
     let members: Vec<String> = sets.members.iter().cloned().collect();
@@ -438,9 +584,14 @@ impl ScopeGuard for ScopeState {
 /// The `did_cache` persistence set (§6.7): members ∪ S. Called synchronously
 /// from identity code; if a write guard is held at that instant the answer is
 /// "not persisted", which only means the document stays in the bounded
-/// in-process cache.
+/// in-process cache. In full every document just resolved is persisted:
+/// retention removes it once it expires, so the table holds S, the members,
+/// R and the DIDs resolved recently.
 impl PersistencePolicy for ScopeState {
     fn in_persistence_set(&self, did: &str) -> bool {
+        if self.public_breadth() == Breadth::Full {
+            return true;
+        }
         // Refract's R is treated like S (refract design §5.4).
         self.sets
             .try_read()
@@ -501,10 +652,10 @@ mod tests {
     /// mirror follows every set.
     #[tokio::test]
     async fn public_state_defaults_to_on_and_the_mirror_follows() {
-        assert_eq!(ScopeSets::default().public, PublicState { mode: PublicMode::On, generation: 0, last_fill_since: None });
+        assert_eq!(ScopeSets::default().public, PublicState { mode: PublicMode::On, generation: 0, last_fill_since: None, ..PublicState::default() });
         let st = state();
         assert_eq!(st.public_mode(), PublicMode::On);
-        let off = PublicState { mode: PublicMode::Off, generation: 3, last_fill_since: None };
+        let off = PublicState { mode: PublicMode::Off, generation: 3, last_fill_since: None, ..PublicState::default() };
         {
             let mut sets = st.write_guard().await;
             st.set_public(&mut sets, off);

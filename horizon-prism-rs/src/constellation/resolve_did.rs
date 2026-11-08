@@ -69,7 +69,7 @@ pub async fn resolve_did(
     // C4 (public-indexing design §11): unless the mode is On, a community
     // author's public reads go to the cascade, so the hint names its first
     // AppView rather than this one.
-    let home_appview = if decision.is_community() && !s.app.hydrator.scope().public_mode().is_on() {
+    let home_appview = if decision.is_community() && !s.app.hydrator.scope().public_reads_local() {
         cascade.first().and_then(|name| table.network(name)).and_then(|n| n.appview_url.clone())
     } else {
         decision.appview_url

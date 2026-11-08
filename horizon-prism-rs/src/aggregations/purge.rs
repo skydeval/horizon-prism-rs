@@ -284,6 +284,22 @@ impl Purger {
             },
             "Unjustified is for out_of_scope, the other guards for member_removed"
         );
+        // In full, a deleted account outside every in-memory set is purged
+        // without the scope write guard: deletions are network-sized.
+        if kind == PurgeKind::AccountDeleted && *guard == MarkerGuard::None {
+            let untracked = {
+                let sets = self.scope.read_guard().await;
+                sets.public.breadth == crate::indexing::Breadth::Full
+                    && !sets.is_tracked(did)
+                    && !sets.in_scope(did)
+                    && !sets.is_restored(did)
+                    && !sets.candidates.contains_key(did)
+                    && sets.purge_kind(did).is_none()
+            };
+            if untracked {
+                return self.marker_unguarded(did).await;
+            }
+        }
         let mut sets = self.scope.write_guard().await;
         let mut tx = self.pool.begin().await?;
         lock_did_exclusive(&mut tx, did).await?;
@@ -433,6 +449,51 @@ impl Purger {
             hook.run(did, kind == PurgeKind::AccountDeleted, member_removed).await;
         }
         tracing::info!(event = "purge_marked", did, kind = kind.as_str(), "purge marker committed");
+        Ok(MarkerOutcome::Marked)
+    }
+
+    /// The `account_deleted` marker of a DID in no in-memory set, in full:
+    /// the DID's exclusive lock, then the concurrent marker, then the
+    /// marker row's commit. A writer re-reads the marker after its DID locks,
+    /// so none past its lock step has missed it; a rollback removes it.
+    async fn marker_unguarded(&self, did: &str) -> Result<MarkerOutcome, PurgeError> {
+        let markers = std::sync::Arc::clone(&self.scope.read_guard().await.full.purge_markers);
+        let mut tx = self.pool.begin().await?;
+        lock_did_exclusive(&mut tx, did).await?;
+        let running: Option<String> = sqlx::query_scalar("SELECT kind FROM purging_dids WHERE did = $1")
+            .bind(did)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if let Some(running) = running {
+            let running = PurgeKind::parse(&running).map_or("unknown", PurgeKind::as_str);
+            return Err(PurgeError::Busy(running));
+        }
+        markers.insert(did);
+        #[cfg(test)]
+        crate::test_support::hooks::pause(crate::test_support::hooks::PURGE_AFTER_MARKER_MAP, did).await;
+        let committed = async {
+            sqlx::query("INSERT INTO purging_dids (did, kind) VALUES ($1, $2)")
+                .bind(did)
+                .bind(PurgeKind::AccountDeleted.as_str())
+                .execute(&mut *tx)
+                .await?;
+            crate::refract::forget_account(&mut tx, did).await?;
+            crate::system_accounts::forget_account(&mut tx, did, &self.system_accounts).await?;
+            sqlx::query(
+                "UPDATE backfill_jobs SET state = 'cancelled', generation = generation + 1, updated_at = now() \
+                 WHERE did = $1 AND state IN ('queued', 'running')",
+            )
+            .bind(did)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await
+        }
+        .await;
+        if let Err(error) = committed {
+            markers.remove(did);
+            return Err(error.into());
+        }
+        tracing::debug!(event = "purge_marked", did, kind = "account_deleted", unguarded = true, "purge marker set");
         Ok(MarkerOutcome::Marked)
     }
 
@@ -627,8 +688,18 @@ impl Purger {
                 }
             }
         }
+        let in_memory = guard.purge_kind(did).is_some();
+        let markers = std::sync::Arc::clone(&guard.full.purge_markers);
         drop(guard);
 
+        // An unguarded marker ends without the write guard, unless a restart
+        // loaded it into the sets or owners changed.
+        let unguarded = markers.contains(did);
+        markers.remove(did);
+        if unguarded && !in_memory && applied.owners_joined.is_empty() && applied.owners_left.is_empty() {
+            tracing::info!(event = "purge_ended", did, tracked = is_member || is_owner, "purge finished");
+            return Ok(());
+        }
         let mut sets = self.scope.write_guard().await;
         sets.purging.remove(did);
         for d in applied.owners_joined {
@@ -1191,7 +1262,7 @@ mod tests {
         purger.marker(MEMBER, PurgeKind::MemberRemoved).await.expect("marker");
         {
             let mut sets = scope.write_guard().await;
-            scope.set_public(&mut sets, PublicState { mode: PublicMode::Filling, generation: 2, last_fill_since: None });
+            scope.set_public(&mut sets, PublicState { mode: PublicMode::Filling, generation: 2, last_fill_since: None, ..PublicState::default() });
         }
         purger.run_batches(MEMBER, PurgeKind::MemberRemoved).await.expect("batches");
         purger.end(MEMBER).await.expect("end");

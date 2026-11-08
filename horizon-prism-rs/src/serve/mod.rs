@@ -107,6 +107,7 @@ impl StartupError {
 struct ScopeRetentionInputs {
     scope: ScopeState,
     pool: sqlx::PgPool,
+    full_kinds: Vec<crate::config::FullGroup>,
 }
 
 #[async_trait]
@@ -117,6 +118,10 @@ impl RetentionInputs for ScopeRetentionInputs {
 
     async fn subscription_tombstones_aged(&self) -> Result<(), sqlx::Error> {
         self.scope.reload_tombstone_counts(&self.pool).await
+    }
+
+    async fn full_groups(&self) -> Vec<crate::config::FullGroup> {
+        if self.scope.public_breadth() == crate::indexing::Breadth::Full { self.full_kinds.clone() } else { Vec::new() }
     }
 }
 
@@ -313,6 +318,11 @@ pub async fn run() -> Result<Stopped, StartupError> {
     .await
     .map_err(|e| StartupError::new(1, format!("loading scope state: {e}")))?
     .with_windows(cfg.file.scope.windows());
+    // Full indexing's admission inputs, before the first writer.
+    scope
+        .load_full(&pool, &cfg.file.full, &cfg.file.firehose.relay_labels.values().cloned().collect::<Vec<_>>())
+        .await
+        .map_err(|e| StartupError::new(1, format!("loading full indexing's sets: {e}")))?;
     if !crate::aggregations::policy::grows_on_interaction(cfg.file.scope.policy) {
         tracing::info!(
             event = "scope_windows_unused",
@@ -322,7 +332,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The public-indexing switch (public-indexing design §3.5): its startup
     // sequence runs before the first writer (`purger.resume_all` below) and
     // hands back the one task the state needs, spawned here.
-    let public = PublicIndexing::new(pool.clone(), scope.clone(), PublicModeSettings::from_config(&cfg.file.indexing));
+    let public = PublicIndexing::new(pool.clone(), scope.clone(), PublicModeSettings::from_config(&cfg.file.indexing)).with_full_kinds(&cfg.file.full.kinds);
     let public_task = public
         .startup(&cfg.file.indexing)
         .await
@@ -614,6 +624,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         Arc::new(PublicRetention::new(Arc::new(ScopeRetentionInputs {
             scope: scope.clone(),
             pool: pool.clone(),
+            full_kinds: cfg.file.full.kinds.clone(),
         }))),
         // The memory's table (§5.14.18.1), with or without an engine.
         Arc::new(crate::farsight::retention::MemoryRetention::new(&cfg.file.farsight.memory, farsight.clone())),

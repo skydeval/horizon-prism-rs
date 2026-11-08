@@ -8,7 +8,7 @@
 use std::collections::BTreeSet;
 
 use super::sections::{
-    COMMUNITY_NETWORK, FileConfig, LOCAL_APPVIEW, NetworkAuth, PrivateReadFloors, PublicScope,
+    COMMUNITY_NETWORK, FileConfig, LOCAL_APPVIEW, NetworkAuth, PrivateReadFloors,
 };
 use crate::net::Intent;
 
@@ -390,9 +390,12 @@ fn lists_problems(cfg: &FileConfig, out: &mut Vec<String>) {
 }
 
 fn indexing(cfg: &FileConfig, out: &mut Vec<String>) {
-    // §9.1 / lock #4: `full` is recognized, then refused.
-    if cfg.indexing.public_scope == Some(PublicScope::Full) {
-        out.push("indexing.public_scope = \"full\" is not built yet".to_string());
+    // `[full] kinds` names each group once.
+    let mut seen = BTreeSet::new();
+    for g in &cfg.full.kinds {
+        if !seen.insert(*g) {
+            out.push(format!("full.kinds: {:?} is listed twice", g.as_str()));
+        }
     }
 }
 

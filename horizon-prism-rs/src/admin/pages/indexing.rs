@@ -19,6 +19,7 @@ use super::{ConfirmPage, Hidden, Nav, ago, back_to, css, enqueue, message, rende
 use crate::admin::AdminState;
 use crate::admin::auth::{Need, require};
 use crate::admin::health::count;
+use crate::admin::stats;
 use crate::admin::menu::PageId;
 use crate::admin::pages::settings::OpenQuery;
 use crate::admin::settings::store::PUBLIC_SCOPE_KEY;
@@ -173,18 +174,45 @@ pub async fn switch(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
         Err(response) => return response,
     };
     let Some(value) = ScopeValue::parse(&form.value) else {
-        return message(&state, Some(Nav::at(&op, HERE)), StatusCode::BAD_REQUEST, "Not saved", "Choose Kryphocron only or Community.", Some((HERE, "Indexing")));
+        return message(&state, Some(Nav::at(&op, HERE)), StatusCode::BAD_REQUEST, "Not saved", "Choose Kryphocron only, Community or Full network.", Some((HERE, "Indexing")));
     };
-    if value == ScopeValue::KryphocronOnly && state.scope.public_mode() != PublicMode::Off {
-        let word = "OFF";
+    let full_running = state.scope.public_breadth() == crate::indexing::Breadth::Full;
+    let ask: Option<(&str, String, String, String)> = match value {
+        ScopeValue::KryphocronOnly if state.scope.public_mode() != PublicMode::Off => Some((
+            "OFF",
+            "Switch to Kryphocron only".to_string(),
+            "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what kryphocron posts and Horizon features need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
+            "Switching back to Community refills public data; public requests come back when the refill is done.".to_string(),
+        )),
+        ScopeValue::Full if !full_running => {
+            let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(&state.pool).await.ok();
+            let free = stats::space(&state.disks.postgres).or_else(|| stats::space(&state.disks.data)).map(|s| s.free);
+            let running = &state.settings.running;
+            let warnings = crate::indexing::full::warnings(&running.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free, running.storage.budget_bytes);
+            Some((
+                "FULL",
+                "Switch to Full network".to_string(),
+                format!("Prism stores and serves the public network for the enabled record groups. {}", warnings.join(" ")),
+                "Switching back to Community deletes what full added and refills S; public requests answer 501 during that refill.".to_string(),
+            ))
+        }
+        ScopeValue::Community if full_running => Some((
+            "COMMUNITY",
+            "Leave Full network for Community".to_string(),
+            "Prism stops storing accounts outside S and deletes the rows full added, in the background, then refills S. Public requests answer 501 during that refill, for up to the fill's longest wait.".to_string(),
+            "Switching back to Full network starts full again; what was deleted is stored again from then on.".to_string(),
+        )),
+        _ => None,
+    };
+    if let Some((word, title, what, undo)) = ask {
         let back = back_to(&state, &headers, form.back.as_deref(), HERE);
         let mut page = ConfirmPage {
             css: css(),
             nav: Some(Nav::at(&op, &back)),
             back,
-            title: "Switch to Kryphocron only".to_string(),
-            what: "Prism stops answering public Bluesky requests and deletes the public data it stored, in the background. Only what kryphocron posts and Horizon features need is kept: blocks, follows involving members, profiles, and members' own records.".to_string(),
-            undo: "Switching back to Community refills public data; public requests come back when the refill is done.".to_string(),
+            title,
+            what,
+            undo,
             action: "/admin/indexing/switch".to_string(),
             csrf: op.csrf.clone(),
             hidden: vec![Hidden { name: "value".to_string(), value: value.as_str().to_string() }],

@@ -103,7 +103,7 @@ impl Hydrator {
             Ok(d) => d,
             Err(e) => return Ok(Err(e)),
         };
-        if !self.in_scope(&did).await {
+        if !self.stores_public_of(&did).await {
             return Ok(match self.upstream().follows(req, &did, limit, cursor).await {
                 Some(v) => {
                     // As the local list drops them (refract design §7.2):

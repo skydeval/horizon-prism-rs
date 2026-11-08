@@ -132,7 +132,7 @@ fn an_entry_that_does_not_parse_goes_alone() {
 fn a_core_setting_still_stops_the_start() {
     assert!(stops("[firehose]\nstream_key = \"\"\n").iter().any(|p| p.contains("firehose.stream_key")));
     assert!(stops("[scope]\npolicy = \"everyone\"\n").iter().any(|p| p.contains("scope.policy")));
-    assert!(stops("[indexing]\npublic_scope = \"full\"\n").iter().any(|p| p.contains("indexing.public_scope")));
+    assert!(stops("[indexing]\npublic_scope = \"everything\"\n").iter().any(|p| p.contains("indexing.public_scope")));
     assert!(stops("[http]\nbind = 3030\n").iter().any(|p| p.contains("http.bind")));
 }
 

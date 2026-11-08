@@ -482,7 +482,7 @@ impl RealUpstreamSource {
     /// cascade order are asked (C4, public-indexing design §11).
     async fn cascade(&self, req: &Requester, did: &str, call: Call<'_>) -> Option<Value> {
         let (home, community) = self.home(req, did).await;
-        let on = self.scope.as_ref().is_none_or(|s| s.public_mode().is_on());
+        let on = self.scope.as_ref().is_none_or(ScopeState::public_reads_local);
         if community && on {
             return None;
         }
@@ -1345,7 +1345,7 @@ mod tests {
             }
         };
         let scope_in = |mode: PublicMode| {
-            let sets = ScopeSets { public: PublicState { mode, generation: 1, last_fill_since: None }, ..ScopeSets::default() };
+            let sets = ScopeSets { public: PublicState { mode, generation: 1, last_fill_since: None, ..PublicState::default() }, ..ScopeSets::default() };
             ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000)
         };
         let req = Requester::test();

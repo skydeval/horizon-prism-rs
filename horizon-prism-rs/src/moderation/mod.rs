@@ -111,6 +111,29 @@ pub async fn gate_many_among(
     readable: Option<&HashSet<String>>,
     refract: RefractView<'_>,
 ) -> Result<HashMap<String, Gate>, sqlx::Error> {
+    gate_many_suspended(pool, subjects, readable, refract, None).await
+}
+
+/// Relay suspensions, in full under `suspended_accounts = "refract_only"`:
+/// a non-active status from one of `relays` hides any subject, stored or
+/// not, unless `exempt` says it is a member or Refract lists it.
+pub struct RelaySuspensions<'a> {
+    pub relays: &'a [String],
+    pub exempt: &'a (dyn Fn(&str) -> bool + Sync),
+}
+
+/// [`gate_many_among`] with relay suspensions.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn gate_many_suspended(
+    pool: &PgPool,
+    subjects: &[String],
+    readable: Option<&HashSet<String>>,
+    refract: RefractView<'_>,
+    suspensions: Option<RelaySuspensions<'_>>,
+) -> Result<HashMap<String, Gate>, sqlx::Error> {
     let mut authors: HashSet<String> = HashSet::new();
     let mut keys: HashSet<String> = HashSet::new();
     for s in subjects {
@@ -134,6 +157,21 @@ pub async fn gate_many_among(
             .bind(&authors_v)
             .fetch_all(pool)
             .await?;
+    // A relay's suspension is a public fact: read for every subject.
+    let relay_suspended: HashSet<String> = match &suspensions {
+        Some(r) if !r.relays.is_empty() => {
+            let every: Vec<String> = subjects.iter().map(|s| uri_author(s).unwrap_or(s).to_string()).collect();
+            let rows: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT d.did FROM relay_account_status x JOIN dids d ON d.id = x.account WHERE d.did = ANY($1) AND x.relay = ANY($2)",
+            )
+            .bind(&every)
+            .bind(r.relays)
+            .fetch_all(pool)
+            .await?;
+            rows.into_iter().filter(|d| !(r.exempt)(d)).collect()
+        }
+        _ => HashSet::new(),
+    };
     let takedown: HashSet<&str> = labels.iter().filter(|(_, v)| v == "!takedown").map(|(s, _)| s.as_str()).collect();
     let hide: HashSet<&str> = labels.iter().filter(|(_, v)| v == "!hide").map(|(s, _)| s.as_str()).collect();
     let status: HashMap<&str, HiddenReason> = statuses
@@ -148,6 +186,8 @@ pub async fn gate_many_among(
                 Gate::Hidden(HiddenReason::Takedown)
             } else if let Some(r) = status.get(author) {
                 Gate::Hidden(*r)
+            } else if relay_suspended.contains(author) {
+                Gate::Hidden(HiddenReason::Suspended)
             } else if refract.record_hidden(s) {
                 Gate::Hidden(HiddenReason::RecordRemoved)
             } else if s.starts_with("at://") && hide.contains(s.as_str()) {
