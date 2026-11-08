@@ -180,7 +180,7 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 14] = [
 
 /// A trial's narrowing: the narrowing's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_STEP_NAMES: [&str; 31] = [
+pub const TRIAL_STEP_NAMES: [&str; 33] = [
     "posts",
     "post_search",
     "likes",
@@ -200,6 +200,8 @@ pub const TRIAL_STEP_NAMES: [&str; 31] = [
     "postgates",
     "starter_pack_counts",
     "post_counts",
+    TRIAL_ZERO_COUNTS,
+    TRIAL_ZERO_TRENDS,
     "actors",
     TRIAL_PROFILES,
     "actor_counts",
@@ -236,6 +238,10 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 15] = [
 
 /// The step that clears the profiles a trial wrote on rows the exit keeps.
 pub const TRIAL_PROFILES: &str = "trial_profiles";
+/// The step that removes count rows the trial's removed rows left at zero.
+pub const TRIAL_ZERO_COUNTS: &str = "trial_zero_counts";
+/// The step that removes trend hours the trial's removed rows left at zero.
+pub const TRIAL_ZERO_TRENDS: &str = "trial_zero_trends";
 
 /// The step names of `list`.
 fn names(list: SweepList) -> &'static [&'static str] {
@@ -248,15 +254,53 @@ fn names(list: SweepList) -> &'static [&'static str] {
     }
 }
 
-/// A trial's exit differs in three steps: tombstones go by the record, so
+/// A trial's exit differs in these steps: tombstones go by the record, so
 /// the start mode's own stay; relay statuses, which only full writes, all
-/// go; and a profile the trial wrote on an identity row the exit keeps, of
-/// an account outside S, the members and R, is cleared while its rev is
-/// still the trial's.
+/// go; a profile the trial wrote on an identity row the exit keeps, of an
+/// account outside S, the members and R, is cleared while its rev is still
+/// the trial's; an account's counts go only when the record names it and
+/// no follow or post of anyone names it any more, so the counts community
+/// keeps for accounts S follows stay; and the count rows and trend hours
+/// the trial's removed rows brought back to zero go, as they read like no
+/// row at all.
 fn trial_steps() -> Vec<Step> {
     let tombstones = super::trial::TrialTable::RecordTombstones.code();
     let profiles = super::trial::TrialTable::Actors.code();
+    let account = did_of("ac.id");
     vec![
+        Step {
+            table: "actor_counts",
+            sql: format!(
+                "DELETE FROM actor_counts WHERE id IN (SELECT ac.id FROM actor_counts ac \
+                   JOIN (SELECT a AS id FROM full_trial_rows UNION SELECT s_a FROM full_trial_rows WHERE s_a IS NOT NULL) r ON r.id = ac.id \
+                 WHERE NOT {} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id) \
+                   AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.subject = ac.id) AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author = ac.id) \
+                   AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = ac.id) LIMIT {BATCH_SIZE})",
+                kept(&account)
+            ),
+            candidates: None,
+            bind: Bind::None,
+        },
+        Step {
+            table: TRIAL_ZERO_COUNTS,
+            ..batched_composite(
+                "post_counts",
+                &["author", "rkey"],
+                "pc",
+                "pc.like_count = 0 AND pc.repost_count = 0 AND pc.reply_count = 0 AND pc.quote_count = 0",
+                Bind::None,
+            )
+        },
+        Step {
+            table: TRIAL_ZERO_TRENDS,
+            ..batched_composite(
+                "tag_activity_hourly",
+                &["tag", "hour"],
+                "ta",
+                "ta.posts <= 0 AND ta.likes <= 0 AND ta.reposts <= 0 AND ta.replies <= 0",
+                Bind::None,
+            )
+        },
         Step {
             table: "record_tombstones",
             sql: format!(

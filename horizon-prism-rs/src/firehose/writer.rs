@@ -2318,7 +2318,11 @@ impl Writer {
         // never writes back a record deleted since its CAR.
         let full = sets.public.breadth == crate::indexing::Breadth::Full && d.kind.full_group().is_some_and(|g| sets.full.kinds.contains(&g));
         let start_reasons = author_in_scope || in_r_or_candidate || plural || (d.kind == RecordKind::Follow && sets.is_tracked(repo));
-        if removed || start_reasons || full {
+        // While a trial's exit runs, a delete that only removed a row the
+        // trial recorded leaves no tombstone: the start mode never stored
+        // the row, so no older copy of it can come back.
+        let trial_row_gone = removed && !start_reasons && sets.trial_exit() && removed_row_recorded(conn, d.kind, &d.uri).await?;
+        if (removed || start_reasons || full) && !trial_row_gone {
             // A full trial records a tombstone the start mode would not
             // have written: none of its reasons, and no row removed but
             // one the trial recorded.

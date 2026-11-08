@@ -575,7 +575,8 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     // Community's own: B's tagged post, the member's post, a stranger's like
     // of the member's post that was removed (its tombstone), and an
     // identity row of a stranger.
-    w.apply(B, &tid(1), &[tagged("3kaaaaaaaab22")], LIVE).await.expect("s post");
+    w.apply(B, &tid(1), &[tagged("3kaaaaaaaab22"), tagged("3kaaaaaaaab2a"), follow("3kaaaaaaaab2b", LATE)], LIVE).await.expect("s post");
+    assert_eq!(rows_of(p, "actor_counts", LATE).await, 1, "community counts an account S follows");
     w.apply(MEMBER, &tid(2), &[post("3kaaaaaaaab23", "m")], LIVE).await.expect("m post");
     w.apply(STRANGER, &tid(3), &[like("3kaaaaaaaab24", &m_post)], LIVE).await.expect("like");
     w.apply(STRANGER, &tid(4), &[delete("app.bsky.feed.like", "3kaaaaaaaab24")], LIVE).await.expect("unlike");
@@ -592,12 +593,20 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     w.apply(
         D,
         &tid(5),
-        &[like("3kaaaaaaaab25", &s_post), reply("3kaaaaaaaab26", &m_post, Some(&s_post)), post("3kaaaaaaaab27", "d"), reply("3kaaaaaaaab29", &s_post, Some(&d_post))],
+        &[
+            like("3kaaaaaaaab25", &s_post),
+            reply("3kaaaaaaaab26", &m_post, Some(&s_post)),
+            post("3kaaaaaaaab27", "d"),
+            reply("3kaaaaaaaab29", &s_post, Some(&d_post)),
+            like("3kaaaaaaaab2c", &post_uri(B, "3kaaaaaaaab2a")),
+            follow("3kaaaaaaaab2d", LATE),
+            post("3kaaaaaaaab2e", "deleted during the exit"),
+        ],
         LIVE,
     )
     .await
     .expect("d");
-    assert_eq!(count(p, trends).await, likes_before + 1, "the trial's like counts toward the tag");
+    assert_eq!(count(p, trends).await, likes_before + 2, "the trial's likes count toward the tag");
     let like_count = "SELECT like_count::bigint FROM post_counts pc WHERE (pc.author, pc.rkey) = (SELECT r.author, r.rkey FROM ref_of('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kaaaaaaaab22') r)";
     assert_eq!(count(p, like_count).await, 1);
     w.apply(OTHER, &tid(6), &[profile("first")], LIVE).await.expect("profile");
@@ -607,13 +616,22 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     let rec = record(p).await;
     let mut d_tables = tables_of(&rec, D);
     d_tables.sort_unstable();
-    assert_eq!(d_tables, ["feed_items", "feed_items", "feed_items", "likes", "posts", "posts"], "the reply's row is community's; its feed item is not: {rec:?}");
+    assert_eq!(
+        d_tables,
+        ["feed_items", "feed_items", "feed_items", "feed_items", "follows", "likes", "likes", "posts", "posts", "posts"],
+        "the reply's row is community's; its feed item is not: {rec:?}"
+    );
     let quoting = rec.iter().find(|r| r.1 == D && r.0 == "posts" && r.6.is_some()).expect("the reply that quotes");
     assert_eq!((quoting.4.as_deref(), quoting.6.as_deref()), (Some(B), Some(D)));
     // A count changed by hand during the trial.
     exec(p, "UPDATE post_counts SET quote_count = 7 WHERE (author, rkey) = (SELECT r.author, r.rkey FROM ref_of('at://did:plc:bbbbbbbbbbbbbbbbbbbbbbbb/app.bsky.feed.post/3kaaaaaaaab22') r)").await;
     let pause = pi.hooks.arm("trial_check");
-    pi.end_trial("manual").await.expect("end");
+    let exit = pi.apply_scope(ScopeValue::Community, "cli").await.expect("end");
+    // While the exit runs, deleting a trial row leaves no tombstone.
+    let tombs = rows_of(p, "record_tombstones", D).await;
+    w.apply(D, &tid(9), &[delete("app.bsky.feed.post", "3kaaaaaaaab2e")], LIVE).await.expect("delete during the exit");
+    assert_eq!(rows_of(p, "record_tombstones", D).await, tombs, "no tombstone for a trial row deleted during the exit");
+    drop(pi.spawn(exit.spawn.expect("the exit's sweep")));
     pause.0.notified().await;
     // The exit is done; the check waits.
     assert_eq!((scope.public_mode(), scope.public_breadth()), (PublicMode::On, Breadth::Community));
@@ -626,6 +644,9 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     assert_eq!(count(p, like_count).await, 0, "the like count is back");
     assert_eq!(count(p, profile_rev).await, 0, "the trial's profile is cleared");
     assert_eq!(count(p, "SELECT count(*) FROM actors").await, actors_before, "the identity row stays");
+    assert_eq!(rows_of(p, "actor_counts", LATE).await, 1, "community's counts of an account S follows stay");
+    assert_eq!(count(p, "SELECT count(*) FROM post_counts WHERE like_count + repost_count + reply_count + quote_count = 0").await, 0, "no count row left at zero");
+    assert_eq!(count(p, "SELECT count(*) FROM tag_activity_hourly WHERE posts + likes + reposts + replies <= 0").await, 0, "no trend hour left at zero");
     for table in super::trial::FULL_ONLY {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {table}")).await, 0, "{table}");
     }
