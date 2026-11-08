@@ -396,6 +396,13 @@ pub fn describe(command: &str, args: &Value) -> String {
             }
         ),
         "indexing status" => "Read the public data status".to_string(),
+        "indexing full-trial start" => "Start a full network trial".to_string(),
+        "indexing full-trial end" => "End the full network trial".to_string(),
+        "indexing full-trial keep" => "Keep the full network on after its trial".to_string(),
+        "indexing full-trial bounds" => "Change the full network trial's limits".to_string(),
+        "indexing full-trial check" => "Check the full network trial again".to_string(),
+        "indexing full-trial dismiss" => "Dismiss the full network trial's result".to_string(),
+        "indexing full-trial status" => "Read the full network trial's status".to_string(),
         "firehose forget-cap" => format!("Forget the remembered capability of relay {}", arg(args, "label")),
         "settings set" => {
             let names: Vec<String> = args

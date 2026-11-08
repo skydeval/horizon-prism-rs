@@ -157,6 +157,8 @@ mod tests {
             // Each operator's admin font.
             "0061_admin_font",
             "0062_full_indexing",
+            // Full trials and their record.
+            "0063_full_trials",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

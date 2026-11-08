@@ -178,13 +178,109 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 14] = [
     "worker_state",
 ];
 
+/// A trial's narrowing: the narrowing's steps, with the trial's profiles
+/// cleared after the identity rows.
+pub const TRIAL_STEP_NAMES: [&str; 31] = [
+    "posts",
+    "post_search",
+    "likes",
+    "reposts",
+    "follows",
+    "blocks",
+    "feed_items",
+    "lists",
+    "list_items",
+    "list_blocks",
+    "list_optouts",
+    "starter_packs",
+    "labeler_services",
+    "actor_self_records",
+    "nearhorizon_poll_posts",
+    "threadgates",
+    "postgates",
+    "starter_pack_counts",
+    "post_counts",
+    "actors",
+    TRIAL_PROFILES,
+    "actor_counts",
+    "constellation_counts",
+    "record_tombstones",
+    "did_cache",
+    "relay_account_status",
+    "identity_refresh",
+    "full_crawl_groups",
+    "full_crawl",
+    "refract_excluded",
+    "worker_state",
+];
+
+/// A trial's drain from full: the drain's steps, with the trial's profiles
+/// cleared after the identity rows.
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 15] = [
+    "post_search",
+    "blocks",
+    "actor_self_records",
+    "actors",
+    TRIAL_PROFILES,
+    "actor_counts",
+    "constellation_counts",
+    "record_tombstones",
+    "did_cache",
+    "relay_account_status",
+    "identity_refresh",
+    "full_crawl_groups",
+    "full_crawl",
+    "refract_excluded",
+    "worker_state",
+];
+
+/// The step that clears the profiles a trial wrote on rows the exit keeps.
+pub const TRIAL_PROFILES: &str = "trial_profiles";
+
 /// The step names of `list`.
 fn names(list: SweepList) -> &'static [&'static str] {
     match list {
         SweepList::Today => &[],
         SweepList::Full => &FULL_DRAIN_STEP_NAMES,
         SweepList::Narrowing => &STEP_NAMES,
+        SweepList::TrialNarrowing => &TRIAL_STEP_NAMES,
+        SweepList::TrialFull => &TRIAL_FULL_DRAIN_STEP_NAMES,
     }
+}
+
+/// A trial's exit differs in three steps: tombstones go by the record, so
+/// the start mode's own stay; relay statuses, which only full writes, all
+/// go; and a profile the trial wrote on an identity row the exit keeps, of
+/// an account outside S, the members and R, is cleared while its rev is
+/// still the trial's.
+fn trial_steps() -> Vec<Step> {
+    let tombstones = super::trial::TrialTable::RecordTombstones.code();
+    let profiles = super::trial::TrialTable::Actors.code();
+    vec![
+        Step {
+            table: "record_tombstones",
+            sql: format!(
+                "DELETE FROM record_tombstones WHERE (author, coll, rkey) IN (SELECT x.author, x.coll, x.rkey FROM full_trial_rows r \
+                 JOIN record_tombstones x ON x.author = r.a AND x.rkey = r.b AND x.coll = r.c WHERE r.tbl = {tombstones} LIMIT {BATCH_SIZE})"
+            ),
+            candidates: None,
+            bind: Bind::None,
+        },
+        batched_composite("relay_account_status", &["account", "relay"], "ras", "TRUE", Bind::None),
+        Step {
+            table: TRIAL_PROFILES,
+            sql: format!(
+                "UPDATE actors SET display_name = NULL, description = NULL, avatar_cid = NULL, banner_cid = NULL, profile_record = NULL, \
+                   profile_rev = NULL, profile_cid = NULL, pronouns = NULL, website = NULL, joined_via_starter_pack_uri = NULL, \
+                   joined_via_starter_pack_cid = NULL, profile_created_at = NULL, self_labels = NULL \
+                 WHERE id IN (SELECT x.id FROM full_trial_rows r JOIN actors x ON x.id = r.a AND x.profile_rev = r.rev \
+                   WHERE r.tbl = {profiles} AND NOT {} LIMIT {BATCH_SIZE})",
+                kept(&did_of("x.id"))
+            ),
+            candidates: None,
+            bind: Bind::None,
+        },
+    ]
 }
 
 /// The index of the step `name` in `list`, if `name` is one of its steps.
@@ -196,7 +292,12 @@ pub fn step_index(list: SweepList, name: &str) -> Option<usize> {
 /// The steps of `list`, built with the private-tier row authors community
 /// retention keeps.
 pub(super) fn steps(list: SweepList, private_row_authors: Vec<String>) -> Vec<Step> {
-    let mut all: Vec<Step> = scope_steps(private_row_authors).into_iter().map(bounded).collect();
+    let mut all: Vec<Step> = Vec::new();
+    // The trial's steps first, so they stand in for the ordinary ones.
+    if matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull) {
+        all.extend(trial_steps());
+    }
+    all.extend(scope_steps(private_row_authors).into_iter().map(bounded));
     all.extend(full_only_steps());
     names(list)
         .iter()
@@ -367,6 +468,18 @@ mod tests {
         assert_eq!(built, STEP_NAMES);
         let drain: Vec<&str> = steps(SweepList::Full, Vec::new()).iter().map(|s| s.table).collect();
         assert_eq!(drain, FULL_DRAIN_STEP_NAMES);
+        let trial: Vec<&str> = steps(SweepList::TrialNarrowing, Vec::new()).iter().map(|s| s.table).collect();
+        assert_eq!(trial, TRIAL_STEP_NAMES);
+        let trial_drain: Vec<&str> = steps(SweepList::TrialFull, Vec::new()).iter().map(|s| s.table).collect();
+        assert_eq!(trial_drain, TRIAL_FULL_DRAIN_STEP_NAMES);
+        // A trial's tombstones go by the record, and every relay status goes.
+        let built = steps(SweepList::TrialNarrowing, Vec::new());
+        let tomb = built.iter().find(|s| s.table == "record_tombstones").expect("tombstones");
+        assert!(tomb.sql.contains("full_trial_rows"), "{}", tomb.sql);
+        let ras = built.iter().find(|s| s.table == "relay_account_status").expect("relay statuses");
+        assert!(ras.sql.contains("WHERE TRUE"), "{}", ras.sql);
+        let ordinary = steps(SweepList::Narrowing, Vec::new());
+        assert!(!ordinary.iter().any(|s| s.sql.contains("full_trial_rows")));
         // A drain's own tables are not run again as steps, except the
         // search rows, which no drain table covers.
         for name in FULL_DRAIN_STEP_NAMES {

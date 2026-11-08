@@ -200,6 +200,8 @@ pub struct PublicModeSettings {
     /// How long the sweep may go without advancing before the stall alarm
     /// (§7.2: 30 minutes).
     pub stall_after: Duration,
+    /// How often a full trial's bounds checker looks (60 s).
+    pub trial_check_every: Duration,
 }
 
 impl PublicModeSettings {
@@ -213,6 +215,7 @@ impl PublicModeSettings {
             retry_base: Duration::from_secs(1),
             failure_pause: Duration::from_secs(60),
             stall_after: Duration::from_secs(30 * 60),
+            trial_check_every: super::trial::CHECK_EVERY,
         }
     }
 }
@@ -331,6 +334,10 @@ pub enum SweepList {
     Full,
     /// Narrowing: the rows full added beyond community's.
     Narrowing,
+    /// A trial's narrowing: as `narrowing`, with the trial's differences.
+    TrialNarrowing,
+    /// A trial's drain from full: as `full`, with the trial's differences.
+    TrialFull,
 }
 
 impl SweepList {
@@ -340,6 +347,8 @@ impl SweepList {
             Self::Today => "today",
             Self::Full => "full",
             Self::Narrowing => "narrowing",
+            Self::TrialNarrowing => "trial_narrowing",
+            Self::TrialFull => "trial_full",
         }
     }
 
@@ -349,16 +358,34 @@ impl SweepList {
             "today" => Some(Self::Today),
             "full" => Some(Self::Full),
             "narrowing" => Some(Self::Narrowing),
+            "trial_narrowing" => Some(Self::TrialNarrowing),
+            "trial_full" => Some(Self::TrialFull),
             _ => None,
         }
+    }
+
+    /// The trial's form of a list.
+    #[must_use]
+    pub fn for_trial(self) -> Self {
+        match self {
+            Self::Narrowing => Self::TrialNarrowing,
+            Self::Full => Self::TrialFull,
+            other => other,
+        }
+    }
+
+    /// Whether a drain from full runs the steps after its tables.
+    #[must_use]
+    pub fn is_full_drain(self) -> bool {
+        matches!(self, Self::Full | Self::TrialFull)
     }
 
     /// The phase the sweep runs in.
     #[must_use]
     pub fn phase(self) -> Phase {
         match self {
-            Self::Today | Self::Full => Phase::Draining,
-            Self::Narrowing => Phase::Narrowing,
+            Self::Today | Self::Full | Self::TrialFull => Phase::Draining,
+            Self::Narrowing | Self::TrialNarrowing => Phase::Narrowing,
         }
     }
 
@@ -366,8 +393,9 @@ impl SweepList {
     #[must_use]
     pub fn first_table(self) -> &'static str {
         match self {
-            Self::Today | Self::Full => public_sweep::TABLES[0].name,
+            Self::Today | Self::Full | Self::TrialFull => public_sweep::TABLES[0].name,
             Self::Narrowing => super::narrowing::STEP_NAMES[0],
+            Self::TrialNarrowing => super::narrowing::TRIAL_STEP_NAMES[0],
         }
     }
 }
@@ -456,6 +484,10 @@ pub struct Transition {
     /// Narrowing only: whether S's fill had finished when it began.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub s_filled: Option<bool>,
+    /// A full trial, carried unchanged by every phase change unless the
+    /// change is the trial's own.
+    #[serde(skip_serializing_if = "Option::is_none", serialize_with = "ser_trial")]
+    pub trial: Option<super::trial::Trial>,
 }
 
 impl Transition {
@@ -473,6 +505,7 @@ impl Transition {
             breadth: Breadth::Community,
             crawl_generation: 0,
             s_filled: None,
+            trial: None,
         }
     }
 
@@ -525,6 +558,14 @@ pub fn rfc3339(t: &DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
+#[allow(clippy::ref_option)] // serde's `serialize_with` passes `&Option<T>`.
+fn ser_trial<S: Serializer>(t: &Option<super::trial::Trial>, s: S) -> Result<S::Ok, S::Error> {
+    match t {
+        Some(t) => t.to_json().serialize(s),
+        None => s.serialize_none(),
+    }
+}
+
 fn ser_ts<S: Serializer>(t: &DateTime<Utc>, s: S) -> Result<S::Ok, S::Error> {
     s.serialize_str(&rfc3339(t))
 }
@@ -554,6 +595,7 @@ pub fn now() -> DateTime<Utc> {
 
 /// The stored transition, as validated at startup (§3.5 step 2).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // Read once at startup.
 pub(super) enum Validated {
     Valid(Transition),
     /// The parsed generation (0 when it does not parse) and
@@ -591,6 +633,14 @@ pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Va
         None | Some(Value::Null) => 0,
         Some(v) => match v.as_u64() {
             Some(g) => g,
+            None => return (held, None),
+        },
+    };
+    // A trial object that does not validate is Held; its record stays.
+    let trial = match raw.get("trial") {
+        None | Some(Value::Null) => None,
+        Some(v) => match super::trial::Trial::parse(v) {
+            Some(t) => Some(t),
             None => return (held, None),
         },
     };
@@ -659,7 +709,14 @@ pub(super) fn validate(raw: &Value, now: DateTime<Utc>) -> (Validated, Option<Va
         breadth,
         crawl_generation,
         s_filled: if phase == Phase::Narrowing { s_filled } else { None },
+        trial,
     };
+    if let Some(trial) = &t.trial {
+        let st = state_of(&t);
+        if !trial.fits(st.breadth, st.mode) {
+            return (held, reset);
+        }
+    }
     (Validated::Valid(t), reset)
 }
 
@@ -777,6 +834,17 @@ pub struct Applied {
     pub spawn: Option<Spawn>,
 }
 
+/// Who asks for a change of the switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Intent {
+    /// A command, the admin UI or S5.
+    Command,
+    /// A full trial's start, with its object.
+    Start(Box<super::trial::Trial>),
+    /// A full trial's end by a bound or a command, with its cause.
+    End { cause: &'static str },
+}
+
 /// What the background work reports, for health and `admin indexing
 /// status` (§10). Kept in memory; the stored state is read alongside.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -792,6 +860,9 @@ pub(super) struct Progress {
     /// Why the edited file value could not be applied at the last start;
     /// the running value stays.
     pub file_apply_error: Option<String>,
+    /// What the last start said about the file's value: `not_applied`, or
+    /// `trial_running` in its place while a trial runs.
+    pub file_note: Option<&'static str>,
 }
 
 /// The switch: its stored state, its in-memory mode, and its background
@@ -806,6 +877,11 @@ pub struct PublicIndexing {
     pub(super) full_kinds: Vec<crate::config::FullGroup>,
     /// The relays' copy tiers, which the firehose consumer shows here.
     tier_board: Arc<crate::firehose::tier::TierBoard>,
+    /// The data directory, whose disk stands in for the database volume
+    /// when that is not visible.
+    pub(super) data_dir: std::path::PathBuf,
+    /// `[full_trial]`: a new trial's bounds when the command gives none.
+    trial_defaults: super::trial::Bounds,
     #[cfg(test)]
     pub(super) hooks: Arc<hooks::Hooks>,
 }
@@ -820,9 +896,31 @@ impl PublicIndexing {
             progress: Arc::default(),
             full_kinds: crate::config::FullGroup::ALL.to_vec(),
             tier_board: Arc::default(),
+            data_dir: std::path::PathBuf::from("."),
+            trial_defaults: super::trial::Bounds::from_config(&crate::config::FullTrialConfig::default()),
             #[cfg(test)]
             hooks: Arc::default(),
         }
+    }
+
+    /// With `[full_trial]`'s defaults.
+    #[must_use]
+    pub fn with_trial_defaults(mut self, c: &crate::config::FullTrialConfig) -> Self {
+        self.trial_defaults = super::trial::Bounds::from_config(c);
+        self
+    }
+
+    /// A new trial's bounds when the command gives none.
+    #[must_use]
+    pub fn trial_defaults(&self) -> super::trial::Bounds {
+        self.trial_defaults
+    }
+
+    /// With the data directory.
+    #[must_use]
+    pub fn with_data_dir(mut self, dir: &std::path::Path) -> Self {
+        self.data_dir = dir.to_path_buf();
+        self
     }
 
     /// The relays' copy tiers, shared with the firehose consumer.
@@ -935,8 +1033,18 @@ impl PublicIndexing {
         {
             let mut sets = self.scope.write_guard().await;
             self.set_state(&mut sets, state);
+            let trial = match &validated {
+                Validated::Valid(t) if state.mode != PublicMode::Held => t.trial.clone(),
+                _ => None,
+            };
+            self.scope.set_trial(&mut sets, trial);
         }
         self.trace("memory");
+        // A trial's bounds, before any writer: one that passed while Prism
+        // was down ends it now.
+        if let Some(exit) = self.trial_startup().await? {
+            task = Some(exit);
+        }
         // Step 5: an operator edit, against the mapped mode.
         if let Some(value) = s5 {
             // A failure never stops the start: the running value stays, and
@@ -972,8 +1080,18 @@ impl PublicIndexing {
             .bind(SETTING_KEY)
             .fetch_optional(&self.pool)
             .await?;
+        let trial_running: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM worker_state WHERE key = $1 AND value->'trial'->>'state' = 'running')",
+        )
+        .bind(TRANSITION_KEY)
+        .fetch_one(&self.pool)
+        .await?;
         let not_applied = |stored: &Value| {
-            if *stored != f.value.to_json() {
+            if trial_running {
+                self.progress(|p| p.file_note = Some("trial_running"));
+                tracing::info!(event = "public_scope_trial_running", file_value = f.value.as_str(), "a full trial is running; app.toml's public_scope is applied when it has ended");
+            } else if *stored != f.value.to_json() {
+                self.progress(|p| p.file_note = Some("not_applied"));
                 tracing::warn!(
                     event = "public_scope_file_not_applied",
                     file_value = f.value.as_str(),
@@ -1051,17 +1169,116 @@ impl PublicIndexing {
     /// The command's transaction (§3.4): `admin indexing public-scope`, the
     /// admin UI, and S5. Runs under the write guard, against the in-memory
     /// mode. Returns the task a phase change needs; the caller spawns it.
+    /// While a full trial runs, a switch to full keeps full for real and a
+    /// switch to any other value ends the trial into it.
     ///
     /// # Errors
     ///
     /// Any database error; nothing changes.
     pub async fn apply_scope(&self, value: ScopeValue, updated_by: &str) -> Result<Applied, sqlx::Error> {
+        self.apply_scope_as(value, updated_by, Intent::Command).await
+    }
+
+    /// A trial's start: [`Self::apply_scope`] to full with the trial, after
+    /// the refused states are tested again under the write guard. `None`
+    /// when the mode is no longer the trial's settled start mode.
+    pub(super) async fn apply_trial_start(&self, trial: super::trial::Trial, actor: &str) -> Result<Option<Applied>, sqlx::Error> {
+        let applied = self.apply_scope_as(ScopeValue::Full, actor, Intent::Start(Box::new(trial))).await?;
+        Ok((applied.action != "refused").then_some(applied))
+    }
+
+    /// [`Self::apply_scope`] for `intent`.
+    #[allow(clippy::too_many_lines)]
+    pub(super) async fn apply_scope_as(&self, value: ScopeValue, updated_by: &str, intent: Intent) -> Result<Applied, sqlx::Error> {
+        use super::trial::TrialState;
         let mut sets = self.scope.write_guard().await;
         let current = sets.public;
         let next = current.generation + 1;
         let cg = current.crawl_generation;
         let at = now();
         let noop = |action| Applied { action, mode: current.mode, generation: current.generation, spawn: None };
+        let carried = sets.trial.clone();
+        // The trial the change writes, and what becomes of its row.
+        let mut next_trial = carried.clone();
+        let mut value = value;
+        let mut trial_row: Option<&'static str> = None;
+        let mut drop_record = false;
+        match (&intent, carried.as_ref().map(|t| t.state)) {
+            (Intent::Start(t), _) => {
+                let settled = current.breadth == Breadth::Community
+                    && ((t.from == ScopeValue::Community && current.mode == PublicMode::On)
+                        || (t.from == ScopeValue::KryphocronOnly && current.mode == PublicMode::Off));
+                if carried.is_some() || !settled {
+                    return Ok(noop("refused"));
+                }
+                let mut t = (**t).clone();
+                t.start_last_fill_since = current.last_fill_since;
+                self.scope.trial_counters().reset();
+                value = ScopeValue::Full;
+                next_trial = Some(t);
+            }
+            (Intent::End { cause }, Some(TrialState::Running)) => {
+                if let Some(t) = next_trial.as_mut() {
+                    t.state = TrialState::Ending;
+                    t.ended_by = Some((*cause).to_string());
+                    value = t.to;
+                }
+                trial_row = Some("ending");
+            }
+            (Intent::End { .. }, _) => return Ok(noop("no_op")),
+            (Intent::Command, Some(TrialState::Running)) if value == ScopeValue::Full => {
+                // Full for real: the trial leaves the transition and the
+                // record is dropped; the trial's skipped accounts are
+                // crawled as full says.
+                let id = carried.as_ref().map_or(0, |t| t.id);
+                let mut tx = self.pool.begin().await?;
+                sqlx::query("UPDATE worker_state SET value = value - 'trial', updated_at = now() WHERE key = $1")
+                    .bind(TRANSITION_KEY)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+                sqlx::query("UPDATE full_crawl SET state = 'pending', reason = NULL WHERE state = 'skipped' AND reason = 'trial'")
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE full_trials SET state = 'kept', ended_at = now(), ended_by = 'kept' WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                self.scope.set_trial(&mut sets, None);
+                drop(sets);
+                self.trial_gauges().await;
+                tracing::info!(event = "full_trial_kept", id, updated_by, "the full trial became full for real");
+                return Ok(noop("kept"));
+            }
+            (Intent::Command, Some(TrialState::Running)) => {
+                if let Some(t) = next_trial.as_mut() {
+                    t.state = TrialState::Ending;
+                    t.ended_by = Some(if value == t.from { "manual" } else { "switch" }.to_string());
+                    t.to = value;
+                }
+                trial_row = Some("ending");
+            }
+            (Intent::Command, Some(TrialState::Ending)) => {
+                if value == ScopeValue::Full {
+                    // A narrowing stops at once, so its record goes now; a
+                    // drain runs to its end, which drops it.
+                    if current.mode != PublicMode::Draining {
+                        next_trial = None;
+                        drop_record = true;
+                        trial_row = Some("kept");
+                    }
+                } else if let Some(t) = next_trial.as_mut() {
+                    t.to = value;
+                }
+            }
+            (Intent::Command, Some(TrialState::Checking)) => {
+                next_trial = None;
+                drop_record = true;
+                trial_row = Some("superseded");
+            }
+            (Intent::Command, Some(TrialState::Failed) | None) => {}
+        }
         if current.mode == PublicMode::Draining {
             // Set or clear `pending` (§8.1); nothing else changes. A
             // literal, so the JSON null is never an SQL NULL.
@@ -1096,7 +1313,7 @@ impl PublicIndexing {
         let full_on = || Transition::settled(Phase::On, next, at, Some(at)).in_breadth(Breadth::Full, cg);
         let fresh_full_fill = |crawl_generation: u64| Transition::filling(next, at).in_breadth(Breadth::Full, crawl_generation);
         let mut tx = self.pool.begin().await?;
-        let change = match (current.mode, current.breadth, value) {
+        let mut change = match (current.mode, current.breadth, value) {
             // Narrowing takes no `pending`: a switch stops it.
             (_, Breadth::Narrowing, ScopeValue::Community) => return Ok(noop("no_op")),
             (_, Breadth::Narrowing, ScopeValue::KryphocronOnly) => draining(SweepList::Full, cg),
@@ -1147,6 +1364,14 @@ impl PublicIndexing {
             | (PublicMode::Off, _, ScopeValue::KryphocronOnly) => return Ok(noop("no_op")),
             (PublicMode::Draining, _, _) => unreachable!("handled above"),
         };
+        // A trial's exit sweeps with the trial's lists.
+        if next_trial.as_ref().is_some_and(|t| t.state == TrialState::Ending)
+            && let Some(sweep) = change.sweep.as_mut()
+        {
+            sweep.list = sweep.list.for_trial();
+            sweep.table = sweep.list.first_table().to_string();
+        }
+        change.trial = self.with_counters(next_trial.clone());
         sqlx::query(
             "INSERT INTO operator_settings (key, value, updated_by) VALUES ($1, $2, $3) \
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()",
@@ -1157,6 +1382,19 @@ impl PublicIndexing {
         .execute(&mut *tx)
         .await?;
         upsert_transition(&mut tx, &change).await?;
+        if drop_record {
+            sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+        }
+        if let (Some(state), Some(t)) = (trial_row, carried.as_ref()) {
+            let ended_by = next_trial.as_ref().and_then(|n| n.ended_by.clone()).unwrap_or_else(|| state.to_string());
+            sqlx::query("UPDATE full_trials SET state = $2, \"to\" = $3, ended_at = now(), ended_by = $4 WHERE id = $1")
+                .bind(t.id)
+                .bind(state)
+                .bind(next_trial.as_ref().map_or(t.to, |n| n.to).as_str())
+                .bind(ended_by)
+                .execute(&mut *tx)
+                .await?;
+        }
         // Entering full: the excluded accounts are read again, since a
         // narrowing may have removed rows the set still holds.
         let excluded = if change.breadth == Breadth::Full && current.breadth != Breadth::Full {
@@ -1179,7 +1417,9 @@ impl PublicIndexing {
             _ => "no_op",
         };
         self.set_state(&mut sets, state);
+        self.scope.set_trial(&mut sets, change.trial.clone());
         drop(sets);
+        self.trial_gauges().await;
         tracing::info!(
             event = "public_scope_applied",
             value = value.as_str(),
@@ -1189,10 +1429,20 @@ impl PublicIndexing {
             breadth = state.breadth.as_str(),
             generation = next,
             crawl_generation = state.crawl_generation,
+            trial = change.trial.as_ref().map(|t| t.state.as_str()),
             updated_by,
             "public indexing phase changed"
         );
         Ok(Applied { action, mode: state.mode, generation: next, spawn })
+    }
+
+    /// The trial with the in-memory counters, for a phase change's write.
+    pub(super) fn with_counters(&self, trial: Option<super::trial::Trial>) -> Option<super::trial::Trial> {
+        trial.map(|mut t| {
+            let stamp = t.counters.get("checked_at").and_then(parse_ts);
+            t.counters = self.scope.trial_counters().to_json(stamp);
+            t
+        })
     }
 
     /// `admin indexing status` and the health block (§10): the row, the
@@ -1262,8 +1512,11 @@ impl PublicIndexing {
             let sets = self.scope.read_guard().await;
             (sets.full.excluded.len(), sets.full.excluded.bytes())
         };
+        let trial = self.trial_status().await?;
         Ok(json!({
             "value": value,
+            "trial": trial,
+            "file_note": p.file_note,
             "mode": mode.as_str(),
             "breadth": self.breadth().as_str(),
             "relays": relays,
@@ -1301,7 +1554,7 @@ impl PublicIndexing {
         let _ = step;
     }
 
-    fn trace_spawn(&self, kind: &'static str) {
+    pub(super) fn trace_spawn(&self, kind: &'static str) {
         #[cfg(test)]
         self.hooks.spawned.lock().expect("hooks").push(kind);
         #[cfg(not(test))]
@@ -1415,6 +1668,12 @@ pub(super) mod hooks {
         /// SQLSTATEs raised, one per batch, at the start of the next ones.
         pub inject: Mutex<VecDeque<&'static str>>,
         pauses: Mutex<HashMap<&'static str, Pause>>,
+        /// The database volume's `(free, total)` bytes a trial reads.
+        pub volume: Mutex<Option<(u64, u64)>>,
+        /// The trial's bounds checker panics once.
+        pub checker_panics: std::sync::atomic::AtomicBool,
+        /// The trial's bounds checker looks at nothing.
+        pub checker_stopped: std::sync::atomic::AtomicBool,
     }
 
     /// `(reached, resume)`.

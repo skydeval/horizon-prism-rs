@@ -79,6 +79,9 @@ pub struct ScopeSets {
     /// What full indexing admits: the enabled groups, and the accounts
     /// excluded after their Refract restoration ended.
     pub full: FullSets,
+    /// A full trial riding the transition, as stored. Set only under the
+    /// write guard, through [`ScopeState::set_trial`].
+    pub trial: Option<crate::indexing::trial::Trial>,
 }
 
 /// Full indexing's admission inputs.
@@ -197,7 +200,26 @@ impl ScopeSets {
     /// writes, so it reads today's sources. While narrowing, never.
     #[must_use]
     pub fn own_repo_local(&self, did: &str) -> bool {
-        self.public.mode.is_on() && self.public.breadth != Breadth::Narrowing && self.in_scope(did)
+        self.public.mode.is_on() && (self.public.breadth != Breadth::Narrowing || self.trial_exit()) && self.in_scope(did)
+    }
+
+    /// A trial's narrowing: it never changes S's rows, so S reads local as
+    /// in community.
+    #[must_use]
+    pub fn trial_exit(&self) -> bool {
+        self.trial.as_ref().is_some_and(|t| t.state == crate::indexing::trial::TrialState::Ending)
+    }
+
+    /// The start mode's admission view while a trial records: in breadth
+    /// Full, with the trial running.
+    #[must_use]
+    pub fn recording(&self) -> Option<crate::indexing::trial::Recording> {
+        let t = self.trial.as_ref().filter(|t| t.state == crate::indexing::trial::TrialState::Running)?;
+        if self.public.breadth != Breadth::Full {
+            return None;
+        }
+        let (mode, breadth) = t.start_view();
+        Some(crate::indexing::trial::Recording { mode, breadth, from: t.from })
     }
 
     /// The own-repo rule for a stored handle: local for S and the members
@@ -205,7 +227,7 @@ impl ScopeSets {
     /// account would need a crawl mark, so it reads today's source.
     #[must_use]
     pub fn own_handle_local(&self, did: &str) -> bool {
-        self.public.breadth != Breadth::Narrowing && (self.in_scope(did) || self.is_member(did))
+        (self.public.breadth != Breadth::Narrowing || self.trial_exit()) && (self.in_scope(did) || self.is_member(did))
     }
 
     #[must_use]
@@ -268,6 +290,10 @@ pub struct ScopeState {
     public_mirror: Arc<AtomicU8>,
     /// `ScopeSets.public.breadth`, likewise.
     breadth_mirror: Arc<AtomicU8>,
+    /// Whether a trial's exit runs, likewise.
+    trial_exit_mirror: Arc<std::sync::atomic::AtomicBool>,
+    /// A full trial's counters, which writers add to.
+    trial_counters: Arc<crate::indexing::trial::TrialCounters>,
 }
 
 impl ScopeState {
@@ -283,6 +309,8 @@ impl ScopeState {
             touched: Arc::default(),
             public_mirror: Arc::new(mirror),
             breadth_mirror: Arc::new(breadth),
+            trial_exit_mirror: Arc::default(),
+            trial_counters: Arc::default(),
         }
     }
 
@@ -331,6 +359,19 @@ impl ScopeState {
         self.breadth_mirror.store(public.breadth.as_u8(), Ordering::Release);
     }
 
+    /// Set the trial and its mirror. `sets` is the write guard the caller
+    /// holds.
+    pub fn set_trial(&self, sets: &mut ScopeSets, trial: Option<crate::indexing::trial::Trial>) {
+        sets.trial = trial;
+        self.trial_exit_mirror.store(sets.trial_exit(), Ordering::Release);
+    }
+
+    /// A full trial's counters.
+    #[must_use]
+    pub fn trial_counters(&self) -> Arc<crate::indexing::trial::TrialCounters> {
+        Arc::clone(&self.trial_counters)
+    }
+
     /// The public-indexing mode, read from the mirror without the guard.
     #[must_use]
     pub fn public_mode(&self) -> PublicMode {
@@ -371,7 +412,7 @@ impl ScopeState {
     /// from the mirrors without the guard.
     #[must_use]
     pub fn public_reads_local(&self) -> bool {
-        self.public_mode().is_on() && self.public_breadth() != Breadth::Narrowing
+        self.public_mode().is_on() && (self.public_breadth() != Breadth::Narrowing || self.trial_exit_mirror.load(Ordering::Acquire))
     }
 
     /// The public-indexing breadth, read from the mirror without the guard.
@@ -505,6 +546,7 @@ impl ScopeState {
         let mut sets = self.write_guard().await;
         fresh.public = sets.public;
         fresh.full = sets.full.clone();
+        fresh.trial = sets.trial.clone();
         fresh.restored = Arc::clone(&sets.restored);
         fresh.candidates = std::mem::take(&mut sets.candidates);
         fresh.refract_hidden = Arc::clone(&sets.refract_hidden);
@@ -574,6 +616,7 @@ async fn load_sets(pool: &PgPool, private: &dyn PrivateTier) -> Result<ScopeSets
         candidates: HashMap::new(),
         refract_hidden: Arc::default(),
         full: FullSets::default(),
+        trial: None,
     };
     // Members are always in S (reason bit 1), even before a rebuild wrote it.
     let members: Vec<String> = sets.members.iter().cloned().collect();

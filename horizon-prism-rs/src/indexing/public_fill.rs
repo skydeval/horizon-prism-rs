@@ -204,15 +204,33 @@ impl PublicIndexing {
         let next = generation + 1;
         let last_fill_since = sets.public.last_fill_since;
         let (breadth, crawl_generation) = (sets.public.breadth, sets.public.crawl_generation);
-        let t = Transition::settled(Phase::On, next, now(), last_fill_since).in_breadth(breadth, crawl_generation);
+        let mut t = Transition::settled(Phase::On, next, now(), last_fill_since).in_breadth(breadth, crawl_generation);
+        // A trial's exit that refilled S: the check runs now.
+        let mut trial = sets.trial.clone();
+        let check = match trial.as_mut() {
+            Some(tr) if tr.state == super::trial::TrialState::Ending && breadth != Breadth::Full => {
+                tr.state = super::trial::TrialState::Checking;
+                tr.check = serde_json::json!({});
+                true
+            }
+            _ => false,
+        };
+        t.trial = self.with_counters(trial);
         let mut tx = self.pool.begin().await?;
         if !replace_if(&mut tx, Phase::Filling, generation, &t).await? {
             Self::superseded("checker", generation);
             return Ok(());
         }
+        if let Some(tr) = t.trial.as_ref().filter(|_| check) {
+            sqlx::query("UPDATE full_trials SET state = 'checking' WHERE id = $1").bind(tr.id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         self.set_state(&mut sets, PublicState { mode: PublicMode::On, generation: next, last_fill_since, breadth, crawl_generation });
+        self.scope.set_trial(&mut sets, t.trial.clone());
         drop(sets);
+        if check {
+            drop(self.spawn_trial_check());
+        }
         tracing::info!(event = "public_fill_done", generation = next, repair_secs = started.elapsed().as_secs_f64(), "public indexing is on");
         Ok(())
     }

@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 
 use super::public_mode::{
-    Breadth, Phase, PublicIndexing, ScopeValue, SweepList, SweepState, Transition, g64, now, parse_ts, replace_if, rfc3339,
+    Breadth, Phase, PublicIndexing, PublicMode, ScopeValue, SweepList, SweepState, Transition, g64, now, parse_ts, replace_if, rfc3339,
     spawn_of, state_of,
 };
+use super::trial::TrialState;
 use crate::db::retention::BATCH_PAUSE;
 
 /// `public_sweep_deleted_rows_total{table}`.
@@ -198,10 +199,9 @@ pub fn valid_state(v: &Value) -> Option<SweepState> {
     let step = match list {
         SweepList::Today => false,
         SweepList::Full => super::narrowing::FULL_DRAIN_STEP_NAMES.contains(&name),
-        SweepList::Narrowing => {
-            if !super::narrowing::STEP_NAMES.contains(&name) {
-                return None;
-            }
+        SweepList::TrialFull => super::narrowing::TRIAL_FULL_DRAIN_STEP_NAMES.contains(&name),
+        SweepList::Narrowing | SweepList::TrialNarrowing => {
+            super::narrowing::step_index(list, name)?;
             true
         }
     };
@@ -328,6 +328,7 @@ impl PublicIndexing {
             let next = match (TABLES.get(table + 1), list) {
                 (Some(next), _) => next.name,
                 (None, SweepList::Full) => super::narrowing::FULL_DRAIN_STEP_NAMES[0],
+                (None, SweepList::TrialFull) => super::narrowing::TRIAL_FULL_DRAIN_STEP_NAMES[0],
                 (None, _) => return Ok(Batch::SweepDone),
             };
             let sweep = SweepState { table: next.to_string(), after: Value::Null, last_advanced_at: now(), list };
@@ -500,15 +501,45 @@ impl PublicIndexing {
         let next = generation + 1;
         let at = now();
         let cg = sets.public.crawl_generation;
-        let (t, value) = if phase == Phase::Narrowing {
-            (Transition::filling(next, at).in_breadth(Breadth::Community, cg), None)
+        // A trial's exit: its narrowing from On, Full ends without a refill,
+        // and every exit that does not refill puts `last_fill_since` back.
+        let mut trial = sets.trial.clone();
+        let ending = trial.as_ref().filter(|t| t.state == TrialState::Ending).map(|t| t.start_last_fill_since);
+        let mut kept = false;
+        let (mut t, value) = if phase == Phase::Narrowing {
+            match ending {
+                Some(since) if sets.public.mode == PublicMode::On => {
+                    (Transition::settled(Phase::On, next, at, since).in_breadth(Breadth::Community, cg), None)
+                }
+                _ => (Transition::filling(next, at).in_breadth(Breadth::Community, cg), None),
+            }
         } else if pending == json!(ScopeValue::Community.as_str()) {
+            if let Some(t) = trial.as_mut().filter(|t| t.state == TrialState::Ending) {
+                t.to = ScopeValue::Community;
+            }
             (Transition::filling(next, at).in_breadth(Breadth::Community, cg), Some(ScopeValue::Community))
         } else if pending == json!(ScopeValue::Full.as_str()) {
+            // Full for real after a trial's drain: its record goes now.
+            if ending.is_some() {
+                kept = true;
+                trial = None;
+            }
             (Transition::filling(next, at).in_breadth(Breadth::Full, cg), Some(ScopeValue::Full))
         } else {
-            (Transition::settled(Phase::Off, next, at, sets.public.last_fill_since).in_breadth(Breadth::Community, cg), None)
+            let since = ending.unwrap_or(sets.public.last_fill_since);
+            (Transition::settled(Phase::Off, next, at, since).in_breadth(Breadth::Community, cg), None)
         };
+        // The exit's settled phase: the check runs.
+        let mut check = false;
+        if let Some(tr) = trial.as_mut()
+            && tr.state == TrialState::Ending
+            && matches!(t.phase, Phase::On | Phase::Off)
+        {
+            tr.state = TrialState::Checking;
+            tr.check = json!({});
+            check = true;
+        }
+        t.trial = self.with_counters(trial);
         if !replace_if(&mut tx, phase, generation, &t).await? {
             Self::superseded("sweep", generation);
             return Ok(());
@@ -526,13 +557,24 @@ impl PublicIndexing {
         } else {
             None
         };
+        if let Some(old) = sets.trial.as_ref().filter(|_| kept) {
+            sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+            sqlx::query("UPDATE full_trials SET state = 'kept', ended_by = 'kept' WHERE id = $1").bind(old.id).execute(&mut *tx).await?;
+        }
+        if let Some(tr) = t.trial.as_ref().filter(|_| check) {
+            sqlx::query("UPDATE full_trials SET state = 'checking' WHERE id = $1").bind(tr.id).execute(&mut *tx).await?;
+        }
         tx.commit().await?;
         if let Some(dids) = excluded {
             sets.full.excluded.replace(dids.into_iter().collect());
         }
         let state = state_of(&t);
         self.set_state(&mut sets, state);
+        self.scope.set_trial(&mut sets, t.trial.clone());
         drop(sets);
+        if check {
+            drop(self.spawn_trial_check());
+        }
         tracing::info!(event = "public_sweep_done", list = list.as_str(), mode = state.mode.as_str(), breadth = state.breadth.as_str(), generation = next, "the sweep ended");
         if let Some(task) = spawn_of(&t) {
             drop(self.spawn(task));

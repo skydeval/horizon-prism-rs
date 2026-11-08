@@ -35,6 +35,8 @@ use crate::config::Secret32;
 
 /// `getMembership.features` while the feature is on, for every caller.
 pub const FEATURE: &str = "account.systemAccounts";
+/// The prefix every table of system accounts has.
+pub const TABLE_PREFIX: &str = "sysacct_";
 
 pub const GET_SYSTEM_ACCOUNTS: &str = "app.nearhorizon.account.getSystemAccounts";
 pub const ADD_SYSTEM_ACCOUNT: &str = "app.nearhorizon.account.addSystemAccount";

@@ -159,6 +159,30 @@ impl Default for FullConfig {
     }
 }
 
+/// `[full_trial]`: the defaults of a new full trial. Each can be given per
+/// trial; none of them refuses a start.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FullTrialConfig {
+    /// The trial ends this many hours after it starts (a fraction is
+    /// allowed).
+    pub hours: Float,
+    /// The trial ends when the database has grown by this many GB since the
+    /// baseline (a fraction is allowed).
+    pub max_added_gb: Float,
+    /// The trial ends when the database volume's free space falls under
+    /// this share.
+    pub end_below_free_percent: u32,
+    /// Crawl history during the trial; live only when false.
+    pub history: bool,
+}
+
+impl Default for FullTrialConfig {
+    fn default() -> Self {
+        Self { hours: Float(24.0), max_added_gb: Float(50.0), end_below_free_percent: 10, history: false }
+    }
+}
+
 /// `[indexing]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -2468,6 +2492,7 @@ pub struct FileConfig {
     pub metrics: MetricsConfig,
     pub indexing: IndexingConfig,
     pub full: FullConfig,
+    pub full_trial: FullTrialConfig,
     pub scope: ScopeConfig,
     pub community: CommunityConfig,
     pub firehose: FirehoseConfig,

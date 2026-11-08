@@ -332,7 +332,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The public-indexing switch (public-indexing design §3.5): its startup
     // sequence runs before the first writer (`purger.resume_all` below) and
     // hands back the one task the state needs, spawned here.
-    let public = PublicIndexing::new(pool.clone(), scope.clone(), PublicModeSettings::from_config(&cfg.file.indexing)).with_full_kinds(&cfg.file.full.kinds);
+    let public = PublicIndexing::new(pool.clone(), scope.clone(), PublicModeSettings::from_config(&cfg.file.indexing))
+        .with_full_kinds(&cfg.file.full.kinds)
+        .with_data_dir(&cfg.env.data_dir)
+        .with_trial_defaults(&cfg.file.full_trial);
     let public_task = public
         .startup(&cfg.file.indexing)
         .await
@@ -655,6 +658,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             budget_bytes: cfg.file.storage.budget_bytes,
             subscribed_max_per_member: cfg.file.lists.subscribed_max_per_member,
             subscribed_max_items: cfg.file.lists.subscribed_max_items,
+            trial: Some(public.clone()),
         }
         .spawn(),
     );

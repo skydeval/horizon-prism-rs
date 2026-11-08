@@ -758,11 +758,14 @@ struct MemoryEffects {
     owners_left: Vec<String>,
     /// A member's list-block references were derived again.
     list_references: bool,
+    /// A full trial's record entries, written before the commit.
+    trial: Vec<crate::indexing::trial::Entry>,
 }
 
 impl MemoryEffects {
     fn merge(&mut self, other: Self) {
         self.list_references |= other.list_references;
+        self.trial.extend(other.trial);
         self.growth_added.extend(other.growth_added);
         if other.new_member_follow.is_some() {
             self.new_member_follow = other.new_member_follow;
@@ -1138,6 +1141,11 @@ impl Writer {
                     GrowthPlan::default()
                 };
                 lock_dids.extend(plan.lock_dids());
+                // A full trial's sanity line: the full arm's decisions,
+                // counted apart from the record.
+                if a == Admission::Admit(AdmitRule::Full) && sets.recording().is_some() {
+                    self.scope.trial_counters().full_decision();
+                }
                 admissions.push(Some(a));
                 plans.push(plan);
             } else {
@@ -1291,6 +1299,14 @@ impl Writer {
             report.outcomes.push(outcome);
         }
 
+        // A full trial's record, in the transaction of the rows it names.
+        let entries = std::mem::take(&mut effects.trial);
+        #[cfg(test)]
+        let entries = if crate::test_support::hooks::injected_in(crate::test_support::hooks::TRIAL_RECORD_OFF, &self.pool, "*") { Vec::new() } else { entries };
+        if !entries.is_empty() {
+            crate::indexing::trial::insert_entries(&mut tx, &entries).await?;
+        }
+
         // §6.11.6: failed ops of a tracked repo or a kryphocron path.
         if options.dead_letter_readiness
             && !report.failed.is_empty()
@@ -1321,6 +1337,12 @@ impl Writer {
         }
         tx.commit().await?;
         drop(guard);
+        if !entries.is_empty() {
+            let counters = self.scope.trial_counters();
+            for e in &entries {
+                counters.recorded(e.tbl.name(), 1);
+            }
+        }
         self.commit_effects(effects).await;
         self.commit_copied(copied).await;
         if let Some(tap) = &self.feed {
@@ -1639,6 +1661,9 @@ impl Writer {
         let mut dids: Vec<String> = Vec::new();
         let mut uris: Vec<String> = Vec::new();
         let mut times: Vec<DateTime<Utc>> = Vec::new();
+        // A full trial's rows: reposters the start mode would not store.
+        let recording = sets.recording();
+        let mut trial_dids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for (did, rkey) in reposters {
             if !proto_blue::syntax::Did::is_valid(did) || !proto_blue::syntax::RecordKey::is_valid(rkey) {
                 continue;
@@ -1651,6 +1676,9 @@ impl Writer {
             };
             let uri = format!("at://{did}/{}/{rkey}", super::classifier::NSID_REPOST);
             if admit(&input, sets).is_admitted() && !uris.contains(&uri) {
+                if recording.as_ref().is_some_and(|r| !crate::aggregations::admit_as(&input, sets, r.mode, r.breadth).is_admitted()) {
+                    trial_dids.insert(did.clone());
+                }
                 dids.push(did.clone());
                 uris.push(uri);
                 times.push(crate::hydration::feed::tid_timestamp(rkey).map_or(now, |t| t.min(now)));
@@ -1692,11 +1720,11 @@ impl Writer {
         let mut tx = self.pool.begin().await?;
         lock_dids_shared(&mut tx, &dids).await?;
         lock_uris(&mut tx, &uris).await?;
-        let inserted = sqlx::query(
+        let inserted: Vec<(AccountId, i64)> = sqlx::query_as(
             "INSERT INTO reposts (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at) \
              SELECT a, k, $4, $5, $6, NULL, $7, c FROM unnest($1::int[], $2::bigint[], $3::timestamptz[]) AS t(a, k, c) \
              WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.author = t.a AND rt.coll = 3 AND rt.rkey = t.k) \
-             ON CONFLICT (author, rkey) DO NOTHING",
+             ON CONFLICT (author, rkey) DO NOTHING RETURNING author, rkey",
         )
         .bind(&authors)
         .bind(&keyed)
@@ -1705,12 +1733,24 @@ impl Writer {
         .bind(subj_coll)
         .bind(subj_rkey)
         .bind(rev_value(SENTINEL_REV))
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
+        .fetch_all(&mut *tx)
+        .await?;
+        let trial_ids: std::collections::HashSet<AccountId> = trial_dids.iter().filter_map(|d| accounts.get(d).copied()).collect();
+        let entries: Vec<crate::indexing::trial::Entry> = inserted
+            .iter()
+            .filter(|(a, _)| trial_ids.contains(a))
+            .map(|(a, k)| crate::indexing::trial::Entry {
+                s: Some((subj_author, Some(subj_rkey))).filter(|_| subj_coll == COLL_POST),
+                ..crate::indexing::trial::Entry::new(crate::indexing::trial::TrialTable::Reposts, *a, *k, 0)
+            })
+            .collect();
+        crate::indexing::trial::insert_entries(&mut tx, &entries).await?;
         tx.commit().await?;
         drop(guard);
-        Ok(inserted)
+        if !entries.is_empty() {
+            self.scope.trial_counters().recorded(crate::indexing::trial::TrialTable::Reposts.name(), u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        }
+        Ok(u64::try_from(inserted.len()).unwrap_or(u64::MAX))
     }
 
     /// Run one op in savepoints until it succeeds, fails transiently (abort)
@@ -1895,6 +1935,12 @@ impl Writer {
         let live = options.live;
         let mut eff = MemoryEffects::default();
         let author = u.input.author.as_str();
+        // A full trial's shadow admission: what the start mode would decide.
+        // A row it would not store is a trial row: recorded, and quiet.
+        let recording = sets.recording();
+        let shadow = recording.as_ref().map(|r| crate::aggregations::admit_as(&u.input, sets, r.mode, r.breadth));
+        let trial_row = shadow.is_some_and(|a| !matches!(a, Admission::Admit(rule) if rule != AdmitRule::PublicRootGate));
+        let grow_only_shadow = shadow == Some(Admission::GrowOnly);
         if matches!(u.body, Body::Private | Body::PrivateGate) {
             let op = self.private_op(u, rev, options);
             let applied = if u.body == Body::PrivateGate {
@@ -1986,9 +2032,20 @@ impl Writer {
             metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
             return Ok((unchanged, eff));
         }
+        if trial_row {
+            eff.trial.extend(trial_entries(u, ids, rev));
+        } else if recording.is_some()
+            && let Some(table) = trial_table_name(&u.body)
+        {
+            self.scope.trial_counters().start_write(table);
+        }
         // A public record naming a private post notifies privately, in
         // every mode, outside the `notify` flag below (private posting §4.8).
-        if let Some(n) = self.public_notify(u, options) {
+        // A trial row sends the private tier only what the start mode
+        // would: a member's post it would grow only.
+        if (!trial_row || grow_only_shadow)
+            && let Some(n) = self.public_notify(u, options)
+        {
             self.private.notify_public(conn, &n).await?;
         }
         // Under the off rule nothing notifies and no feed item is written
@@ -1997,7 +2054,7 @@ impl Writer {
         let off = sets.public.mode.off_rule();
         let before_fill = options.source == WriteSource::Backfill
             && sets.public.last_fill_since.is_some_and(|since| u.created_at < since);
-        let notify = !off && !before_fill;
+        let notify = !off && !before_fill && !trial_row;
         if member_list_block {
             let list_after = list_block_target(conn, &u.uri).await?;
             for list in [&list_before, &list_after].into_iter().flatten() {
@@ -2008,17 +2065,25 @@ impl Writer {
         // Feed items only for public records whose author is in S, and for
         // a repost only of a post: an update that reposts anything else
         // takes the old item away.
+        // A trial records a feed item the start mode's rule would not write.
+        let start_feed = recording.as_ref().is_none_or(|r| !r.mode.off_rule() && sets.in_scope(author));
         if !off && (sets.in_scope(author) || full_feed(sets, &u.body)) {
             match (&u.body, ids) {
                 (Body::Post(p), Some(OpIds::Post(k))) => {
                     let kind = if p.reply_parent.is_some() { FEED_REPLY } else { FEED_POST };
                     let item = FeedItemRow { originator: k.author, is_repost: false, src_rkey: k.rkey, kind, post: (k.author, k.rkey) };
                     upsert_feed_item(conn, &item, p.created_at).await?;
+                    if !start_feed {
+                        eff.trial.push(crate::indexing::trial::Entry::new(crate::indexing::trial::TrialTable::FeedItems, k.author, k.rkey, 0));
+                    }
                 }
                 (Body::Repost(s), Some(OpIds::Subject(k))) => match k.subject {
                     StoredRef::Whole { author: post_author, coll: COLL_POST, rkey: post_rkey } => {
                         let item = FeedItemRow { originator: k.author, is_repost: true, src_rkey: k.rkey, kind: FEED_REPOST, post: (post_author, post_rkey) };
                         upsert_feed_item(conn, &item, s.created_at).await?;
+                        if !start_feed {
+                            eff.trial.push(crate::indexing::trial::Entry::new(crate::indexing::trial::TrialTable::FeedItems, k.author, k.rkey, 1));
+                        }
                     }
                     _ => {
                         sqlx::query("DELETE FROM feed_items WHERE originator = $1 AND is_repost AND src_rkey = $2")
@@ -2252,8 +2317,20 @@ impl Writer {
         // In full, every public delete of an enabled group, so the crawl
         // never writes back a record deleted since its CAR.
         let full = sets.public.breadth == crate::indexing::Breadth::Full && d.kind.full_group().is_some_and(|g| sets.full.kinds.contains(&g));
-        if removed || author_in_scope || in_r_or_candidate || plural || full || (d.kind == RecordKind::Follow && sets.is_tracked(repo)) {
+        let start_reasons = author_in_scope || in_r_or_candidate || plural || (d.kind == RecordKind::Follow && sets.is_tracked(repo));
+        if removed || start_reasons || full {
+            // A full trial records a tombstone the start mode would not
+            // have written: none of its reasons, and no row removed but
+            // one the trial recorded.
+            let record = if sets.recording().is_some() && !start_reasons && (!removed || removed_row_recorded(conn, d.kind, &d.uri).await?) {
+                new_tombstone_key(conn, &d.uri).await?
+            } else {
+                None
+            };
             tombstones::put(&mut *conn, &d.uri, rev, Put::Highest).await?;
+            if let Some((a, rkey, coll)) = record {
+                eff.trial.push(crate::indexing::trial::Entry::new(crate::indexing::trial::TrialTable::RecordTombstones, a, rkey, coll));
+            }
         }
         // The URI's feed items and notifications go with the record, unless
         // a newer record lives at the URI: they are its own then, and a late
@@ -2445,6 +2522,98 @@ fn full_feed(sets: &ScopeSets, body: &Body) -> bool {
         _ => return false,
     };
     sets.public.breadth == crate::indexing::Breadth::Full && sets.full.kinds.contains(&group)
+}
+
+/// The record table of an upsert's body, by name.
+fn trial_table_name(body: &Body) -> Option<&'static str> {
+    use crate::indexing::trial::TrialTable as T;
+    Some(match body {
+        Body::Post(_) => T::Posts.name(),
+        Body::Like(_) => T::Likes.name(),
+        Body::Repost(_) => T::Reposts.name(),
+        Body::Follow(_) => T::Follows.name(),
+        Body::Block(_) => T::Blocks.name(),
+        Body::Profile(_) => T::Actors.name(),
+        Body::Row(row) => T::of_table(row.table)?.name(),
+        Body::Private | Body::PrivateGate => return None,
+    })
+}
+
+/// A trial row's record entries, from the ids it was written with: its
+/// key, and the posts or account whose counts it moved.
+fn trial_entries(u: &Upsert, ids: Option<&OpIds>, rev: &str) -> Vec<crate::indexing::trial::Entry> {
+    use crate::indexing::trial::{Entry, TrialTable as T};
+    let post = |r: &Option<StoredRef>| match r {
+        Some(StoredRef::Whole { author, coll: COLL_POST, rkey }) => Some((*author, *rkey)),
+        _ => None,
+    };
+    let entry = match (&u.body, ids) {
+        (Body::Post(_), Some(OpIds::Post(k))) => Entry { s: post(&k.parent).map(|(a, r)| (a, Some(r))), q: post(&k.quote), ..Entry::new(T::Posts, k.author, k.rkey, 0) },
+        (Body::Like(_) | Body::Repost(_), Some(OpIds::Subject(k))) => {
+            let tbl = if matches!(u.body, Body::Like(_)) { T::Likes } else { T::Reposts };
+            Entry { s: post(&Some(k.subject.clone())).map(|(a, r)| (a, Some(r))), ..Entry::new(tbl, k.author, k.rkey, 0) }
+        }
+        (Body::Follow(_), Some(OpIds::Graph(g))) => Entry { s: Some((g.subject, None)), ..Entry::new(T::Follows, g.author, g.rkey, 0) },
+        (Body::Block(_), Some(OpIds::Graph(g))) => Entry::new(T::Blocks, g.author, g.rkey, 0),
+        (Body::Profile(_), Some(OpIds::Profile(p))) => Entry { rev: Some(rev_value(rev)), ..Entry::new(T::Actors, p.author, 0, 0) },
+        (Body::Row(row), Some(OpIds::Row(r))) => {
+            let Some(tbl) = T::of_table(row.table) else {
+                return Vec::new();
+            };
+            match row.layout {
+                Layout::Keyed { key: RowKey::Author, .. } => Entry::new(tbl, r.author, 0, 0),
+                Layout::Keyed { key: RowKey::Coll, .. } => Entry::new(tbl, r.author, 0, i16::try_from(r.key).unwrap_or(0)),
+                Layout::Keyed { key: RowKey::Rkey, .. } => Entry::new(tbl, r.author, r.key, 0),
+                Layout::ByUri { .. } => return Vec::new(),
+            }
+        }
+        _ => return Vec::new(),
+    };
+    vec![entry]
+}
+
+/// Whether the row a delete removed is in a full trial's record.
+async fn removed_row_recorded(conn: &mut PgConnection, kind: RecordKind, uri: &str) -> Result<bool, sqlx::Error> {
+    use crate::indexing::trial::TrialTable as T;
+    let (tbl, b, c) = match kind {
+        RecordKind::Post => (T::Posts, "k.rkey", "0"),
+        RecordKind::Like => (T::Likes, "k.rkey", "0"),
+        RecordKind::Repost => (T::Reposts, "k.rkey", "0"),
+        RecordKind::Follow => (T::Follows, "k.rkey", "0"),
+        RecordKind::Block => (T::Blocks, "k.rkey", "0"),
+        RecordKind::Profile => (T::Actors, "0", "0"),
+        RecordKind::Table("labeler_services") => (T::LabelerServices, "0", "0"),
+        RecordKind::Table("actor_self_records") => (T::ActorSelfRecords, "0", "k.coll"),
+        RecordKind::Table(t) => match T::of_table(t) {
+            Some(tbl) => (tbl, "k.rkey", "0"),
+            None => return Ok(false),
+        },
+        RecordKind::PublicRootGate => (T::Threadgates, "k.rkey", "0"),
+        RecordKind::PrivatePost | RecordKind::PrivateGate => return Ok(false),
+    };
+    sqlx::query_scalar(&format!(
+        "SELECT EXISTS (SELECT 1 FROM ref_of($1) k JOIN full_trial_rows r ON r.tbl = $2 AND r.a = k.author AND r.b = {b} AND r.c = {c})"
+    ))
+    .bind(uri)
+    .bind(tbl.code())
+    .fetch_one(conn)
+    .await
+}
+
+/// The key a tombstone of `uri` would have, when no tombstone has it yet.
+async fn new_tombstone_key(conn: &mut PgConnection, uri: &str) -> Result<Option<(i32, i64, i16)>, sqlx::Error> {
+    type Key = (Option<i32>, Option<i64>, Option<i16>, bool);
+    let key: Option<Key> = sqlx::query_as(
+        "SELECT k.author, k.rkey, k.coll, EXISTS (SELECT 1 FROM record_tombstones t WHERE t.author = k.author AND t.coll = k.coll AND t.rkey = k.rkey) \
+         FROM ref_of($1) k",
+    )
+    .bind(uri)
+    .fetch_optional(conn)
+    .await?;
+    Ok(match key {
+        Some((Some(a), Some(rkey), Some(coll), false)) => Some((a, rkey, coll)),
+        _ => None,
+    })
 }
 
 async fn tombstoned(conn: &mut PgConnection, uri: &str, rev: &str) -> Result<bool, sqlx::Error> {

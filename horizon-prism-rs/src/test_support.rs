@@ -274,6 +274,8 @@ pub mod hooks {
     /// The unguarded deletion marker: after the concurrent marker, before
     /// its row commits.
     pub const PURGE_AFTER_MARKER_MAP: &str = "full_purge_after_marker_map";
+    /// A full trial's record is not written. Key: `<database>/*`.
+    pub const TRIAL_RECORD_OFF: &str = "full_trial_record_off";
     /// S10, #722: a job's or catch-up's settle, before its transaction and
     /// the gap lock. Key: `<database>/<did>` ([`pause_in`]).
     pub const SETTLE_BEFORE_GAP_LOCK: &str = "s10_settle_before_gap_lock";

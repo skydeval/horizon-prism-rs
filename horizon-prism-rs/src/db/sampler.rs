@@ -241,6 +241,9 @@ pub struct StorageSampler {
     pub subscribed_max_per_member: u32,
     /// `lists.subscribed_max_items`, for `list_subscription_rows_bound`.
     pub subscribed_max_items: u32,
+    /// The public-indexing switch, whose running full trial's bounds every
+    /// database sample also tests.
+    pub trial: Option<crate::indexing::PublicIndexing>,
 }
 
 impl StorageSampler {
@@ -256,6 +259,12 @@ impl StorageSampler {
                 metrics::counter!(METRIC_SAMPLE_ERRORS, "source" => "postgres").increment(1);
                 tracing::warn!(event = "storage_sample_failed", source = "postgres", %error, "storage sample failed");
             }
+        }
+        // A full trial's bounds: the second path that ends it.
+        if let Some(public) = &self.trial
+            && let Err(error) = public.check_trial_bounds("sampler").await
+        {
+            tracing::warn!(event = "full_trial_check_failed", %error, "the storage sampler could not test the trial's bounds");
         }
         // Rule 4's row counts (design-v3 §14.2).
         match gauges::sample(&self.pool).await {

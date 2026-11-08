@@ -22,7 +22,7 @@ pub mod purge;
 pub mod rebuild;
 pub mod scope_state;
 
-pub use admit::{Admission, AdmissionInput, AdmitRule, RecordKind, RejectReason, admit};
+pub use admit::{Admission, AdmissionInput, AdmitRule, RecordKind, RejectReason, admit, admit_as};
 pub use growth::GrowthPlan;
 pub use policy::{REASON_FOLLOWED, REASON_INTERACTED, REASON_MEMBER, REASON_SUBSCRIBED, in_index_scope};
 pub use purge::{MarkerGuard, MarkerOutcome, PurgeLifecycle, Purger};

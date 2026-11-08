@@ -172,7 +172,20 @@ impl Admission {
 /// admission-checked (§5.5).
 #[must_use]
 pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
-    let decision = admit_by_rules(input, sets);
+    admit_in(input, sets, (sets.public.mode, sets.public.breadth))
+}
+
+/// [`admit`] under another mode and breadth over the same sets: a full
+/// trial's shadow admission, which asks what the start mode would decide.
+#[must_use]
+pub fn admit_as(input: &AdmissionInput, sets: &ScopeSets, mode: crate::indexing::PublicMode, breadth: crate::indexing::Breadth) -> Admission {
+    admit_in(input, sets, (mode, breadth))
+}
+
+type View = (crate::indexing::PublicMode, crate::indexing::Breadth);
+
+fn admit_in(input: &AdmissionInput, sets: &ScopeSets, view: View) -> Admission {
+    let decision = admit_by_rules(input, sets, view);
     // Refract's restored-subject rule (refract-reposts design §1), in every
     // mode: it only widens what no other rule stores, and never overrides a
     // purge rejection.
@@ -186,7 +199,7 @@ pub fn admit(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     decision
 }
 
-fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
+fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets, view: View) -> Admission {
     // Purge-kind rejections (§6.11.7 table) come first.
     match sets.purge_kind(&input.author) {
         Some(PurgeKind::AccountDeleted) => {
@@ -218,7 +231,7 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
             kind: RecordKind::Table("threadgates"),
             ..input.clone()
         };
-        return match admit(&public, sets) {
+        return match admit_in(&public, sets, view) {
             admitted @ Admission::Admit(_) => admitted,
             _ => Admission::Admit(AdmitRule::PublicRootGate),
         };
@@ -229,7 +242,7 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
         return decision;
     }
     // The off rule, in the off modes only (public-indexing design §5).
-    if sets.public.mode.off_rule()
+    if view.0.off_rule()
         && let Some(decision) = off_rule(input, sets)
     {
         return decision;
@@ -266,7 +279,7 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     // Rule 1's full arm: after S, Refract and the member rules; never a
     // private kind; an account whose Refract restoration ended stays out.
     // The copy's tier and the account's status are checked by the writer.
-    if sets.public.breadth == crate::indexing::Breadth::Full
+    if view.1 == crate::indexing::Breadth::Full
         && !input.kind.is_private()
         && input.kind.full_group().is_some_and(|g| sets.full.kinds.contains(&g))
         && !sets.full.excluded.contains(&input.author)

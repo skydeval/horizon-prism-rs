@@ -17,7 +17,7 @@ pub use crate::admin::operators::Actor;
 use crate::admin::settings::live::is_live;
 pub use crate::admin::settings::store::Change;
 use crate::admin::settings::{LiveSettings, LiveValues, RestartHandle, store};
-use crate::config::EnvConfig;
+use crate::config::{EnvConfig, Float};
 
 use crate::aggregations::membership::{self, AddOutcome, Denial, add_member, is_denied};
 use crate::aggregations::purge::PurgeError;
@@ -74,6 +74,21 @@ pub enum AdminCommand {
     IndexingPublicScope { value: ScopeValue },
     /// `indexing status`: the switch's row, mode, phase and progress.
     IndexingStatus,
+    /// `indexing full-trial start`: full indexing for a bounded time, with
+    /// a record of what it added; unset bounds take `[full_trial]`'s.
+    FullTrialStart { hours: Option<Float>, max_added_gb: Option<Float>, end_below_free_percent: Option<u32>, history: bool },
+    /// `indexing full-trial end`: end a running trial now.
+    FullTrialEnd,
+    /// `indexing full-trial keep`: keep full for real; the record goes.
+    FullTrialKeep,
+    /// `indexing full-trial bounds`: change a running trial's bounds.
+    FullTrialBounds { hours: Option<Float>, max_added_gb: Option<Float>, end_below_free_percent: Option<u32> },
+    /// `indexing full-trial check`: run a failed trial's check again.
+    FullTrialCheck,
+    /// `indexing full-trial dismiss`: drop a failed trial's record.
+    FullTrialDismiss,
+    /// `indexing full-trial status`: the trial and the last result.
+    FullTrialStatus,
     /// `firehose forget-cap <label>`: forget a relay's remembered
     /// capability, so a downgraded unfiltered relay reader counts as whole
     /// again.
@@ -146,6 +161,19 @@ impl AdminCommand {
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
             Self::IndexingPublicScope { value } => ("indexing public-scope", json!({ "value": value.as_str() })),
             Self::IndexingStatus => ("indexing status", json!({})),
+            Self::FullTrialStart { hours, max_added_gb, end_below_free_percent, history } => (
+                "indexing full-trial start",
+                json!({ "hours": hours.map(|h| h.0), "max_added_gb": max_added_gb.map(|g| g.0), "end_below_free_percent": end_below_free_percent, "history": history }),
+            ),
+            Self::FullTrialEnd => ("indexing full-trial end", json!({})),
+            Self::FullTrialKeep => ("indexing full-trial keep", json!({})),
+            Self::FullTrialBounds { hours, max_added_gb, end_below_free_percent } => (
+                "indexing full-trial bounds",
+                json!({ "hours": hours.map(|h| h.0), "max_added_gb": max_added_gb.map(|g| g.0), "end_below_free_percent": end_below_free_percent }),
+            ),
+            Self::FullTrialCheck => ("indexing full-trial check", json!({})),
+            Self::FullTrialDismiss => ("indexing full-trial dismiss", json!({})),
+            Self::FullTrialStatus => ("indexing full-trial status", json!({})),
             Self::FirehoseForgetCap { label } => ("firehose forget-cap", json!({ "label": label })),
             Self::OperatorAdd { input, note, add_host } => {
                 ("operator add", json!({ "input": input, "note": note, "add_host": add_host }))
@@ -260,6 +288,37 @@ impl AdminCommand {
                 }
             }
             "indexing status" => Self::IndexingStatus,
+            "indexing full-trial start" | "indexing full-trial bounds" => {
+                let n = |k: &str| -> Result<Option<u32>, InvalidCommand> {
+                    match args.get(k) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(v) => v.as_u64().and_then(|n| u32::try_from(n).ok()).map(Some).ok_or_else(|| InvalidCommand(format!("{command}: {k} must be a whole number"))),
+                    }
+                };
+                let f = |k: &str| -> Result<Option<Float>, InvalidCommand> {
+                    match args.get(k) {
+                        None | Some(Value::Null) => Ok(None),
+                        Some(v) => v.as_f64().filter(|x| x.is_finite() && *x >= 0.0).map(|x| Some(Float(x))).ok_or_else(|| InvalidCommand(format!("{command}: {k} must be a number of at least 0"))),
+                    }
+                };
+                let (hours, max_added_gb, end_below_free_percent) = (f("hours")?, f("max_added_gb")?, n("end_below_free_percent")?);
+                if hours.is_some_and(|h| h.0 <= 0.0) {
+                    return Err(InvalidCommand(format!("{command}: hours must be more than 0")));
+                }
+                if end_below_free_percent.is_some_and(|p| p > 100) {
+                    return Err(InvalidCommand(format!("{command}: end_below_free_percent is a share of 0 to 100")));
+                }
+                if command == "indexing full-trial start" {
+                    Self::FullTrialStart { hours, max_added_gb, end_below_free_percent, history: args.get("history").and_then(Value::as_bool).unwrap_or(false) }
+                } else {
+                    Self::FullTrialBounds { hours, max_added_gb, end_below_free_percent }
+                }
+            }
+            "indexing full-trial end" => Self::FullTrialEnd,
+            "indexing full-trial keep" => Self::FullTrialKeep,
+            "indexing full-trial check" => Self::FullTrialCheck,
+            "indexing full-trial dismiss" => Self::FullTrialDismiss,
+            "indexing full-trial status" => Self::FullTrialStatus,
             "firehose forget-cap" => match args.get("label").and_then(Value::as_str) {
                 Some(l) if !l.is_empty() && l.len() <= 200 && !l.chars().any(char::is_whitespace) => Self::FirehoseForgetCap { label: l.to_string() },
                 _ => return Err(InvalidCommand(format!("{command}: label must be a relay label"))),
@@ -338,6 +397,13 @@ impl AdminCommand {
             | Self::FarsightStatus
             | Self::IndexingPublicScope { .. }
             | Self::IndexingStatus
+            | Self::FullTrialStart { .. }
+            | Self::FullTrialEnd
+            | Self::FullTrialKeep
+            | Self::FullTrialBounds { .. }
+            | Self::FullTrialCheck
+            | Self::FullTrialDismiss
+            | Self::FullTrialStatus
             | Self::FirehoseForgetCap { .. }
             | Self::OperatorAdd { .. }
             | Self::OperatorRemove { .. }
@@ -499,6 +565,36 @@ impl Handlers {
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
             AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value, actor).await,
             AdminCommand::IndexingStatus => self.public.status().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FullTrialStart { hours, max_added_gb, end_below_free_percent, history } => {
+                let d = self.public.trial_defaults();
+                let bounds = crate::indexing::trial::Bounds {
+                    hours: hours.map_or(d.hours, |h| h.0),
+                    max_added_gb: max_added_gb.map_or(d.max_added_gb, |g| g.0),
+                    end_below_free_percent: end_below_free_percent.unwrap_or(d.end_below_free_percent),
+                    history: *history,
+                };
+                match self.public.start_trial(bounds, actor.label()).await {
+                    Ok(s) => Ok(Outcome::Done(json!({
+                        "id": s.id,
+                        "from": s.from.as_str(),
+                        "ends_at": crate::indexing::public_mode::rfc3339(&s.ends_at),
+                        "action": s.action,
+                    }))),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            AdminCommand::FullTrialEnd => match self.public.end_trial("manual").await {
+                Ok(Some(applied)) => Ok(Outcome::Done(json!({ "action": applied.action, "mode": applied.mode.as_str() }))),
+                Ok(None) => Err("No trial is running.".to_string()),
+                Err(e) => Err(e.to_string()),
+            },
+            AdminCommand::FullTrialKeep => self.public.keep_trial(actor.label()).await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FullTrialBounds { hours, max_added_gb, end_below_free_percent } => {
+                self.public.trial_bounds(hours.map(|h| h.0), max_added_gb.map(|g| g.0), *end_below_free_percent).await.map(Outcome::Done).map_err(|e| e.to_string())
+            }
+            AdminCommand::FullTrialCheck => self.public.recheck_trial().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FullTrialDismiss => self.public.dismiss_trial().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FullTrialStatus => self.public.trial_status().await.map(Outcome::Done).map_err(|e| e.to_string()),
             AdminCommand::FirehoseForgetCap { label } => self.firehose_forget_cap(label).await,
             AdminCommand::OperatorAdd { input, note, add_host } => self.operator_add(input, note.as_deref(), *add_host, actor).await,
             AdminCommand::OperatorRemove { did } => settled(operators::remove(&self.pool, did).await),
@@ -1164,11 +1260,20 @@ mod tests {
             AdminCommand::IndexingPublicScope { value: ScopeValue::Community },
             AdminCommand::IndexingPublicScope { value: ScopeValue::Full },
             AdminCommand::IndexingStatus,
+            AdminCommand::FullTrialStart { hours: Some(Float(0.5)), max_added_gb: None, end_below_free_percent: Some(5), history: false },
+            AdminCommand::FullTrialEnd,
+            AdminCommand::FullTrialKeep,
+            AdminCommand::FullTrialBounds { hours: None, max_added_gb: Some(Float(0.2)), end_below_free_percent: None },
+            AdminCommand::FullTrialCheck,
+            AdminCommand::FullTrialDismiss,
+            AdminCommand::FullTrialStatus,
         ] {
             let (name, args) = cmd.to_row();
             assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
             assert_eq!(cmd.did(), None);
         }
+        assert!(AdminCommand::parse("indexing full-trial start", &json!({"hours": 0})).is_err());
+        assert!(AdminCommand::parse("indexing full-trial bounds", &json!({"end_below_free_percent": 101})).is_err());
         assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "everything"})).is_err());
         // The operator commands (admin-ui design §11) round-trip and wait
         // on no purge; arguments are checked as the design says.

@@ -224,6 +224,67 @@ pub enum IndexingAction {
     },
     /// The setting, the running mode and phase, progress and any error.
     Status,
+    /// A full network trial: full indexing for a bounded time, then back to
+    /// the mode it started from, with what it added removed and checked.
+    FullTrial {
+        #[command(subcommand)]
+        action: FullTrialAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum FullTrialAction {
+    /// Start a trial from community or kryphocron_only. Unset limits take
+    /// `[full_trial]`'s.
+    Start {
+        /// End this many hours after the start (a fraction is allowed).
+        #[arg(long)]
+        hours: Option<f64>,
+        /// End when the database has grown by this many GB (a fraction is
+        /// allowed).
+        #[arg(long)]
+        max_added_gb: Option<f64>,
+        /// End when the database volume's free space falls under this share.
+        #[arg(long)]
+        end_below_free_percent: Option<u32>,
+        /// Crawl history too (not built yet: refused).
+        #[arg(long)]
+        history: bool,
+        /// The confirm word: FULL.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// End the running trial now.
+    End {
+        /// The confirm word: END.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Keep full on for real; the trial's record is dropped.
+    Keep {
+        /// The confirm word: FULL.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// Change the running trial's limits.
+    Bounds {
+        #[arg(long)]
+        hours: Option<f64>,
+        #[arg(long)]
+        max_added_gb: Option<f64>,
+        #[arg(long)]
+        end_below_free_percent: Option<u32>,
+    },
+    /// Run a failed trial's check again.
+    Check,
+    /// Drop a failed trial's record and keep its result as dismissed.
+    Dismiss {
+        /// The confirm word: DISMISS.
+        #[arg(long)]
+        confirm: Option<String>,
+    },
+    /// The trial, its figures and the last result.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -432,6 +493,24 @@ impl AdminCmd {
                 value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only, community or full, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
+            Self::Indexing { action: IndexingAction::FullTrial { action } } => match action {
+                FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, .. } => AdminCommand::FullTrialStart {
+                    hours: hours.map(crate::config::Float),
+                    max_added_gb: max_added_gb.map(crate::config::Float),
+                    end_below_free_percent: *end_below_free_percent,
+                    history: *history,
+                },
+                FullTrialAction::End { .. } => AdminCommand::FullTrialEnd,
+                FullTrialAction::Keep { .. } => AdminCommand::FullTrialKeep,
+                FullTrialAction::Bounds { hours, max_added_gb, end_below_free_percent } => AdminCommand::FullTrialBounds {
+                    hours: hours.map(crate::config::Float),
+                    max_added_gb: max_added_gb.map(crate::config::Float),
+                    end_below_free_percent: *end_below_free_percent,
+                },
+                FullTrialAction::Check => AdminCommand::FullTrialCheck,
+                FullTrialAction::Dismiss { .. } => AdminCommand::FullTrialDismiss,
+                FullTrialAction::Status => AdminCommand::FullTrialStatus,
+            },
             Self::Firehose { action: FirehoseAction::ForgetCap { label } } => AdminCommand::FirehoseForgetCap { label: label.clone() },
             Self::Refract { action: RefractAction::Check { did } } => AdminCommand::RefractCheck { did: did.clone() },
             Self::Refract { action: RefractAction::End { did, reason } } => AdminCommand::RefractEnd { did: did.clone(), reason: reason.clone() },
@@ -485,6 +564,57 @@ async fn confirm_scope(pool: &PgPool, cfg: &crate::config::AppConfig, value: Sco
     }
     text.push(format!("Run again with --confirm {word} to switch."));
     Err(text.join("\n"))
+}
+
+/// A trial's confirm word: `FULL` to start (after its warnings, bounds and
+/// what it does not exercise or restore) or keep, `END` to end, `DISMISS`
+/// to dismiss.
+async fn confirm_trial(pool: &PgPool, cfg: &crate::config::AppConfig, action: &FullTrialAction) -> Result<(), String> {
+    let (word, confirm) = match action {
+        FullTrialAction::Start { confirm, .. } | FullTrialAction::Keep { confirm } => ("FULL", confirm),
+        FullTrialAction::End { confirm } => ("END", confirm),
+        FullTrialAction::Dismiss { confirm } => ("DISMISS", confirm),
+        FullTrialAction::Bounds { .. } | FullTrialAction::Check | FullTrialAction::Status => return Ok(()),
+    };
+    if confirm.as_deref() == Some(word) {
+        return Ok(());
+    }
+    let text = match action {
+        FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, .. } => {
+            let d = &cfg.file.full_trial;
+            let bounds = crate::indexing::trial::Bounds {
+                hours: hours.unwrap_or(d.hours.0),
+                max_added_gb: max_added_gb.unwrap_or(d.max_added_gb.0),
+                end_below_free_percent: end_below_free_percent.unwrap_or(d.end_below_free_percent),
+                history: *history,
+            };
+            let phase: Option<String> = sqlx::query_scalar("SELECT value->>'phase' FROM worker_state WHERE key = 'public_transition'")
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| e.to_string())?
+                .flatten();
+            let from = if phase.as_deref() == Some("off") { ScopeValue::KryphocronOnly } else { ScopeValue::Community };
+            let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(pool).await.ok();
+            let free = crate::indexing::trial::volume(&cfg.env.data_dir);
+            let warnings = crate::indexing::full::warnings(&cfg.file.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free.map(|f| f.0), cfg.file.storage.budget_bytes);
+            // How long the last fill took: its last finished job after its start.
+            let last_fill: Option<i64> = sqlx::query_scalar(
+                "SELECT EXTRACT(EPOCH FROM (max(updated_at) - min(not_before)))::bigint FROM backfill_jobs WHERE depth = 'resync' AND state = 'done'",
+            )
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten();
+            let first = crate::indexing::trial::first_bound(bounds, free, crate::indexing::full::GROWTH_BYTES_PER_DAY);
+            crate::indexing::trial::confirm_text(from, bounds, &warnings, last_fill.map(chrono::TimeDelta::seconds), first).join("\n")
+        }
+        FullTrialAction::Keep { .. } => {
+            "Keeping full: the trial's record is dropped and full indexing stays on for real.\nRun again with --confirm FULL to keep it.".to_string()
+        }
+        FullTrialAction::End { .. } => "Ending the trial: Prism leaves full, removes what it added and checks it.\nRun again with --confirm END to end it.".to_string(),
+        _ => "Dismissing drops the failed trial's record; its result is kept as dismissed.\nRun again with --confirm DISMISS to dismiss it.".to_string(),
+    };
+    Err(text)
 }
 
 /// Insert the row and notify `serve`, in one transaction. Returns the id.
@@ -693,6 +823,12 @@ pub async fn run(args: &AdminArgs) -> u8 {
     if let (AdminCmd::Indexing { action: IndexingAction::PublicScope { confirm, .. } }, Some(AdminCommand::IndexingPublicScope { value })) =
         (&args.command, &early)
         && let Err(e) = confirm_scope(&pool, &cfg, *value, confirm.as_deref()).await
+    {
+        eprintln!("{e}");
+        return 2;
+    }
+    if let AdminCmd::Indexing { action: IndexingAction::FullTrial { action } } = &args.command
+        && let Err(e) = confirm_trial(&pool, &cfg, action).await
     {
         eprintln!("{e}");
         return 2;
