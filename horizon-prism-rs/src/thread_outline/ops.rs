@@ -406,12 +406,14 @@ pub fn refused_ops(entry: &StreamEntry, readable: Option<&Readable>) -> Vec<Op> 
 pub fn entry_ops(entry: &StreamEntry, now: DateTime<Utc>, relay_key: &dyn Fn(Option<&str>) -> Option<String>) -> Vec<Op> {
     match crate::firehose::stream::decode(entry) {
         Ok(Event::Commit(c)) => crate::firehose::writer::outline_ops(&c.repo, &c.rev, &c.ops, now),
-        Ok(Event::Identity { kind, did, relay, active }) => {
+        Ok(Event::Identity { kind, did, relay, active, .. }) => {
             let Some(relay) = relay_key(relay.as_deref()) else {
                 return Vec::new();
             };
             status_op(kind, &did, &relay, active, entry.seq()).into_iter().collect()
         }
+        // No post changes: the live path collects nothing for them.
+        Ok(Event::Sync(_) | Event::Resume(_)) => Vec::new(),
         Err(_) => {
             let readable = crate::firehose::stream::readable_despite(entry);
             refused_ops(entry, readable.as_ref())

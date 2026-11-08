@@ -72,6 +72,70 @@ pub enum PublicScope {
     Full,
 }
 
+/// A record group full indexing stores for every account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullGroup {
+    Posts,
+    Likes,
+    Reposts,
+    Follows,
+    Blocks,
+    Lists,
+    Profiles,
+    StarterPacks,
+    Polls,
+}
+
+impl FullGroup {
+    pub const ALL: [Self; 9] = [
+        Self::Posts,
+        Self::Likes,
+        Self::Reposts,
+        Self::Follows,
+        Self::Blocks,
+        Self::Lists,
+        Self::Profiles,
+        Self::StarterPacks,
+        Self::Polls,
+    ];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Posts => "posts",
+            Self::Likes => "likes",
+            Self::Reposts => "reposts",
+            Self::Follows => "follows",
+            Self::Blocks => "blocks",
+            Self::Lists => "lists",
+            Self::Profiles => "profiles",
+            Self::StarterPacks => "starter_packs",
+            Self::Polls => "polls",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|g| g.as_str() == s)
+    }
+}
+
+/// `[full]`: what full indexing stores.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FullConfig {
+    /// The record groups stored for every account. A group not listed
+    /// follows community rules.
+    pub kinds: Vec<FullGroup>,
+}
+
+impl Default for FullConfig {
+    fn default() -> Self {
+        Self { kinds: FullGroup::ALL.to_vec() }
+    }
+}
+
 /// `[indexing]`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -224,6 +288,13 @@ pub struct FirehoseConfig {
     pub coverage_capacity: u64,
     /// Relay URL (the `_relay` field) to short metrics label.
     pub relay_labels: BTreeMap<String, String>,
+    /// Relay labels whose relay reader is older than stream capabilities
+    /// and runs a non-empty record filter: their copies are set aside for
+    /// full indexing.
+    pub old_filtered_relays: Vec<String>,
+    /// A fallback relay URL to the label of the relay it stands in for,
+    /// resolved before every per-relay rule.
+    pub relay_aliases: BTreeMap<String, String>,
 }
 
 impl Default for FirehoseConfig {
@@ -248,6 +319,8 @@ impl Default for FirehoseConfig {
             coverage_window_secs: 600,
             coverage_capacity: 3_000_000,
             relay_labels,
+            old_filtered_relays: Vec::new(),
+            relay_aliases: BTreeMap::new(),
         }
     }
 }
@@ -2371,6 +2444,7 @@ pub struct FileConfig {
     pub net: NetSectionConfig,
     pub metrics: MetricsConfig,
     pub indexing: IndexingConfig,
+    pub full: FullConfig,
     pub scope: ScopeConfig,
     pub community: CommunityConfig,
     pub firehose: FirehoseConfig,

@@ -25,7 +25,7 @@ pub use env::{
 pub use sections::{
     ActivitySubscriptionsConfig, AdminConfig, AuthConfig, BookmarkCount, BookmarksConfig, BackfillConfig, COMMUNITY_NETWORK, CacheConfig, CascadeConfig,
     CommunityConfig, ConstellationConfig, CountsConfig, CountsSource, DbConfig, DraftsConfig, FeaturesConfig,
-    FarsightConfig, FileConfig, Float, FirehoseConfig, FloorsSetting, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
+    FarsightConfig, FileConfig, Float, FirehoseConfig, FullConfig, FullGroup, FloorsSetting, Honest501Config, HttpConfig, IdentityConfig, IndexingConfig,
     KnownFollowersConfig, KnownLikersConfig, KryphocronConfig, LOCAL_APPVIEW, LabelersConfig, LabelsConfig, ListsConfig, MetricsConfig, MicrocosmConfig, NetSectionConfig, NetworkAuth, NetworkConfig, NotificationsConfig, OpThreadConfig, ThreadLensAccess, ThreadLensConfig, FarsightFallbackConfig, FarsightMemoryConfig,
     IndexRequestConfig, LabelSource, PluralConfig, PrivateAnyPdsConfig, RefractCommunity, RefractConfig, default_gone_labels, PrivateNotifyConfig, PrivatePushConfig, PrivateReadConfig, PrivateReadFloors, PrivateSearchConfig, PublicPageClient, PublicPageConfig, PublicScope, RateClassConfig, RateLimitsConfig,
     RetentionConfig, SchemaBackfillConfig, SearchConfig, SuggestionsConfig, LiveNow, UnspeccedConfig, SuggestedTopic, TrendsConfig, SchemaIndexConfig, ScopeConfig, ScopePolicy, ScopeWindows, ServiceConfig, ServiceState, StorageConfig,

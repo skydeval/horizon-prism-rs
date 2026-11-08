@@ -1145,3 +1145,69 @@ async fn no_gap_on_first_ever_creation() {
     assert_eq!(f.epoch().await, 0);
     f.cleanup().await;
 }
+
+// Stream capabilities: `sync`, `resume`, op-less filtered commits, `_cap`.
+
+/// A commit entry from relay `relay` at `rev` after `since`, stamped `cap`
+/// when given.
+fn stamped_commit(repo: &str, rev: &str, since: &str, relay: &str, cap: Option<serde_json::Value>) -> Vec<(&'static str, String)> {
+    let mut data = json!({"repo": repo, "rev": rev, "since": since, "ops": [], "time": chrono::Utc::now().to_rfc3339(), "_relay": relay});
+    if let Some(cap) = cap {
+        data["_cap"] = cap;
+    }
+    vec![("type", "commit".to_string()), ("data", data.to_string()), ("seq", "1".to_string())]
+}
+
+async fn applied_rev(f: &Fixture, did: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT applied_rev FROM sync_state WHERE did = $1")
+        .bind(did)
+        .fetch_optional(&f.db.pool)
+        .await
+        .expect("sync_state")
+        .flatten()
+}
+
+/// The tracked chain is fenced in every mode: a member's op-less commit
+/// from a relay reader whose filter leaves out stored collections does not
+/// advance `applied_rev`, a whole relay's copy does, and an unstamped copy
+/// after a filtered stamp from the same relay (a downgrade) is not whole.
+/// `sync` and `resume` entries are read and acked with no transaction, and
+/// the relay's stamp is remembered.
+#[tokio::test]
+async fn only_a_whole_copy_advances_a_tracked_chain() {
+    let Some(mut f) = Fixture::new("fh_whole_copy_fence", Options::default()).await else {
+        return;
+    };
+    let bsky = "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos";
+    let microcosm = "wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos";
+    let filtered = json!({"v": 1, "caps": ["sync", "resume", "oplessFiltered"], "record_types": ["app.bsky.feed.post"]});
+    let whole = json!({"v": 1, "caps": ["sync", "resume", "oplessFiltered"]});
+    f.add(&stamped_commit(MEMBER, "3kaaaaaaaaab2", "3kaaaaaaaaab1", bsky, Some(filtered)), None).await;
+    let (mut c, _) = f.consumer().await;
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 1, Duration::from_secs(5)).await);
+    assert_eq!(applied_rev(&f, MEMBER).await, None, "a filtered copy leaves the tracked chain alone");
+    // An older reader on the same relay: a downgrade, not whole either.
+    f.add(&stamped_commit(MEMBER, "3kaaaaaaaaab3", "3kaaaaaaaaab2", bsky, None), None).await;
+    assert!(c.run_until(|c| c.throughput.processed >= 2, Duration::from_secs(5)).await);
+    assert_eq!(applied_rev(&f, MEMBER).await, None, "a downgraded reader is not whole");
+    // A whole relay's copy advances it; so does an unstamped copy from a
+    // relay that never stamped a filter.
+    f.add(&stamped_commit(MEMBER, "3kaaaaaaaaab4", "3kaaaaaaaaab3", microcosm, Some(whole)), None).await;
+    assert!(c.run_until(|c| c.throughput.processed >= 3, Duration::from_secs(5)).await);
+    assert_eq!(applied_rev(&f, MEMBER).await.as_deref(), Some("3kaaaaaaaaab4"));
+    f.add(&[("type", "sync".into()), ("data", json!({"did": MEMBER, "rev": "3kaaaaaaaaab7", "time": null, "_relay": microcosm}).to_string()), ("seq", "5".into())], None).await;
+    f.add(&[("type", "resume".into()), ("data", json!({"reason": "outdated_cursor", "saved_cursor": 1, "first_lost_seq": 2, "continues_from": 9, "_relay": bsky}).to_string())], None).await;
+    assert!(c.run_until(|c| c.throughput.processed >= 5, Duration::from_secs(5)).await);
+    assert_eq!(c.throughput.by_path, [2, 3, 0, 0], "sync and resume run no transaction; the tracked commits do");
+    assert_eq!(applied_rev(&f, MEMBER).await.as_deref(), Some("3kaaaaaaaaab4"), "a sync writes nothing");
+    let caps: serde_json::Value = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'relay_caps'")
+        .fetch_one(&f.db.pool)
+        .await
+        .expect("relay_caps");
+    assert_eq!(caps["bsky"]["record_types"], json!(["app.bsky.feed.post"]));
+    assert_eq!(caps["microcosm"]["record_types"], serde_json::Value::Null);
+    let dead: u64 = redis::cmd("XLEN").arg(&f.cfg.dead_letter_stream).query_async(&mut f.redis).await.expect("xlen");
+    assert_eq!(dead, 0);
+    f.cleanup().await;
+}

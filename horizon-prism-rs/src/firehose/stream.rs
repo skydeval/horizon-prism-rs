@@ -125,8 +125,161 @@ pub enum Event {
     Commit(Commit),
     /// `identity`, `account`, `handle` or `tombstone`: routed to the identity
     /// refresher (§5.6). `active` is an `#account` event's flag, when it
-    /// carries one (thread outline design §3.1).
-    Identity { kind: IdentityKind, did: String, relay: Option<String>, active: Option<bool> },
+    /// carries one (thread outline design §3.1); `status` its status text.
+    Identity {
+        kind: IdentityKind,
+        did: String,
+        relay: Option<String>,
+        active: Option<bool>,
+        status: Option<String>,
+        cap: Option<Cap>,
+    },
+    /// A relay's `#sync`: the repo's state is now the one at `rev`.
+    Sync(RepoSync),
+    /// The relay reader's `resume`: events on one relay were not published.
+    Resume(Resume),
+}
+
+impl Event {
+    /// The entry's `_relay`.
+    #[must_use]
+    pub fn relay(&self) -> Option<&str> {
+        match self {
+            Self::Commit(c) => c.relay.as_deref(),
+            Self::Identity { relay, .. } => relay.as_deref(),
+            Self::Sync(s) => s.relay.as_deref(),
+            Self::Resume(r) => r.relay.as_deref(),
+        }
+    }
+
+    /// The entry's capability stamp, `None` from a relay reader older than
+    /// stream capabilities.
+    #[must_use]
+    pub fn cap(&self) -> Option<&Cap> {
+        match self {
+            Self::Commit(c) => c.cap.as_ref(),
+            Self::Identity { cap, .. } => cap.as_ref(),
+            Self::Sync(s) => s.cap.as_ref(),
+            Self::Resume(r) => r.cap.as_ref(),
+        }
+    }
+}
+
+/// The relay reader's capability stamp (`_cap`), carried by every entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cap {
+    /// The stamp's format version.
+    pub version: u64,
+    /// The optional behaviours that are on (`sync`, `resume`,
+    /// `oplessFiltered`).
+    pub caps: Vec<String>,
+    /// The record filter's NSIDs; `None` when the filter is empty, so every
+    /// collection passes. A stamp that cannot be read is a filter that
+    /// passes nothing.
+    pub record_types: Option<std::collections::BTreeSet<String>>,
+}
+
+impl Cap {
+    pub const SYNC: &'static str = "sync";
+    pub const RESUME: &'static str = "resume";
+    pub const OPLESS_FILTERED: &'static str = "oplessFiltered";
+
+    /// Whether the behaviour `name` is on.
+    #[must_use]
+    pub fn has(&self, name: &str) -> bool {
+        self.caps.iter().any(|c| c == name)
+    }
+
+    /// Read a `_cap` value. Anything but an object, or a `record_types`
+    /// that is not a list of strings, reads as a filter that passes
+    /// nothing, so a stamp Prism cannot read never counts as whole.
+    #[must_use]
+    pub fn from_json(v: &Json) -> Self {
+        let unreadable = Self { version: 0, caps: Vec::new(), record_types: Some(std::collections::BTreeSet::new()) };
+        let Some(obj) = v.as_object() else {
+            return unreadable;
+        };
+        let version = obj.get("v").and_then(Json::as_u64).unwrap_or(0);
+        let caps = obj
+            .get("caps")
+            .and_then(Json::as_array)
+            .map(|a| a.iter().filter_map(Json::as_str).map(str::to_string).collect())
+            .unwrap_or_default();
+        let record_types = match obj.get("record_types") {
+            None | Some(Json::Null) => None,
+            Some(Json::Array(items)) => {
+                let names: Option<std::collections::BTreeSet<String>> =
+                    items.iter().map(|i| i.as_str().map(str::to_string)).collect();
+                match names {
+                    Some(n) => Some(n),
+                    None => return unreadable,
+                }
+            }
+            Some(_) => return unreadable,
+        };
+        Self { version, caps, record_types }
+    }
+}
+
+fn cap_of(v: Option<&Json>) -> Option<Cap> {
+    v.map(Cap::from_json)
+}
+
+/// A `sync` entry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoSync {
+    pub did: String,
+    pub rev: String,
+    pub time: Option<DateTime<Utc>>,
+    pub relay: Option<String>,
+    pub cap: Option<Cap>,
+}
+
+/// Why a `resume` entry was published.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeReason {
+    /// The relay refused the saved cursor and continued from its oldest
+    /// retained event.
+    OutdatedCursor,
+    /// A dial went out with no saved cursor.
+    NoSavedCursor,
+    /// The relay's sequence was reset.
+    RelaySeqReset,
+    /// A reason this version does not know.
+    Other(String),
+}
+
+impl ResumeReason {
+    fn parse(s: &str) -> Self {
+        match s {
+            "outdated_cursor" => Self::OutdatedCursor,
+            "no_saved_cursor" => Self::NoSavedCursor,
+            "relay_seq_reset" => Self::RelaySeqReset,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::OutdatedCursor => "outdated_cursor",
+            Self::NoSavedCursor => "no_saved_cursor",
+            Self::RelaySeqReset => "relay_seq_reset",
+            Self::Other(s) => s,
+        }
+    }
+}
+
+/// A `resume` entry: events with seqs in `[first_lost_seq, continues_from)`
+/// on one relay were not published.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Resume {
+    pub reason: ResumeReason,
+    pub saved_cursor: Option<i64>,
+    pub first_lost_seq: Option<i64>,
+    pub continues_from: i64,
+    pub relay: Option<String>,
+    pub cap: Option<Cap>,
 }
 
 /// The non-commit event types.
@@ -164,6 +317,8 @@ pub struct Commit {
     pub time: Option<DateTime<Utc>>,
     pub relay: Option<String>,
     pub ops: Vec<RawOp>,
+    /// The entry's `_cap`.
+    pub cap: Option<Cap>,
 }
 
 #[derive(Deserialize)]
@@ -179,6 +334,8 @@ struct CommitData {
     time: Option<String>,
     #[serde(default, rename = "_relay")]
     relay: Option<String>,
+    #[serde(default, rename = "_cap")]
+    cap: Option<Json>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +356,41 @@ struct DidData {
     /// `#account` only; anything but a boolean is no flag.
     #[serde(default)]
     active: Option<Json>,
+    /// `#account` only; anything but a string is no status.
+    #[serde(default)]
+    status: Option<Json>,
+    #[serde(default, rename = "_cap")]
+    cap: Option<Json>,
+}
+
+#[derive(Deserialize)]
+struct SyncData {
+    did: String,
+    rev: String,
+    #[serde(default)]
+    time: Option<String>,
+    #[serde(default, rename = "_relay")]
+    relay: Option<String>,
+    #[serde(default, rename = "_cap")]
+    cap: Option<Json>,
+}
+
+#[derive(Deserialize)]
+struct ResumeData {
+    reason: String,
+    #[serde(default)]
+    saved_cursor: Option<i64>,
+    #[serde(default)]
+    first_lost_seq: Option<i64>,
+    continues_from: i64,
+    #[serde(default, rename = "_relay")]
+    relay: Option<String>,
+    #[serde(default, rename = "_cap")]
+    cap: Option<Json>,
+}
+
+fn parse_time(t: Option<&str>) -> Option<DateTime<Utc>> {
+    t.and_then(|t| DateTime::parse_from_rfc3339(t).ok()).map(|t| t.with_timezone(&Utc))
 }
 
 /// Decode an entry. Errors are deterministic (§5.2 contract stability).
@@ -216,21 +408,57 @@ pub fn decode(entry: &StreamEntry) -> Result<Event, String> {
         "account" => IdentityKind::Account,
         "handle" => IdentityKind::Handle,
         "tombstone" => IdentityKind::Tombstone,
+        "sync" => return decode_sync(data).map(Event::Sync),
+        "resume" => return decode_resume(data).map(Event::Resume),
         other => return Err(format!("unknown type {other:?}")),
     };
     let d: DidData = serde_json::from_slice(data).map_err(|e| format!("{ty} data: {e}"))?;
     if !proto_blue::syntax::Did::is_valid(&d.did) {
         return Err(format!("invalid did {:?}", d.did));
     }
-    let active = match kind {
-        IdentityKind::Account => d.active.as_ref().and_then(Json::as_bool),
-        _ => None,
+    let (active, status) = match kind {
+        IdentityKind::Account => (
+            d.active.as_ref().and_then(Json::as_bool),
+            d.status.as_ref().and_then(Json::as_str).map(str::to_string),
+        ),
+        _ => (None, None),
     };
     Ok(Event::Identity {
         kind,
         did: d.did,
         relay: d.relay,
         active,
+        status,
+        cap: cap_of(d.cap.as_ref()),
+    })
+}
+
+fn decode_sync(data: &[u8]) -> Result<RepoSync, String> {
+    let d: SyncData = serde_json::from_slice(data).map_err(|e| format!("sync data: {e}"))?;
+    if !proto_blue::syntax::Did::is_valid(&d.did) {
+        return Err(format!("invalid did {:?}", d.did));
+    }
+    if !proto_blue::syntax::Tid::is_valid(&d.rev) {
+        return Err(format!("invalid rev {:?}", d.rev));
+    }
+    Ok(RepoSync {
+        did: d.did,
+        rev: d.rev,
+        time: parse_time(d.time.as_deref()),
+        relay: d.relay,
+        cap: cap_of(d.cap.as_ref()),
+    })
+}
+
+fn decode_resume(data: &[u8]) -> Result<Resume, String> {
+    let d: ResumeData = serde_json::from_slice(data).map_err(|e| format!("resume data: {e}"))?;
+    Ok(Resume {
+        reason: ResumeReason::parse(&d.reason),
+        saved_cursor: d.saved_cursor,
+        first_lost_seq: d.first_lost_seq,
+        continues_from: d.continues_from,
+        relay: d.relay,
+        cap: cap_of(d.cap.as_ref()),
     })
 }
 
@@ -255,7 +483,7 @@ pub fn readable_despite(entry: &StreamEntry) -> Option<Readable> {
     let data = entry.raw("data")?;
     match entry.field("type")? {
         "commit" => decode_commit_checked(data, false).ok().map(|c| Readable::Commit { repo: c.repo, ops: c.ops }),
-        "identity" | "account" | "handle" | "tombstone" => {
+        "identity" | "account" | "handle" | "tombstone" | "sync" => {
             let d: DidData = serde_json::from_slice(data).ok()?;
             (!proto_blue::syntax::Did::is_valid(&d.did)).then_some(Readable::NotADid)
         }
@@ -294,11 +522,7 @@ fn decode_commit_checked(data: &[u8], check_rev: bool) -> Result<Commit, String>
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let time = c
-        .time
-        .as_deref()
-        .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-        .map(|t| t.with_timezone(&Utc));
+    let time = parse_time(c.time.as_deref());
     let since = c
         .since
         .as_ref()
@@ -312,6 +536,7 @@ fn decode_commit_checked(data: &[u8], check_rev: bool) -> Result<Commit, String>
         time,
         relay: c.relay,
         ops,
+        cap: cap_of(c.cap.as_ref()),
     })
 }
 
@@ -475,6 +700,8 @@ mod tests {
                     did: "did:plc:aaaa".into(),
                     relay: Some("r".into()),
                     active: None,
+                    status: None,
+                    cap: None,
                 }
             );
         }
@@ -497,5 +724,85 @@ mod tests {
         };
         assert_eq!(active, None);
         assert_eq!(entry("account", &json!({})).seq(), Some(42));
+    }
+
+    /// The relay reader's 0.2.0 entries: `sync`, `resume`, an op-less
+    /// filtered commit, and `_cap` on every entry, read from the entry
+    /// itself.
+    #[test]
+    fn decodes_stream_capability_entries() {
+        let cap = json!({"v": 1, "caps": ["sync", "resume", "oplessFiltered"], "record_types": ["app.bsky.feed.post"]});
+        let Event::Sync(s) = decode(&entry(
+            "sync",
+            &json!({"did": "did:plc:aaaa", "rev": "3kaaaaaaaaaab", "time": "2026-11-01T00:00:00.000Z", "_relay": "r", "_cap": cap}),
+        ))
+        .expect("sync") else {
+            panic!("expected sync");
+        };
+        assert_eq!((s.did.as_str(), s.rev.as_str(), s.relay.as_deref()), ("did:plc:aaaa", "3kaaaaaaaaaab", Some("r")));
+        assert!(s.time.is_some());
+        let c = s.cap.expect("cap");
+        assert_eq!(c.version, 1);
+        assert!(c.has(Cap::SYNC) && c.has(Cap::RESUME) && c.has(Cap::OPLESS_FILTERED));
+        assert_eq!(c.record_types, Some(["app.bsky.feed.post".to_string()].into_iter().collect()));
+        // A sync with a bad rev or DID is refused.
+        assert!(decode(&entry("sync", &json!({"did": "did:plc:aaaa", "rev": "nope"}))).is_err());
+        assert!(decode(&entry("sync", &json!({"did": "bob", "rev": "3kaaaaaaaaaab"}))).is_err());
+        assert_eq!(readable_despite(&entry("sync", &json!({"did": "bob", "rev": "3kaaaaaaaaaab"}))), Some(Readable::NotADid));
+
+        let Event::Resume(r) = decode(&entry(
+            "resume",
+            &json!({"reason": "outdated_cursor", "saved_cursor": 10, "first_lost_seq": 11, "continues_from": 40, "_relay": "r",
+                    "_cap": {"v": 1, "caps": ["resume"]}}),
+        ))
+        .expect("resume") else {
+            panic!("expected resume");
+        };
+        assert_eq!(r.reason, ResumeReason::OutdatedCursor);
+        assert_eq!((r.saved_cursor, r.first_lost_seq, r.continues_from), (Some(10), Some(11), 40));
+        assert_eq!(r.cap.as_ref().map(|c| c.record_types.is_none()), Some(true));
+        let Event::Resume(r) = decode(&entry("resume", &json!({"reason": "no_saved_cursor", "saved_cursor": null, "first_lost_seq": null, "continues_from": 7})))
+            .expect("resume") else {
+            panic!("expected resume");
+        };
+        assert_eq!((r.reason, r.saved_cursor, r.cap), (ResumeReason::NoSavedCursor, None, None));
+        assert!(decode(&entry("resume", &json!({"reason": "outdated_cursor"}))).is_err());
+
+        // An op-less filtered commit is an ordinary commit with no ops.
+        let Event::Commit(c) = decode(&entry(
+            "commit",
+            &json!({"repo": "did:plc:aaaa", "commit": "bafyc", "rev": "3kaaaaaaaaaac", "since": "3kaaaaaaaaaab", "ops": [], "time": "2026-11-01T00:00:00.000Z", "_relay": "r", "_cap": cap}),
+        ))
+        .expect("commit") else {
+            panic!("expected commit");
+        };
+        assert!(c.ops.is_empty());
+        assert_eq!(c.since.as_deref(), Some("3kaaaaaaaaaab"));
+        assert!(c.cap.is_some_and(|c| c.record_types.is_some()));
+
+        // `_cap` on identity events, and an `#account` status.
+        let Event::Identity { status, cap, .. } = decode(&entry(
+            "account",
+            &json!({"did": "did:plc:aaaa", "active": false, "status": "takendown", "_relay": "r", "_cap": {"v": 1, "caps": []}}),
+        ))
+        .expect("account") else {
+            panic!("expected account");
+        };
+        assert_eq!(status.as_deref(), Some("takendown"));
+        assert_eq!(cap, Some(Cap { version: 1, caps: Vec::new(), record_types: None }));
+        // An entry from an older reader has no stamp.
+        let Event::Commit(old) = decode(&entry("commit", &json!({"repo": "did:plc:aaaa", "rev": "3kaaaaaaaaaac", "ops": []}))).expect("commit") else {
+            panic!("expected commit");
+        };
+        assert_eq!(old.cap, None);
+    }
+
+    /// A stamp Prism cannot read is a filter that passes nothing.
+    #[test]
+    fn an_unreadable_cap_passes_nothing() {
+        for v in [json!("x"), json!({"v": 1, "record_types": "app.bsky.feed.post"}), json!({"v": 1, "record_types": [1]})] {
+            assert_eq!(Cap::from_json(&v).record_types, Some(std::collections::BTreeSet::new()), "{v}");
+        }
+        assert_eq!(Cap::from_json(&json!({"v": 1, "caps": [], "record_types": null})).record_types, None);
     }
 }

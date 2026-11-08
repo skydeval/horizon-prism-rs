@@ -44,6 +44,7 @@ use super::gap::{self, GapCause};
 use super::router::route_identity;
 use super::scripts::{self, CheckedRead, GapEvidence, ReanchorMode, ScriptError};
 use super::stream::{Commit, Event, IdentityKind, Readable, StreamEntry, decode, parse_read_reply, readable_despite, repo_hint};
+use super::tier::{CopyTier, Tiers};
 use super::watermark::{Watermarks, contribution};
 use super::writer::{ApplyOptions, Transient, WriteSource, Writer};
 use crate::config::FirehoseConfig;
@@ -91,6 +92,8 @@ pub const METRIC_REANCHOR: &str = "firehose_reanchor_total";
 pub const METRIC_REANCHOR_DECISIONS: &str = "firehose_reanchor_decisions_total";
 pub const METRIC_SAMPLE_CALLS: &str = "firehose_lag_sample_calls_total";
 pub const METRIC_SAMPLE_FAILURES: &str = "firehose_lag_sample_failures_total";
+/// Metric: `sync` and `resume` entries read, by type.
+pub const METRIC_STREAM_EVENTS: &str = "firehose_stream_events_total";
 
 /// A failure that aborts the current step; always transient.
 #[derive(Debug, thiserror::Error)]
@@ -477,6 +480,8 @@ pub struct Consumer {
     outline: Option<crate::thread_outline::Sender>,
     /// The entry in progress's outline ops, sent once it is processed.
     outline_ops: Vec<crate::thread_outline::ops::Op>,
+    /// Each relay's copy tier, from the stamps its entries carry.
+    tiers: Tiers,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -493,6 +498,7 @@ impl Consumer {
     ) -> Self {
         let pool = writer.pool().clone();
         register_series();
+        let cfg_old_filtered = cfg.old_filtered_relays.clone();
         Self {
             #[cfg(test)]
             test: TestTuning {
@@ -518,7 +524,18 @@ impl Consumer {
             step: StepStats::default(),
             outline: None,
             outline_ops: Vec::new(),
+            tiers: Tiers::new(
+                crate::indexing::full::full_set(&crate::config::FullGroup::ALL),
+                cfg_old_filtered,
+            ),
         }
+    }
+
+    /// The record groups `[full] kinds` enables, for the copy tiers.
+    #[must_use]
+    pub fn with_full_kinds(mut self, kinds: &[crate::config::FullGroup]) -> Self {
+        self.tiers = Tiers::new(crate::indexing::full::full_set(kinds), self.cfg.old_filtered_relays.clone());
+        self
     }
 
     /// Hand each commit's thread outline ops to the outline writer
@@ -593,6 +610,7 @@ impl Consumer {
     /// Any transient failure; startup is re-run from the top.
     pub async fn startup(&mut self) -> Result<(), ConsumerError> {
         scripts::load_all(&mut self.redis).await?;
+        self.tiers.restore(&self.pool).await?;
         // A recreation gap a previous run owed is run before anything else.
         self.owed = gap::recreation_gap_owed(&self.pool).await?;
         if self.owed {
@@ -1104,8 +1122,37 @@ impl Consumer {
                 return Ok(EntryPath::DeadLetter);
             }
         };
+        // The relay reader's stamp, remembered per relay label.
+        let label = self.watermarks.label_for(event.relay()).to_string();
+        let tier = self.tiers.tier(&label, event.cap());
+        if self.tiers.observe(&label, event.cap()) {
+            self.tiers.persist(&self.pool).await?;
+        }
         match event {
-            Event::Identity { kind, did, relay, active } => {
+            Event::Sync(sync) => {
+                // A repo reset. Members' tracked chains follow it as before:
+                // the next commit that does not chain is a link, and the
+                // head prober resyncs a repo that diverged.
+                tracing::debug!(event = "firehose_sync", id = %entry.id, relay = %label, tier = tier.as_str(), repo = %sync.did, rev = %sync.rev, "repo sync received");
+                metrics::counter!(METRIC_STREAM_EVENTS, "type" => "sync").increment(1);
+                Ok(EntryPath::NoTx)
+            }
+            Event::Resume(resume) => {
+                tracing::info!(
+                    event = "firehose_resume",
+                    id = %entry.id,
+                    relay = %label,
+                    tier = tier.as_str(),
+                    reason = resume.reason.as_str(),
+                    saved_cursor = ?resume.saved_cursor,
+                    first_lost_seq = ?resume.first_lost_seq,
+                    continues_from = resume.continues_from,
+                    "a relay reader reported events it did not publish"
+                );
+                metrics::counter!(METRIC_STREAM_EVENTS, "type" => "resume").increment(1);
+                Ok(EntryPath::NoTx)
+            }
+            Event::Identity { kind, did, relay, active, .. } => {
                 if self.outline.is_some()
                     && let Some(key) = crate::thread_outline::ops::status_relay(&self.watermarks, relay.as_deref())
                 {
@@ -1126,12 +1173,11 @@ impl Consumer {
                 }
                 Ok(EntryPath::Identity)
             }
-            Event::Commit(commit) => self.process_commit(entry, commit).await,
+            Event::Commit(commit) => self.process_commit(entry, commit, label, tier).await,
         }
     }
 
-    async fn process_commit(&mut self, entry: &StreamEntry, commit: Commit) -> Result<EntryPath, ConsumerError> {
-        let label = self.watermarks.label_for(commit.relay.as_deref()).to_string();
+    async fn process_commit(&mut self, entry: &StreamEntry, commit: Commit, label: String, tier: CopyTier) -> Result<EntryPath, ConsumerError> {
         self.coverage.observe(&commit.repo, &commit.rev, &label);
         tracing::debug!(
             event = "firehose_ops",
@@ -1142,9 +1188,13 @@ impl Consumer {
             ops = commit.ops.len(),
             "commit received"
         );
+        // A tracked repo's chain is advanced only by a whole copy: any other
+        // copy may have dropped a commit its filter left out, in every
+        // public-indexing mode.
+        let options = ApplyOptions { advance_applied_rev: tier == CopyTier::Whole, ..self.apply_options() };
         let report = self
             .writer
-            .apply_commit(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, self.apply_options())
+            .apply_commit(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options)
             .await?;
         // A malformed op that could not matter is counted, not dead-lettered
         // (actionable-warnings design §6.3).
@@ -1238,6 +1288,9 @@ fn register_series() {
     metrics::gauge!(METRIC_BACKLOG_BUSY).increment(0.0);
     metrics::counter!(METRIC_BACKLOG_PROCESSED).increment(0);
     metrics::gauge!(METRIC_GROUP_PRESENT).set(1.0);
+    for ty in ["sync", "resume"] {
+        metrics::counter!(METRIC_STREAM_EVENTS, "type" => ty).increment(0);
+    }
 }
 
 /// `[next-cursor, [ids…], [deleted ids…]]`.

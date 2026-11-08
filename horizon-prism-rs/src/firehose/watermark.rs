@@ -58,6 +58,8 @@ pub struct Watermarks {
     inner: Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     /// `_relay` URL → label.
     labels: Arc<BTreeMap<String, String>>,
+    /// A fallback `_relay` URL → the label of the relay it stands in for.
+    aliases: Arc<BTreeMap<String, String>>,
     private_relays: Arc<Vec<String>>,
     /// `kryphocron.oracle_freshness_bound_secs`, for the degraded gauge and
     /// its transition logs; without it neither is recorded.
@@ -72,6 +74,7 @@ impl Watermarks {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
             labels: Arc::new(labels),
+            aliases: Arc::new(BTreeMap::new()),
             private_relays: Arc::new(private_relays),
             freshness_bound: None,
             was_degraded: Arc::new(AtomicBool::new(false)),
@@ -119,11 +122,31 @@ impl Watermarks {
         }
     }
 
-    /// The label of a `_relay` URL.
+    /// With `firehose.relay_aliases`: a fallback URL counts as the relay
+    /// it stands in for. An alias whose URL is itself a labelled relay, or
+    /// whose target is not a configured label, is set aside with a warning.
+    #[must_use]
+    pub fn with_aliases(mut self, aliases: &BTreeMap<String, String>) -> Self {
+        let known: std::collections::BTreeSet<&str> = self.labels.values().map(String::as_str).collect();
+        let mut kept = BTreeMap::new();
+        for (url, target) in aliases {
+            if self.labels.contains_key(url) {
+                tracing::warn!(event = "relay_alias_set_aside", url = %url, target = %target, "firehose.relay_aliases: the URL is a relay of its own in relay_labels; the alias is set aside");
+            } else if !known.contains(target.as_str()) {
+                tracing::warn!(event = "relay_alias_set_aside", url = %url, target = %target, "firehose.relay_aliases: the target is not a label in relay_labels; the alias is set aside");
+            } else {
+                kept.insert(url.clone(), target.clone());
+            }
+        }
+        self.aliases = Arc::new(kept);
+        self
+    }
+
+    /// The label of a `_relay` URL, aliases resolved.
     #[must_use]
     pub fn label_for(&self, relay: Option<&str>) -> &str {
         relay
-            .and_then(|r| self.labels.get(r))
+            .and_then(|r| self.labels.get(r).or_else(|| self.aliases.get(r)))
             .map_or(UNKNOWN_RELAY, String::as_str)
     }
 
@@ -386,6 +409,26 @@ mod tests {
         let unbound = marks();
         unbound.record_degraded(now);
         assert!(!unbound.was_degraded.load(Ordering::SeqCst));
+    }
+
+    /// A fallback URL counts as the relay it stands in for; an alias whose
+    /// URL is a labelled relay, or whose target is unknown, is set aside.
+    #[test]
+    fn aliases_resolve_to_their_primary() {
+        let aliases: BTreeMap<String, String> = [
+            ("wss://fallback.example", "bsky"),
+            ("wss://b", "bsky"),
+            ("wss://nowhere.example", "nobody"),
+        ]
+        .into_iter()
+        .map(|(u, l)| (u.to_string(), l.to_string()))
+        .collect();
+        let w = marks().with_aliases(&aliases);
+        assert_eq!(w.label_for(Some("wss://fallback.example")), "bsky");
+        assert_eq!(w.label_for(Some("wss://b")), "microcosm");
+        assert_eq!(w.label_for(Some("wss://nowhere.example")), UNKNOWN_RELAY);
+        assert_eq!(w.label_for(Some("wss://a")), "bsky");
+        assert_eq!(w.label_for(None), UNKNOWN_RELAY);
     }
 
     #[test]

@@ -43,6 +43,35 @@ pub const PLURAL_COLLECTIONS: [&str; 4] = [NSID_PRONOUNS, NSID_PLURAL_SYSTEM, NS
 pub const NSID_POST_PRIVATE: &str = "tools.kryphocron.feed.postPrivate";
 pub const NSID_AUDIENCE: &str = "tools.kryphocron.policy.audience";
 
+/// Every collection [`classify`] indexes: every ecosystem kind, plus the
+/// kryphocron collections with a producer. A relay filter that passes all of
+/// these leaves out nothing Prism stores.
+pub const STORED_SET: [&str; 23] = [
+    NSID_POST,
+    NSID_LIKE,
+    NSID_REPOST,
+    NSID_FOLLOW,
+    NSID_BLOCK,
+    NSID_PROFILE,
+    NSID_LIST,
+    NSID_LISTITEM,
+    NSID_LISTBLOCK,
+    NSID_LIST_OPTOUT,
+    NSID_STARTER_PACK,
+    NSID_LABELER_SERVICE,
+    NSID_NOTIFICATION_DECLARATION,
+    NSID_ACTOR_STATUS,
+    NSID_CONTENT_VISIBILITY,
+    NSID_THREADGATE,
+    NSID_POSTGATE,
+    NSID_POLL_POST,
+    NSID_PRONOUNS,
+    NSID_PLURAL_SYSTEM,
+    NSID_PLURAL_FRONT,
+    NSID_PLURAL_MEMBER,
+    NSID_POST_PRIVATE,
+];
+
 /// Ecosystem record kinds indexed in v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EcosystemKind {
@@ -172,6 +201,20 @@ pub fn skip_reason(class: RecordClass) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stored set is exactly what `classify` writes: each member is
+    /// indexed at rkey `self`, and the skipped kryphocron audience is not
+    /// in it.
+    #[test]
+    fn stored_set_is_what_classify_indexes() {
+        for nsid in STORED_SET {
+            assert!(classify(nsid, "self").record_kind().is_some(), "{nsid}");
+        }
+        assert!(!STORED_SET.contains(&NSID_AUDIENCE));
+        assert!(classify(NSID_AUDIENCE, "3k").record_kind().is_none());
+        let unique: std::collections::BTreeSet<&str> = STORED_SET.into_iter().collect();
+        assert_eq!(unique.len(), STORED_SET.len());
+    }
 
     #[test]
     fn ecosystem_nsids() {

@@ -538,6 +538,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // Firehose: watermarks, coverage, consumer, lag sampler.
     let fh = cfg.file.firehose.clone();
     let watermarks = Watermarks::new(fh.relay_labels.clone(), fh.private_relays.clone())
+        .with_aliases(&fh.relay_aliases)
         .with_freshness_bound(Duration::from_secs(cfg.file.kryphocron.oracle_freshness_bound_secs));
     watermarks
         .restore(&pool)
@@ -595,7 +596,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
         Arc::clone(&status),
     )
     .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
-    .with_system_accounts(system_accounts.clone());
+    .with_system_accounts(system_accounts.clone())
+    .with_full_kinds(&cfg.file.full.kinds);
     let consumer = match outline_sender {
         Some(sender) => consumer.with_outline(sender),
         None => consumer,
