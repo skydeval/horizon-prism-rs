@@ -56,7 +56,7 @@ pub struct Filters {
 }
 
 /// The command names the "what" filter offers.
-pub const COMMAND_NAMES: [&str; 23] = [
+pub const COMMAND_NAMES: [&str; 24] = [
     "member add",
     "member remove",
     "member deny",
@@ -80,6 +80,7 @@ pub const COMMAND_NAMES: [&str; 23] = [
     "lists purge",
     "indexing public-scope",
     "indexing status",
+    "firehose forget-cap",
 ];
 
 fn outcome_words(outcome: &str) -> String {

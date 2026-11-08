@@ -122,6 +122,33 @@ pub struct RelaySuspensions<'a> {
     pub exempt: &'a (dyn Fn(&str) -> bool + Sync),
 }
 
+/// The gate's account rule for SQL reads, as one inlinable expression that
+/// is true when the account is hidden: `status_hidden` (the read's own test
+/// of `actors.account_status`), or a non-active status from a takedown
+/// relay in the bound `text[]` named by `relays`, unless the account is a
+/// member or Refract lists it. `id` and `did` name the account (SQL
+/// expressions of its `dids` id and its DID text). The relays are empty
+/// outside full and under `suspended_accounts = "all"`
+/// ([`crate::hydration::Hydrator::hidden_relays`]), so then only the status
+/// decides. `relays` appears once, so a query builder can bind it in place.
+#[must_use]
+pub fn hidden_status_sql(status_hidden: &str, id: &str, did: &str, relays: &str) -> String {
+    format!(
+        "({status_hidden} \
+          OR EXISTS (SELECT 1 FROM relay_account_status hs WHERE hs.account = {id} AND hs.relay = ANY({relays}::text[]) \
+                       AND NOT EXISTS (SELECT 1 FROM members hm WHERE hm.did = {did}) \
+                       AND NOT EXISTS (SELECT 1 FROM refract_dids hr WHERE hr.did = {did} AND hr.state IN ('restored', 'grace'))))"
+    )
+}
+
+/// [`hidden_status_sql`] pushed onto a query builder, binding `relays`.
+pub fn push_hidden_status(qb: &mut sqlx::QueryBuilder<'_, sqlx::Postgres>, status_hidden: &str, id: &str, did: &str, relays: Vec<String>) {
+    const MARK: &str = "\u{1}relays\u{1}";
+    let sql = hidden_status_sql(status_hidden, id, did, MARK);
+    let (before, after) = sql.split_once(MARK).unwrap_or((sql.as_str(), ""));
+    qb.push(before.to_string()).push_bind(relays).push(after.to_string());
+}
+
 /// [`gate_many_among`] with relay suspensions.
 ///
 /// # Errors
@@ -221,6 +248,71 @@ mod tests {
     const A: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const B: &str = "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb";
     const C: &str = "did:plc:cccccccccccccccccccccccc";
+
+    /// The SQL form of the account rule: the read's own status test, or a
+    /// takedown relay's non-active status for an account that is neither a
+    /// member nor Refract-listed; no relays bound, only the status decides.
+    #[tokio::test]
+    async fn the_sql_account_rule_hides_relay_suspensions_unless_exempt() {
+        let Some(db) = fresh_db("hidden_status_sql").await else {
+            return;
+        };
+        let p = &db.pool;
+        crate::test_support::actors::put(p, C, &[("account_status", "'deactivated'")]).await;
+        sqlx::raw_sql(&format!(
+            "INSERT INTO dids (did) VALUES ('{A}'), ('{B}') ON CONFLICT DO NOTHING; \
+             INSERT INTO relay_account_status (account, relay, status) SELECT id, 'bsky', 'takendown' FROM dids WHERE did IN ('{A}', '{B}'); \
+             INSERT INTO members (did, source) VALUES ('{B}', 'admin');"
+        ))
+        .execute(p)
+        .await
+        .expect("seed");
+        let sql = format!(
+            "SELECT d.did FROM dids d LEFT JOIN actors a ON a.id = d.id WHERE {} ORDER BY 1",
+            hidden_status_sql("COALESCE(a.account_status, 'active') <> 'active'", "d.id", "d.did", "$1")
+        );
+        let hidden = |relays: Vec<String>| {
+            let sql = sql.clone();
+            async move { sqlx::query_scalar::<_, String>(&sql).bind(relays).fetch_all(p).await.expect("query") }
+        };
+        assert_eq!(hidden(vec!["bsky".into()]).await, [A, C], "the member is exempt");
+        assert_eq!(hidden(Vec::new()).await, [C], "no relays: the status alone");
+        assert_eq!(hidden(vec!["other".into()]).await, [C], "another relay's rows hide nobody");
+        sqlx::query("INSERT INTO refract_dids (did, community, state, source) VALUES ($1, 'community-a', 'restored', 'fill')")
+            .bind(A)
+            .execute(p)
+            .await
+            .expect("restored");
+        assert_eq!(hidden(vec!["bsky".into()]).await, [C], "Refract's listing is exempt");
+        db.drop_db().await;
+    }
+
+    /// Every public, gate-shaped SQL read tests an account's status through
+    /// the one fragment: no bare `account_status` predicate outside a
+    /// `hidden_status_sql` (or `push_hidden_status`) call.
+    #[test]
+    fn public_reads_test_status_through_the_one_fragment() {
+        let files = [
+            ("search", include_str!("../hydration/search.rs")),
+            ("suggestions", include_str!("../hydration/suggestions.rs")),
+            ("trends", include_str!("../hydration/trends.rs")),
+            ("starter_packs", include_str!("../hydration/starter_packs.rs")),
+            ("notifications", include_str!("../hydration/notifications.rs")),
+            ("actor", include_str!("../hydration/actor.rs")),
+            ("lens", include_str!("../hydration/lens.rs")),
+        ];
+        let mut seen = 0;
+        for (name, src) in files {
+            let code = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for (i, _) in code.match_indices("account_status") {
+                let call = ["hidden_status_sql(", "push_hidden_status("].iter().filter_map(|c| code[..i].rfind(c)).max();
+                let inside = call.is_some_and(|at| !code[at..i].contains(';'));
+                assert!(inside, "{name}: a bare account_status predicate: {}", &code[code[..i].rfind('\n').unwrap_or(0)..i]);
+                seen += 1;
+            }
+        }
+        assert!(seen >= 6, "the reads were found ({seen})");
+    }
 
     #[tokio::test]
     async fn labels_and_account_status() {

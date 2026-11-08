@@ -607,7 +607,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     )
     .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
     .with_system_accounts(system_accounts.clone())
-    .with_full_kinds(&cfg.file.full.kinds);
+    .with_full_kinds(&cfg.file.full.kinds)
+    .with_tier_board(public.tier_board());
     let consumer = match outline_sender {
         Some(sender) => consumer.with_outline(sender),
         None => consumer,
@@ -626,6 +627,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
             pool: pool.clone(),
             full_kinds: cfg.file.full.kinds.clone(),
         }))),
+        // In full, long-suspended accounts' public rows.
+        Arc::new(crate::indexing::full::SuspendedPurge::new(scope.clone(), cfg.file.full.suspended_purge_days)),
         // The memory's table (§5.14.18.1), with or without an engine.
         Arc::new(crate::farsight::retention::MemoryRetention::new(&cfg.file.farsight.memory, farsight.clone())),
         // Rule 4's daily safety net (design-v4 §14.1 R4).

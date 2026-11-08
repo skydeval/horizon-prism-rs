@@ -531,12 +531,19 @@ impl Hydrator {
                AND n.author_did <> ALL($5) AND n.record_uri <> ALL($6) \
                AND NOT (n.author_did = ANY($7) AND split_part(n.record_uri, '/', 4) <> ALL($9)) \
                AND NOT (n.author_did = ANY($8) AND split_part(n.record_uri, '/', 4) = 'app.bsky.feed.post') \
-               AND NOT EXISTS (SELECT 1 FROM actors a JOIN dids ad ON ad.id = a.id WHERE ad.did = n.author_did \
-                               AND a.account_status IN ('deactivated', 'takendown', 'suspended', 'deleted')) \
+               AND NOT {} \
                AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject IN (n.record_uri, n.author_did) AND l.val = '!takedown') \
                AND ($10::text[] IS NULL OR n.author_did = ANY($10))",
-            preference_clause(3, 4)
+            preference_clause(3, 4),
+            crate::moderation::hidden_status_sql(
+                "EXISTS (SELECT 1 FROM actors a JOIN dids ad ON ad.id = a.id WHERE ad.did = n.author_did \
+                   AND a.account_status IN ('deactivated', 'takendown', 'suspended', 'deleted'))",
+                "(SELECT nd.id FROM dids nd WHERE nd.did = n.author_did)",
+                "n.author_did",
+                "$11",
+            ),
         );
+        let relays = self.hidden_relays().await;
         let count = |only: Option<Vec<String>>| {
             sqlx::query_scalar::<_, i64>(&sql)
                 .bind(me)
@@ -549,6 +556,7 @@ impl Hydrator {
                 .bind(&posts_only)
                 .bind(&kept)
                 .bind(only)
+                .bind(&relays)
                 .fetch_one(self.pool())
         };
         let mut total = count(None).await?;

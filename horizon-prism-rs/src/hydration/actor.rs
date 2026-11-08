@@ -529,12 +529,14 @@ impl Hydrator {
         let pattern = format!("%{}%", like_escape(&q));
         let sql = format!(
             "SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id CROSS JOIN LATERAL (SELECT ad.did AS author_did) n \
-             WHERE ($1::text IS NULL OR ({exclusions})) AND {IN_CORPUS} AND ($5 OR {SHOWN_SIGNED_OUT}) \
+             WHERE ($1::text IS NULL OR ({exclusions})) AND {corpus} AND ($5 OR {SHOWN_SIGNED_OUT}) \
                AND (a.handle ILIKE $2 OR a.display_name ILIKE $2) \
              ORDER BY GREATEST(similarity(coalesce(a.handle, ''), $3), similarity(coalesce(a.display_name, ''), $3)) DESC, a.id \
              LIMIT $4 OFFSET $6",
             exclusions = viewer_exclusions(),
+            corpus = in_corpus("$7"),
         );
+        let relays = self.hidden_relays().await;
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, self.inner.cfg.search.statement_timeout_ms).await?;
         let started = Instant::now();
@@ -545,6 +547,7 @@ impl Hydrator {
             .bind(limit)
             .bind(viewer.did.is_some())
             .bind(offset)
+            .bind(relays)
             .fetch_all(&mut *tx)
             .await;
         metrics::histogram!(METRIC_DURATION, "endpoint" => "searchActors").record(started.elapsed().as_secs_f64());
@@ -611,6 +614,7 @@ impl Hydrator {
         let candidates = i64::from(cfg.typeahead_candidates);
         let upper = successor(&q);
         let prefix = format!("{}%", like_escape(&q));
+        let relays = self.hidden_relays().await;
 
         let mut qb: QueryBuilder<'_, Postgres> = QueryBuilder::new("WITH v AS (SELECT ");
         qb.push_bind(viewer.state_did().map(str::to_string)).push("::text AS did)");
@@ -620,16 +624,22 @@ impl Hydrator {
                 qb.push(format!(" AND {column} ~<~ ")).push_bind(upper.clone());
             }
             qb.push(format!(" AND {column} LIKE ")).push_bind(prefix.clone());
-            qb.push(format!(" AND {IN_CORPUS} ORDER BY {column} USING ~<~ LIMIT ")).push_bind(candidates).push(")");
+            qb.push(" AND ");
+            push_in_corpus(&mut qb, &relays);
+            qb.push(format!(" ORDER BY {column} USING ~<~ LIMIT ")).push_bind(candidates).push(")");
         }
         qb.push(", e AS (SELECT a.id FROM actors a JOIN dids ad ON ad.id = a.id WHERE a.handle = ")
             .push_bind(q.clone())
-            .push(format!(" AND {IN_CORPUS})"));
+            .push(" AND ");
+        push_in_corpus(&mut qb, &relays);
+        qb.push(")");
         let mut branches = "SELECT id FROM h UNION SELECT id FROM d UNION SELECT id FROM e".to_string();
         if q.chars().count() >= 3 {
             qb.push(", w AS (SELECT a.id FROM actors a JOIN dids ad ON ad.id = a.id WHERE a.display_name ILIKE ")
                 .push_bind(format!("% {}%", like_escape(&q)));
-            qb.push(format!(" AND {IN_CORPUS} LIMIT ")).push_bind(candidates).push(")");
+            qb.push(" AND ");
+            push_in_corpus(&mut qb, &relays);
+            qb.push(" LIMIT ").push_bind(candidates).push(")");
             branches.push_str(" UNION SELECT id FROM w");
         }
         qb.push(format!(
@@ -730,10 +740,23 @@ fn status_view(
     Some(view)
 }
 
-/// The accounts a search may find: active, and in scope or a member. `a`
-/// is the `actors` row and `ad` its `dids` row.
-pub(super) const IN_CORPUS: &str = "a.account_status = 'active' \
-     AND (EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) OR EXISTS (SELECT 1 FROM members m WHERE m.did = ad.did))";
+/// Of the accounts a search may find: in scope or a member. `a` is the
+/// `actors` row and `ad` its `dids` row.
+const CORPUS_SCOPE: &str = "(EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) OR EXISTS (SELECT 1 FROM members m WHERE m.did = ad.did))";
+
+/// The accounts a search may find: active and not hidden by a takedown
+/// relay (`relays` is the placeholder of the bound relays), and in scope
+/// or a member. `a` is the `actors` row and `ad` its `dids` row.
+pub(super) fn in_corpus(relays: &str) -> String {
+    format!("NOT {} AND {CORPUS_SCOPE}", crate::moderation::hidden_status_sql("a.account_status <> 'active'", "a.id", "ad.did", relays))
+}
+
+/// [`in_corpus`] pushed onto a query builder, binding `relays`.
+fn push_in_corpus(qb: &mut QueryBuilder<'_, Postgres>, relays: &[String]) {
+    qb.push("NOT ");
+    crate::moderation::push_hidden_status(qb, "a.account_status <> 'active'", "a.id", "ad.did", relays.to_vec());
+    qb.push(format!(" AND {CORPUS_SCOPE}"));
+}
 
 /// What a signed-out search leaves out: an account whose profile asks not
 /// to be shown to signed-out viewers.

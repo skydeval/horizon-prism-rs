@@ -309,7 +309,7 @@ impl Plan {
     /// post row beside it when a filter reads one. The viewer is the first
     /// bind, which the exclusions and `following` name as `$1`; so this must
     /// be the first thing that binds.
-    fn push_from(&self, qb: &mut QueryBuilder<'_, Postgres>, viewer: Option<&str>, anonymous: bool) {
+    fn push_from(&self, qb: &mut QueryBuilder<'_, Postgres>, viewer: Option<&str>, anonymous: bool, relays: &[String]) {
         qb.push(" FROM (SELECT s.*, d.did AS author_did FROM post_search s JOIN dids d ON d.id = s.author) n");
         if self.filters.iter().any(Filter::reads_post) {
             qb.push(" JOIN posts p ON p.author = n.author AND p.rkey = n.rkey");
@@ -318,7 +318,14 @@ impl Plan {
         qb.push_bind(viewer.map(str::to_string));
         qb.push("::text IS NULL OR (").push(viewer_exclusions()).push("))");
         qb.push(" AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = n.author_did)");
-        qb.push(" AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.id = n.author AND a.account_status <> 'active')");
+        qb.push(" AND NOT ");
+        crate::moderation::push_hidden_status(
+            qb,
+            "EXISTS (SELECT 1 FROM actors a WHERE a.id = n.author AND a.account_status <> 'active')",
+            "n.author",
+            "n.author_did",
+            relays.to_vec(),
+        );
         if anonymous {
             qb.push(" AND NOT EXISTS (SELECT 1 FROM actors a WHERE a.id = n.author AND '!no-unauthenticated' = ANY(a.self_labels))");
         }
@@ -650,6 +657,7 @@ impl Hydrator {
         };
         let me = viewer.state_did();
         let anonymous = viewer.did.is_none();
+        let relays = self.hidden_relays().await;
         let limit = i64::from(p.limit.clamp(1, 100));
         let max_offset = i64::from(cfg.max_offset.min(cfg.top_candidates));
 
@@ -658,7 +666,7 @@ impl Hydrator {
         match plan.sort {
             Sort::Latest => {
                 qb.push("SELECT at_uri(n.author, 1::smallint, n.rkey), n.created_at");
-                plan.push_from(&mut qb, me, anonymous);
+                plan.push_from(&mut qb, me, anonymous, &relays);
                 if let (Some(at), Some(uri)) = parse_local_cursor(p.cursor.as_deref()) {
                     // A cursor URI that names no key sorts below every row of
                     // its time.
@@ -676,7 +684,7 @@ impl Hydrator {
                     return Ok(Ok(Self::emit(json!({ "posts": [] }))));
                 }
                 qb.push("WITH c AS (SELECT n.author, n.rkey, at_uri(n.author, 1::smallint, n.rkey) AS uri, n.created_at, n.search_tsv");
-                plan.push_from(&mut qb, me, anonymous);
+                plan.push_from(&mut qb, me, anonymous, &relays);
                 qb.push(" ORDER BY n.created_at DESC, n.author DESC, n.rkey DESC LIMIT ").push_bind(i64::from(cfg.top_candidates));
                 qb.push(
                     ") SELECT c.uri, c.created_at FROM c \
@@ -727,7 +735,7 @@ impl Hydrator {
         let cap = i64::from(cfg.hits_total_max);
         let hits: Option<i64> = {
             let mut count: QueryBuilder<'_, Postgres> = QueryBuilder::new("SELECT count(*) FROM (SELECT 1");
-            plan.push_from(&mut count, me, anonymous);
+            plan.push_from(&mut count, me, anonymous, &relays);
             count.push(" LIMIT ").push_bind(cap + 1).push(") s");
             let mut savepoint = tx.begin().await?;
             set_timeout(&mut savepoint, cfg.hits_total_timeout_ms).await?;

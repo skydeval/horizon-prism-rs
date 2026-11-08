@@ -127,13 +127,17 @@ pub(super) fn computed_at() -> [u8; 8] {
 }
 
 /// The pool conditions on `a` (an `actors` row, whose `dids` row is `ad`),
-/// with the activity requirement when `active_days` is given.
-pub(super) fn eligible(active_days: Option<u32>) -> String {
-    let mut sql = "EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) \
-         AND a.account_status = 'active' AND a.handle IS NOT NULL AND a.handle <> 'handle.invalid' \
+/// with the activity requirement when `active_days` is given. `relays` is
+/// the placeholder of the bound takedown relays
+/// ([`crate::moderation::hidden_status_sql`]).
+pub(super) fn eligible(active_days: Option<u32>, relays: &str) -> String {
+    let mut sql = format!(
+        "EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = ad.did) \
+         AND NOT {} AND a.handle IS NOT NULL AND a.handle <> 'handle.invalid' \
          AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = ad.did AND l.val IN ('!takedown', '!hide')) \
-         AND NOT EXISTS (SELECT 1 FROM actor_self_records r WHERE r.author = a.id AND r.coll = 15 AND r.hide_from_recs)"
-        .to_string();
+         AND NOT EXISTS (SELECT 1 FROM actor_self_records r WHERE r.author = a.id AND r.coll = 15 AND r.hide_from_recs)",
+        crate::moderation::hidden_status_sql("a.account_status <> 'active'", "a.id", "ad.did", relays)
+    );
     if let Some(days) = active_days {
         sql.push_str(&format!(
             " AND EXISTS (SELECT 1 FROM posts p WHERE p.author = a.id AND p.created_at > now() - interval '{days} days')"
@@ -176,9 +180,10 @@ impl Hydrator {
         };
         let mut slot = slot.lock().await;
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
-            let sql = format!("SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days)));
+            let sql = format!("SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days), "$2"));
+            let relays = self.hidden_relays().await;
             let started = Instant::now();
-            let found = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await;
+            let found = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).bind(relays).fetch_all(self.pool()).await;
             metrics::histogram!(METRIC_REFRESH_SECONDS).record(started.elapsed().as_secs_f64());
             let dids: Vec<String> = found?;
             slot.ranked = Ranked { dids: Arc::new(dids), rec_id: rec_id("suggestions/v1", &[label.as_bytes(), &computed_at()]) };
@@ -189,17 +194,20 @@ impl Hydrator {
 
     /// Accounts ranked by how many of `sql`'s sample follow them, then by
     /// the popular order, under the statement timeout. `sql` takes the DID
-    /// as `$1`, the sample size as `$2` and the result cap as `$3`, and
-    /// gives `(did, count)`. On a timeout the popular order stands in.
+    /// as `$1`, the sample size as `$2`, the result cap as `$3` and the
+    /// takedown relays as `$4`, and gives `(did, count)`. On a timeout the
+    /// popular order stands in.
     async fn ranked_by_follows(&self, sql: &str, did: &str, sample: u32, endpoint: &'static str) -> Result<Vec<String>, sqlx::Error> {
         let cfg = &self.inner.cfg;
         let popular = self.suggestion_pool(Ordering::Popular).await?;
+        let relays = self.hidden_relays().await;
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.search.statement_timeout_ms).await?;
         let found: Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(sql)
             .bind(did)
             .bind(i64::from(sample))
             .bind(i64::from(cfg.suggestions.pool_size))
+            .bind(relays)
             .fetch_all(&mut *tx)
             .await;
         match found {
@@ -234,7 +242,7 @@ impl Hydrator {
              JOIN actors a ON a.id = f.subject \
              WHERE ad.did <> $1 AND {} \
              GROUP BY ad.did ORDER BY count(*) DESC LIMIT $3",
-            eligible(Some(cfg.active_days))
+            eligible(Some(cfg.active_days), "$4")
         );
         let ranked = self.ranked_by_follows(&sql, me, cfg.fof_max_follows, endpoint).await?;
         let popular = self.suggestion_pool(Ordering::Popular).await?;
@@ -265,7 +273,7 @@ impl Hydrator {
              JOIN actors a ON a.id = f.subject \
              WHERE ad.did <> $1 AND {} \
              GROUP BY ad.did ORDER BY count(*) DESC LIMIT $3",
-            eligible(Some(cfg.active_days))
+            eligible(Some(cfg.active_days), "$4")
         );
         let mut dids = self.ranked_by_follows(&sql, actor, cfg.cofollow_sample_followers, "getSuggestedFollowsByActor").await?;
         if dids.len() < usize::try_from(cfg.cofollow_min).unwrap_or(usize::MAX) {
@@ -390,9 +398,10 @@ impl Hydrator {
                      LEFT JOIN starter_pack_counts c ON c.author = sp.author AND c.rkey = sp.rkey WHERE {} \
                      ORDER BY COALESCE(c.joined_week_count, 0) DESC, COALESCE(c.joined_all_time_count, 0) DESC, sp.author, sp.rkey LIMIT $1",
                     crate::db::lists::uri_sql("ad.did", "app.bsky.graph.starterpack", "sp.rkey"),
-                    eligible(None)
+                    eligible(None, "$2")
                 );
-                slot.0 = Arc::new(sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).fetch_all(self.pool()).await?);
+                let relays = self.hidden_relays().await;
+                slot.0 = Arc::new(sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).bind(relays).fetch_all(self.pool()).await?);
                 slot.1 = Some(Instant::now());
             }
             Arc::clone(&slot.0)

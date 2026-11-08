@@ -35,6 +35,56 @@ fn tracked(col: &str) -> String {
     format!("(EXISTS (SELECT 1 FROM members m WHERE m.did = {col}) OR EXISTS (SELECT 1 FROM sync_state ss WHERE ss.did = {col}))")
 }
 
+/// When full was entered, as stored with its groups; NULL when it was not
+/// recorded (full entered by an older version), so nothing is spared.
+fn full_since() -> String {
+    format!("(SELECT (fsw.value #>> '{{}}')::timestamptz FROM worker_state fsw WHERE fsw.key = '{}')", super::full::SINCE_KEY)
+}
+
+/// A timestamp column written since full was entered.
+fn since_entry(col: &str) -> String {
+    format!("COALESCE({col} >= {}, TRUE)", full_since())
+}
+
+/// A rev column (a TID's stored value) of a commit made since full was
+/// entered: the TID of the entry instant, mapped to stored order.
+fn rev_since_entry(col: &str) -> String {
+    format!(
+        "COALESCE({col} >= ((floor(extract(epoch FROM {}) * 1000000)::bigint << 10) + (-9223372036854775807 - 1)), TRUE)",
+        full_since()
+    )
+}
+
+/// `step` with `extra` added to its predicate, in the delete and in the
+/// candidate query alike.
+fn and_also(mut step: Step, extra: &str) -> Step {
+    let add = |sql: &mut String| {
+        if let Some(at) = sql.rfind(" LIMIT ") {
+            sql.insert_str(at, &format!(" AND {extra}"));
+        }
+    };
+    add(&mut step.sql);
+    if let Some(c) = step.candidates.as_mut() {
+        add(c);
+    }
+    step
+}
+
+/// Community retention's step for `table`, limited to the rows full could
+/// have written. Rows community already held when full was entered are
+/// community's own: its retention decides them, as if full had not run.
+/// Admission keeps only blocks with a member side in every breadth, so the
+/// block steps find only older rows; identity rows are dated by their
+/// creation.
+fn bounded(step: Step) -> Step {
+    match step.table {
+        "blocks" => and_also(step, &rev_since_entry("b.rev")),
+        "list_blocks" => and_also(step, &rev_since_entry("lb.rev")),
+        "actors" => and_also(step, &since_entry("a.indexed_at")),
+        _ => step,
+    }
+}
+
 /// The tables only full writes, and the rows of shared tables full adds to
 /// that no retention step covers.
 fn full_only_steps() -> Vec<Step> {
@@ -43,13 +93,17 @@ fn full_only_steps() -> Vec<Step> {
         batched("constellation_counts", "target", "cc", &format!("NOT {}", kept(target_did)), Bind::None),
         batched_composite("record_tombstones", &["author", "coll", "rkey"], "t", &format!("NOT {}", kept(&did_of("t.author"))), Bind::None),
         // After `actors`: a DID whose identity row stays keeps its document.
+        // Community persists documents of S and the members only, and keeps
+        // each until it expires, so a document fetched before full was
+        // entered stays for retention.
         batched(
             "did_cache",
             "did",
             "dc",
             &format!(
-                "NOT {} AND NOT EXISTS (SELECT 1 FROM actors a JOIN dids ad ON ad.id = a.id WHERE ad.did = dc.did)",
-                kept("dc.did")
+                "NOT {} AND NOT EXISTS (SELECT 1 FROM actors a JOIN dids ad ON ad.id = a.id WHERE ad.did = dc.did) AND {}",
+                kept("dc.did"),
+                since_entry("dc.fetched_at")
             ),
             Bind::None,
         ),
@@ -58,7 +112,14 @@ fn full_only_steps() -> Vec<Step> {
         batched_composite("full_crawl_groups", &["account", "grp"], "fg", "TRUE", Bind::None),
         batched("full_crawl", "account", "fc", "TRUE", Bind::None),
         batched("refract_excluded", "account", "rx", "TRUE", Bind::None),
-        batched("worker_state", "key", "w", &format!("w.key = '{}'", super::full::GROUPS_KEY), Bind::None),
+        // Last: the entry time bounds the steps above until here.
+        batched(
+            "worker_state",
+            "key",
+            "w",
+            &format!("w.key IN ('{}', '{}')", super::full::GROUPS_KEY, super::full::SINCE_KEY),
+            Bind::None,
+        ),
     ]
 }
 
@@ -135,7 +196,7 @@ pub fn step_index(list: SweepList, name: &str) -> Option<usize> {
 /// The steps of `list`, built with the private-tier row authors community
 /// retention keeps.
 pub(super) fn steps(list: SweepList, private_row_authors: Vec<String>) -> Vec<Step> {
-    let mut all = scope_steps(private_row_authors);
+    let mut all: Vec<Step> = scope_steps(private_row_authors).into_iter().map(bounded).collect();
     all.extend(full_only_steps());
     names(list)
         .iter()
@@ -310,6 +371,25 @@ mod tests {
         // search rows, which no drain table covers.
         for name in FULL_DRAIN_STEP_NAMES {
             assert!(!super::super::public_sweep::TABLES.iter().any(|t| t.name == name), "{name}");
+        }
+    }
+
+    /// The block and identity steps are bounded by the entry time in the
+    /// delete and in the candidate query; retention's own steps are not.
+    #[test]
+    fn the_shared_identity_and_block_steps_are_bounded_by_the_entry() {
+        let built = steps(SweepList::Narrowing, Vec::new());
+        let step = |name: &str| built.iter().find(|s| s.table == name).cloned().unwrap_or_else(|| panic!("{name}"));
+        for (name, col) in [("blocks", "b.rev >="), ("list_blocks", "lb.rev >="), ("actors", "a.indexed_at >="), ("did_cache", "dc.fetched_at >=")] {
+            let s = step(name);
+            assert!(s.sql.contains(col), "{name}: {}", s.sql);
+            assert!(s.sql.contains(" LIMIT "), "{name}");
+            if let Some(c) = &s.candidates {
+                assert!(c.contains(col), "{name}: {c}");
+            }
+        }
+        for s in scope_steps(Vec::new()) {
+            assert!(!s.sql.contains(super::super::full::SINCE_KEY), "{}", s.table);
         }
     }
 }

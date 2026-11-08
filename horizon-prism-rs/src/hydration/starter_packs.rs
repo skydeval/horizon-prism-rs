@@ -264,21 +264,23 @@ impl Hydrator {
               WHERE ($1::text IS NULL OR ({exclusions})) \
                 AND sp.search_tsv @@ websearch_to_tsquery('simple', $2) \
                 AND EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = spd.did) \
-                AND COALESCE(a.account_status, 'active') = 'active' AND ($3 OR {SHOWN_SIGNED_OUT})",
+                AND NOT {hidden} AND ($3 OR {SHOWN_SIGNED_OUT})",
             exclusions = viewer_exclusions(),
+            hidden = crate::moderation::hidden_status_sql("COALESCE(a.account_status, 'active') <> 'active'", "sp.author", "spd.did", "$4"),
         );
         let page = format!(
             "SELECT {}{from} \
              ORDER BY COALESCE((SELECT c.joined_all_time_count FROM starter_pack_counts c WHERE c.author = sp.author AND c.rkey = sp.rkey), 0) DESC, \
                       ts_rank_cd(sp.search_tsv, websearch_to_tsquery('simple', $2)) DESC, sp.author, sp.rkey \
-             LIMIT $4 OFFSET $5",
+             LIMIT $5 OFFSET $6",
             crate::db::lists::uri_sql("spd.did", NSID_STARTERPACK, "sp.rkey")
         );
         let me = viewer.state_did();
         let signed_in = viewer.did.is_some();
+        let relays = self.hidden_relays().await;
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.statement_timeout_ms).await?;
-        let found = sqlx::query_scalar(&page).bind(me).bind(q).bind(signed_in).bind(limit).bind(offset).fetch_all(&mut *tx).await;
+        let found = sqlx::query_scalar(&page).bind(me).bind(q).bind(signed_in).bind(&relays).bind(limit).bind(offset).fetch_all(&mut *tx).await;
         let uris: Vec<String> = match found {
             Ok(uris) => uris,
             Err(error) if timed_out(&error) => {
@@ -292,11 +294,11 @@ impl Hydrator {
         let cap = i64::from(cfg.hits_total_max);
         let mut hits: Option<i64> = None;
         if v2 {
-            let count = format!("SELECT count(*) FROM (SELECT 1{from} LIMIT $4) s");
+            let count = format!("SELECT count(*) FROM (SELECT 1{from} LIMIT $5) s");
             let mut savepoint = tx.begin().await?;
             set_timeout(&mut savepoint, cfg.hits_total_timeout_ms).await?;
             let counted: Result<i64, sqlx::Error> =
-                sqlx::query_scalar(&count).bind(me).bind(q).bind(signed_in).bind(cap + 1).fetch_one(&mut *savepoint).await;
+                sqlx::query_scalar(&count).bind(me).bind(q).bind(signed_in).bind(&relays).bind(cap + 1).fetch_one(&mut *savepoint).await;
             match counted {
                 Ok(n) => {
                     savepoint.commit().await?;

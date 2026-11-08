@@ -762,6 +762,17 @@ impl Hydrator {
         if req.is_local_only() { dids.to_vec() } else { self.readable_dids(dids).await }
     }
 
+    /// The takedown relays whose non-active statuses hide an account in an
+    /// SQL read ([`crate::moderation::hidden_status_sql`]): empty outside
+    /// full and under `suspended_accounts = "all"`.
+    pub(crate) async fn hidden_relays(&self) -> Vec<String> {
+        if self.scope().public_breadth() != crate::indexing::Breadth::Full {
+            return Vec::new();
+        }
+        let sets = self.scope().read_guard().await;
+        if sets.public.breadth == crate::indexing::Breadth::Full { sets.full.takedown_relays.clone() } else { Vec::new() }
+    }
+
     /// The moderation gate for `subjects` (§II-7.10), with `account_status`
     /// read only for the authors `req` may read (§11 G-9): any other
     /// author's status row is treated as absent, so the gate cannot reveal

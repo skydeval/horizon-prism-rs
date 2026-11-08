@@ -200,6 +200,14 @@ impl ScopeSets {
         self.public.mode.is_on() && self.public.breadth != Breadth::Narrowing && self.in_scope(did)
     }
 
+    /// The own-repo rule for a stored handle: local for S and the members
+    /// in every mode, as before full, and never while narrowing. Any other
+    /// account would need a crawl mark, so it reads today's source.
+    #[must_use]
+    pub fn own_handle_local(&self, did: &str) -> bool {
+        self.public.breadth != Breadth::Narrowing && (self.in_scope(did) || self.is_member(did))
+    }
+
     #[must_use]
     pub fn is_member(&self, did: &str) -> bool {
         self.members.contains(did)

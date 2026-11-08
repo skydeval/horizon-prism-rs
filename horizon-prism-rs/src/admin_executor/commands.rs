@@ -74,6 +74,10 @@ pub enum AdminCommand {
     IndexingPublicScope { value: ScopeValue },
     /// `indexing status`: the switch's row, mode, phase and progress.
     IndexingStatus,
+    /// `firehose forget-cap <label>`: forget a relay's remembered
+    /// capability, so a downgraded unfiltered relay reader counts as whole
+    /// again.
+    FirehoseForgetCap { label: String },
     /// `operator add <handle-or-did> [--note]` (admin-ui design §5.7): the
     /// account is resolved afresh here. With `add_host` (the CLI), its
     /// exact host is allowed unless a pattern covers it; without (the UI),
@@ -142,6 +146,7 @@ impl AdminCommand {
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
             Self::IndexingPublicScope { value } => ("indexing public-scope", json!({ "value": value.as_str() })),
             Self::IndexingStatus => ("indexing status", json!({})),
+            Self::FirehoseForgetCap { label } => ("firehose forget-cap", json!({ "label": label })),
             Self::OperatorAdd { input, note, add_host } => {
                 ("operator add", json!({ "input": input, "note": note, "add_host": add_host }))
             }
@@ -255,6 +260,10 @@ impl AdminCommand {
                 }
             }
             "indexing status" => Self::IndexingStatus,
+            "firehose forget-cap" => match args.get("label").and_then(Value::as_str) {
+                Some(l) if !l.is_empty() && l.len() <= 200 && !l.chars().any(char::is_whitespace) => Self::FirehoseForgetCap { label: l.to_string() },
+                _ => return Err(InvalidCommand(format!("{command}: label must be a relay label"))),
+            },
             "operator add" => {
                 let input = s("input")?;
                 if !(is_did(&input) || (proto_blue::syntax::Handle::is_valid(&input) && input == input.to_ascii_lowercase())) {
@@ -329,6 +338,7 @@ impl AdminCommand {
             | Self::FarsightStatus
             | Self::IndexingPublicScope { .. }
             | Self::IndexingStatus
+            | Self::FirehoseForgetCap { .. }
             | Self::OperatorAdd { .. }
             | Self::OperatorRemove { .. }
             | Self::OperatorHostAdd { .. }
@@ -489,6 +499,7 @@ impl Handlers {
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
             AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value, actor).await,
             AdminCommand::IndexingStatus => self.public.status().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FirehoseForgetCap { label } => self.firehose_forget_cap(label).await,
             AdminCommand::OperatorAdd { input, note, add_host } => self.operator_add(input, note.as_deref(), *add_host, actor).await,
             AdminCommand::OperatorRemove { did } => settled(operators::remove(&self.pool, did).await),
             AdminCommand::OperatorHostAdd { pattern } => {
@@ -567,6 +578,15 @@ impl Handlers {
             }
             Err(failure) => settled::<Value>(Err(failure)),
         }
+    }
+
+    /// `firehose forget-cap`: the stored stamp is removed, then the running
+    /// consumer forgets it before its next entry, so neither a restart nor
+    /// its next save brings it back.
+    async fn firehose_forget_cap(&self, label: &str) -> Result<Outcome, String> {
+        let remembered = crate::firehose::tier::forget_cap(&self.pool, label).await.map_err(|e| e.to_string())?;
+        self.public.tier_board().request_forget(label);
+        Ok(Outcome::Done(json!({ "label": label, "remembered": remembered })))
     }
 
     /// `indexing public-scope` (public-indexing design §3.4): the command's
@@ -1102,10 +1122,13 @@ mod tests {
             AdminCommand::Resync,
             AdminCommand::DeadletterReplay { id: "1-0".into() },
             AdminCommand::DeadletterDrop { id: "17-3".into() },
+            AdminCommand::FirehoseForgetCap { label: "bsky".into() },
         ] {
             let (command, args) = cmd.to_row();
             assert_eq!(AdminCommand::parse(command, &args), Ok(cmd));
         }
+        assert!(AdminCommand::parse("firehose forget-cap", &json!({"label": ""})).is_err());
+        assert!(AdminCommand::parse("firehose forget-cap", &json!({"label": "two words"})).is_err());
     }
 
     #[test]

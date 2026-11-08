@@ -520,10 +520,16 @@ impl PublicIndexing {
                 .execute(&mut *tx)
                 .await?;
         }
-        if t.breadth == Breadth::Full {
+        let excluded = if t.breadth == Breadth::Full {
             super::full::reset_groups(&mut tx, cg, &self.full_kinds).await?;
-        }
+            Some(super::full::excluded_dids(&mut tx).await?)
+        } else {
+            None
+        };
         tx.commit().await?;
+        if let Some(dids) = excluded {
+            sets.full.excluded.replace(dids.into_iter().collect());
+        }
         let state = state_of(&t);
         self.set_state(&mut sets, state);
         drop(sets);

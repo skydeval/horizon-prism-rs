@@ -162,13 +162,14 @@ impl Hydrator {
                  JOIN dids ad ON ad.id = p.author JOIN actors a ON a.id = p.author WHERE {} \
                  GROUP BY t.tag HAVING count(*) >= $3 AND count(DISTINCT p.author) >= $4 \
                  ORDER BY count(*) DESC, t.tag",
-                eligible(None)
+                eligible(None, "$5")
             );
             let tags: Vec<String> = sqlx::query_scalar(&sql)
                 .bind(&candidates)
                 .bind(hours)
                 .bind(i64::from(cfg.min_posts))
                 .bind(i64::from(cfg.min_authors))
+                .bind(self.hidden_relays().await)
                 .fetch_all(self.pool())
                 .await?;
             slot.items = Arc::new(tags.into_iter().map(|tag| Topic { tag }).collect());
@@ -236,7 +237,7 @@ impl Hydrator {
              FROM unnest($1::text[]) AS t(tag) \
              JOIN post_search p ON p.tags @> ARRAY[t.tag] AND p.created_at >= now() - make_interval(hours => $2 + $3) \
              JOIN dids ad ON ad.id = p.author JOIN actors a ON a.id = p.author WHERE {}",
-            eligible(None)
+            eligible(None, "$4")
         );
         let counted = format!(
             "WITH subj AS ({subjects}) SELECT tag, count(*), count(DISTINCT author_did) FROM subj \
@@ -260,17 +261,18 @@ impl Hydrator {
             engagement("reposts", "e.subj_author = s.author_id AND e.subj_rkey = s.rkey_id AND e.subj_coll = 1"),
             engagement("posts", "e.parent_author = s.author_id AND e.parent_rkey = s.rkey_id AND e.parent_coll = 1"),
         );
+        let relays = self.hidden_relays().await;
         let mut tx = self.pool().begin().await?;
         set_timeout(&mut tx, cfg.refresh_timeout_ms).await?;
         let counts: Result<Vec<(String, i64, i64)>, sqlx::Error> =
-            sqlx::query_as(&counted).bind(&candidates).bind(window).bind(lookback).fetch_all(&mut *tx).await;
+            sqlx::query_as(&counted).bind(&candidates).bind(window).bind(lookback).bind(&relays).fetch_all(&mut *tx).await;
         let counts = match counts {
             Ok(rows) => rows,
             Err(error) if timed_out(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
         let rows: Result<Vec<Engaged>, sqlx::Error> =
-            sqlx::query_as(&series).bind(&candidates).bind(window).bind(lookback).fetch_all(&mut *tx).await;
+            sqlx::query_as(&series).bind(&candidates).bind(window).bind(lookback).bind(&relays).fetch_all(&mut *tx).await;
         let rows = match rows {
             Ok(rows) => rows,
             Err(error) if timed_out(&error) => return Ok(None),

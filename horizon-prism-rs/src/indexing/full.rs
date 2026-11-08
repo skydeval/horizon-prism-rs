@@ -73,6 +73,9 @@ pub fn authored_tables(kinds: &[FullGroup]) -> Vec<&'static str> {
 
 /// The `worker_state` key of each group's history.
 pub const GROUPS_KEY: &str = "full_groups";
+/// The `worker_state` key of when full was entered: kept through an
+/// interrupted narrowing, removed when the narrowing or the drain ends.
+pub const SINCE_KEY: &str = "full_since";
 
 /// Whether community retention's scope step over `table` is skipped in
 /// full: public scope steps delete nothing of an enabled group. Search rows
@@ -126,13 +129,30 @@ pub async fn reset_groups(conn: &mut sqlx::PgConnection, crawl_generation: u64, 
     )
     .bind(GROUPS_KEY)
     .bind(value)
-    .execute(conn)
+    .execute(&mut *conn)
     .await?;
+    // The first entry's time stays: a narrowing stopped by a switch back
+    // has not removed what full wrote before it.
+    sqlx::query("INSERT INTO worker_state (key, value, updated_at) VALUES ($1, to_jsonb(now()), now()) ON CONFLICT (key) DO NOTHING")
+        .bind(SINCE_KEY)
+        .execute(conn)
+        .await?;
     Ok(())
 }
 
+/// The accounts excluded after their Refract restoration ended, read in
+/// the caller's transaction.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn excluded_dids(conn: &mut sqlx::PgConnection) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT d.did FROM refract_excluded x JOIN dids d ON d.id = x.account").fetch_all(conn).await
+}
+
 /// Record one takedown relay's `#account` status: a non-active status is
-/// kept per relay, a return to active deletes it. An event without an
+/// kept per relay, from when the suspension began; a return to active
+/// deletes it. An event without an
 /// `active` flag says nothing and writes nothing. The DID is interned in
 /// its own statement first.
 ///
@@ -154,7 +174,7 @@ pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, ac
             sqlx::query("INSERT INTO dids (did) VALUES ($1) ON CONFLICT (did) DO NOTHING").bind(did).execute(pool).await?;
             sqlx::query(
                 "INSERT INTO relay_account_status (account, relay, status) SELECT id, $2, $3 FROM dids WHERE did = $1 \
-                 ON CONFLICT (account, relay) DO UPDATE SET status = EXCLUDED.status, at = now()",
+                 ON CONFLICT (account, relay) DO UPDATE SET status = EXCLUDED.status",
             )
             .bind(did)
             .bind(relay)
@@ -164,6 +184,77 @@ pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, ac
             metrics::counter!(METRIC_SUSPENDED, "relay" => relay.to_string()).increment(1);
             Ok(())
         }
+    }
+}
+
+/// The accounts whose takedown-relay suspension has lasted `days`: outside
+/// S, not members and not listed by Refract.
+const LONG_SUSPENDED_SQL: &str = "SELECT DISTINCT d.did FROM relay_account_status r JOIN dids d ON d.id = r.account \
+     WHERE r.relay = ANY($1) AND r.at < now() - make_interval(days => $2) \
+       AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = d.did) \
+       AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = d.did) \
+       AND NOT EXISTS (SELECT 1 FROM refract_dids rf WHERE rf.did = d.did AND rf.state IN ('restored', 'grace')) \
+     ORDER BY d.did LIMIT 1000";
+
+/// Metric: accounts whose stored public rows were removed after a long
+/// suspension.
+pub const METRIC_SUSPENDED_PURGED: &str = "full_suspended_purged_total";
+
+/// The daily removal of long-suspended accounts' public rows: in full under
+/// `suspended_accounts = "refract_only"`, an account a takedown relay has
+/// suspended for `[full] suspended_purge_days` (0: never) loses its own
+/// public rows, by the per-account steps community retention uses, so its
+/// likes, replies and quotes of members' posts stay, as a narrowing keeps
+/// them.
+pub struct SuspendedPurge {
+    scope: crate::aggregations::ScopeState,
+    days: u32,
+}
+
+impl SuspendedPurge {
+    #[must_use]
+    pub fn new(scope: crate::aggregations::ScopeState, days: u32) -> Self {
+        Self { scope, days }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::db::retention::RetentionTask for SuspendedPurge {
+    fn name(&self) -> &'static str {
+        "full_suspended"
+    }
+
+    async fn run(
+        &self,
+        pool: &sqlx::PgPool,
+        guard: &dyn crate::db::retention::ScopeGuard,
+        _settings: &crate::db::retention::RetentionSettings,
+    ) -> Result<crate::db::retention::RetentionReport, sqlx::Error> {
+        let mut report = crate::db::retention::RetentionReport::default();
+        let relays = {
+            let sets = self.scope.read_guard().await;
+            if sets.public.breadth == crate::indexing::Breadth::Full { sets.full.takedown_relays.clone() } else { Vec::new() }
+        };
+        if relays.is_empty() || self.days == 0 {
+            return Ok(report);
+        }
+        let days = i32::try_from(self.days).unwrap_or(i32::MAX);
+        let dids: Vec<String> = sqlx::query_scalar(LONG_SUSPENDED_SQL).bind(&relays).bind(days).fetch_all(pool).await?;
+        if dids.is_empty() {
+            return Ok(report);
+        }
+        let steps = crate::db::retention::scope_steps(crate::private_tier::retention::row_authors(pool).await?);
+        let mut totals: std::collections::BTreeMap<&'static str, u64> = std::collections::BTreeMap::new();
+        for did in &dids {
+            for step in steps.iter().filter(|s| s.candidates.is_some()) {
+                let n = crate::db::retention::delete_did_rows(pool, guard, step, did, false).await?;
+                *totals.entry(step.table).or_default() += n;
+            }
+        }
+        metrics::counter!(METRIC_SUSPENDED_PURGED).increment(u64::try_from(dids.len()).unwrap_or(u64::MAX));
+        tracing::info!(event = "full_suspended_purged", accounts = dids.len(), days = self.days, "long-suspended accounts' public rows removed");
+        report.deleted = totals.into_iter().collect();
+        Ok(report)
     }
 }
 

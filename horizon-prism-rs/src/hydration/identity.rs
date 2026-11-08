@@ -32,10 +32,7 @@ impl Hydrator {
         }
         let stored = crate::db::actors::did_of_handle(self.pool(), &handle).await?;
         if let Some(did) = stored {
-            let indexed = {
-                let scope = self.scope().read_guard().await;
-                scope.in_scope(&did) || scope.is_member(&did)
-            };
+            let indexed = self.scope().read_guard().await.own_handle_local(&did);
             if indexed {
                 metrics::counter!(METRIC_HANDLE_RESOLUTIONS, "intent" => "public", "result" => "local").increment(1);
                 return Ok(Ok(Self::emit(json!({ "did": did }))));
@@ -132,6 +129,30 @@ mod tests {
         let text = handle.render();
         let local = crate::test_support::series(&text, METRIC_HANDLE_RESOLUTIONS, &["intent=\"public\"", "result=\"local\""]);
         assert_eq!(local, Some(1.0), "{text}");
+        db.drop_db().await;
+    }
+
+    /// While full narrows, even an indexed account's handle reads the
+    /// network's answer; in full it is local as in community.
+    #[tokio::test]
+    async fn a_handle_reads_the_network_while_narrowing() {
+        let Some(db) = fresh_db("hydration_resolve_handle_narrowing").await else {
+            return;
+        };
+        let p = &db.pool;
+        actor(p, ALICE, "alice.test", "Alice").await;
+        for (breadth, local) in [(crate::indexing::Breadth::Full, true), (crate::indexing::Breadth::Narrowing, false)] {
+            let mut sets = ScopeSets::default();
+            sets.scope.insert(ALICE.into());
+            sets.public.breadth = breadth;
+            let h = hydrator_with(p, sets, Arc::new(Handles));
+            let r = h.resolve_handle(&Requester::test(), "alice.test").await.expect("db");
+            if local {
+                assert_eq!(r.expect("view").inner()["did"], ALICE, "{breadth:?}");
+            } else {
+                assert_eq!(r.expect_err("upstream").error, "HandleNotFound", "{breadth:?}: the network does not know it");
+            }
+        }
         db.drop_db().await;
     }
 }

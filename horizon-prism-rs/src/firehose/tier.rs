@@ -42,6 +42,57 @@ impl CopyTier {
     }
 }
 
+/// One relay's current tier, for status and Health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayTier {
+    pub tier: CopyTier,
+    /// The full-set collections its filter leaves out.
+    pub left_out: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct BoardState {
+    relays: BTreeMap<String, RelayTier>,
+    forget: Vec<String>,
+}
+
+/// What the consumer shares about relay tiers: each relay's current tier,
+/// and the labels whose remembered stamps the operator asked to forget,
+/// which the consumer takes before its next entry.
+#[derive(Debug, Default)]
+pub struct TierBoard(std::sync::Mutex<BoardState>);
+
+impl TierBoard {
+    fn state(&self) -> std::sync::MutexGuard<'_, BoardState> {
+        self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Ask the consumer to forget `label`'s remembered stamp.
+    pub fn request_forget(&self, label: &str) {
+        self.state().forget.push(label.to_string());
+    }
+
+    /// The labels to forget, taken once.
+    #[must_use]
+    pub fn take_forgets(&self) -> Vec<String> {
+        std::mem::take(&mut self.state().forget)
+    }
+
+    fn set(&self, label: &str, tier: RelayTier) {
+        self.state().relays.insert(label.to_string(), tier);
+    }
+
+    fn remove(&self, label: &str) {
+        self.state().relays.remove(label);
+    }
+
+    /// Every relay seen since the start, with its tier.
+    #[must_use]
+    pub fn relays(&self) -> BTreeMap<String, RelayTier> {
+        self.state().relays.clone()
+    }
+}
+
 /// Tiers per relay label, with the stamps last seen.
 #[derive(Debug, Clone)]
 pub struct Tiers {
@@ -52,6 +103,8 @@ pub struct Tiers {
     last: BTreeMap<String, Option<BTreeSet<String>>>,
     /// Label → the tier last logged, so a change is logged once.
     logged: BTreeMap<String, CopyTier>,
+    /// Where a tier change is shown.
+    board: std::sync::Arc<TierBoard>,
 }
 
 impl Tiers {
@@ -65,7 +118,32 @@ impl Tiers {
             old_filtered: old_filtered.into_iter().collect(),
             last: BTreeMap::new(),
             logged: BTreeMap::new(),
+            board: std::sync::Arc::default(),
         }
+    }
+
+    /// The board tier changes are shown on.
+    #[must_use]
+    pub fn board(&self) -> std::sync::Arc<TierBoard> {
+        std::sync::Arc::clone(&self.board)
+    }
+
+    /// Show tier changes on `board`.
+    #[must_use]
+    pub fn with_board(mut self, board: std::sync::Arc<TierBoard>) -> Self {
+        self.board = board;
+        self
+    }
+
+    /// Forget the stamps the operator asked to forget on the board.
+    /// Returns whether any was taken (and the stamps should be persisted).
+    pub fn take_forgets(&mut self) -> bool {
+        let labels = self.board.take_forgets();
+        for label in &labels {
+            tracing::info!(event = "firehose_relay_cap_forgotten", relay = %label, "a relay's remembered capability was forgotten");
+            self.forget(label);
+        }
+        !labels.is_empty()
     }
 
     /// The tier of a filter.
@@ -112,6 +190,7 @@ impl Tiers {
         let tier = self.tier(label, cap);
         if self.logged.get(label) != Some(&tier) {
             self.logged.insert(label.to_string(), tier);
+            self.board.set(label, RelayTier { tier, left_out: self.left_out(cap) });
             if tier == CopyTier::Aside {
                 let left_out = self.left_out(cap);
                 tracing::warn!(
@@ -140,6 +219,7 @@ impl Tiers {
     pub fn forget(&mut self, label: &str) {
         self.last.remove(label);
         self.logged.remove(label);
+        self.board.remove(label);
     }
 
     fn to_json(&self) -> Json {
@@ -273,6 +353,31 @@ mod tests {
         assert_eq!(t.tier("bsky", None), CopyTier::Aside);
         t.forget("bsky");
         assert_eq!(t.tier("bsky", None), CopyTier::Whole);
+    }
+
+    /// The board shows each relay's tier as it changes, with what an aside
+    /// relay's filter leaves out; a forget asked on the board is taken once
+    /// and turns a downgraded unfiltered reader back to whole.
+    #[test]
+    fn the_board_shows_tiers_and_carries_forgets() {
+        let board = std::sync::Arc::new(TierBoard::default());
+        let mut t = Tiers::new(full_set(&FullGroup::ALL), Vec::new()).with_board(std::sync::Arc::clone(&board));
+        t.observe("bsky", Some(&cap(None)));
+        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Whole, left_out: Vec::new() });
+        let no_likes: Vec<&str> = STORED_SET.iter().copied().filter(|c| *c != "app.bsky.feed.like").collect();
+        t.observe("bsky", Some(&cap(Some(&no_likes))));
+        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Aside, left_out: vec!["app.bsky.feed.like".to_string()] });
+        // The reader is replaced by one that stamps nothing: still aside.
+        t.observe("bsky", None);
+        assert_eq!(t.tier("bsky", None), CopyTier::Aside);
+        assert!(!t.take_forgets(), "nothing asked");
+        board.request_forget("bsky");
+        assert!(t.take_forgets());
+        assert!(!t.take_forgets(), "taken once");
+        assert_eq!(t.tier("bsky", None), CopyTier::Whole);
+        assert!(!board.relays().contains_key("bsky"), "shown again at its next entry");
+        t.observe("bsky", None);
+        assert_eq!(board.relays()["bsky"].tier, CopyTier::Whole);
     }
 
     /// The remembered stamps survive a restart, and `forget_cap` removes one.

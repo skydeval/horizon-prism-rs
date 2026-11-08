@@ -69,6 +69,11 @@ pub enum AdminCmd {
         #[command(subcommand)]
         action: StreamAction,
     },
+    /// The relays' stream readers.
+    Firehose {
+        #[command(subcommand)]
+        action: FirehoseAction,
+    },
     /// The admin command queue (read-only).
     Commands {
         #[command(subcommand)]
@@ -289,6 +294,16 @@ pub enum StreamAction {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum FirehoseAction {
+    /// Forget the capability a relay's reader last stamped, so a reader
+    /// downgraded to one that stamps nothing counts as unfiltered again.
+    ForgetCap {
+        /// The relay's label (firehose.relay_labels).
+        label: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum CommandsAction {
     List {
         /// queued | running | done | failed
@@ -417,6 +432,7 @@ impl AdminCmd {
                 value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only, community or full, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
+            Self::Firehose { action: FirehoseAction::ForgetCap { label } } => AdminCommand::FirehoseForgetCap { label: label.clone() },
             Self::Refract { action: RefractAction::Check { did } } => AdminCommand::RefractCheck { did: did.clone() },
             Self::Refract { action: RefractAction::End { did, reason } } => AdminCommand::RefractEnd { did: did.clone(), reason: reason.clone() },
             Self::Refract { action: RefractAction::Keep { scope } } => AdminCommand::RefractKeep { scope: scope.clone(), keep: true },

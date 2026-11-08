@@ -568,8 +568,8 @@ impl Hydrator {
         crate::db::tombstones::tombstoned(self.pool(), uris).await
     }
 
-    /// Whether the author's account is locally known to be `active`.
-    /// "Locally known" needs the author in scope or a member: the row of any
+    /// Whether the author's account is locally known to be `active`, and no
+    /// takedown relay's suspension hides it. "Locally known" needs the author in scope or a member: the row of any
     /// other DID (a private owner, the author of a private reply) is
     /// treated as absent (design-v3 §11 G-9, §II-10.4; R3-142).
     ///
@@ -580,10 +580,17 @@ impl Hydrator {
         if !self.in_scope_or_member(did).await {
             return Ok(false);
         }
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) AND account_status = 'active')")
-            .bind(did)
-            .fetch_one(self.pool())
-            .await
+        let sql = format!(
+            "SELECT NOT {}",
+            crate::moderation::hidden_status_sql(
+                "NOT EXISTS (SELECT 1 FROM actors WHERE id = (SELECT id FROM dids WHERE did = $1) AND account_status = 'active')",
+                "(SELECT id FROM dids WHERE did = $1)",
+                "$1",
+                "$2",
+            )
+        );
+        let relays = self.hidden_relays().await;
+        sqlx::query_scalar(&sql).bind(did).bind(relays).fetch_one(self.pool()).await
     }
 
     /// Of `uris`, the posts stored here, each with the parent its row

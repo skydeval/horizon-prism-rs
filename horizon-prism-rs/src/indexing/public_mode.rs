@@ -804,6 +804,8 @@ pub struct PublicIndexing {
     pub(super) progress: Arc<Mutex<Progress>>,
     /// `[full] kinds`: the groups full indexing stores for every account.
     pub(super) full_kinds: Vec<crate::config::FullGroup>,
+    /// The relays' copy tiers, which the firehose consumer shows here.
+    tier_board: Arc<crate::firehose::tier::TierBoard>,
     #[cfg(test)]
     pub(super) hooks: Arc<hooks::Hooks>,
 }
@@ -817,9 +819,16 @@ impl PublicIndexing {
             settings,
             progress: Arc::default(),
             full_kinds: crate::config::FullGroup::ALL.to_vec(),
+            tier_board: Arc::default(),
             #[cfg(test)]
             hooks: Arc::default(),
         }
+    }
+
+    /// The relays' copy tiers, shared with the firehose consumer.
+    #[must_use]
+    pub fn tier_board(&self) -> Arc<crate::firehose::tier::TierBoard> {
+        Arc::clone(&self.tier_board)
     }
 
     /// With `[full] kinds`.
@@ -906,7 +915,7 @@ impl PublicIndexing {
                 "UPDATE worker_state SET value = jsonb_set(value, '{sweep}', $3), updated_at = now() \
                  WHERE key = 'public_transition' AND value->>'phase' = $1 AND (value->>'generation')::bigint = $2",
             )
-            .bind(Phase::Draining.as_str())
+            .bind(t.phase.as_str())
             .bind(g64(t.generation))
             .bind(serde_json::to_value(sweep).unwrap_or(Value::Null))
             .execute(&self.pool)
@@ -1148,10 +1157,18 @@ impl PublicIndexing {
         .execute(&mut *tx)
         .await?;
         upsert_transition(&mut tx, &change).await?;
-        if change.breadth == Breadth::Full && current.breadth != Breadth::Full {
+        // Entering full: the excluded accounts are read again, since a
+        // narrowing may have removed rows the set still holds.
+        let excluded = if change.breadth == Breadth::Full && current.breadth != Breadth::Full {
             super::full::reset_groups(&mut tx, change.crawl_generation, &self.full_kinds).await?;
-        }
+            Some(super::full::excluded_dids(&mut tx).await?)
+        } else {
+            None
+        };
         tx.commit().await?;
+        if let Some(dids) = excluded {
+            sets.full.excluded.replace(dids.into_iter().collect());
+        }
         let state = state_of(&change);
         let spawn = spawn_of(&change);
         let action = match (change.phase, current.breadth == change.breadth) {
@@ -1233,10 +1250,25 @@ impl PublicIndexing {
             Some((v, f, at, by)) => (v, f.unwrap_or(Value::Null), json!(rfc3339(&at)), json!(by)),
             None => (Value::Null, Value::Null, Value::Null, Value::Null),
         };
+        // Every relay's copy tier, and the accounts excluded after their
+        // Refract restoration ended.
+        let relays: serde_json::Map<String, Value> = self
+            .tier_board
+            .relays()
+            .into_iter()
+            .map(|(label, t)| (label, json!({ "tier": t.tier.as_str(), "left_out": t.left_out })))
+            .collect();
+        let (excluded, excluded_bytes) = {
+            let sets = self.scope.read_guard().await;
+            (sets.full.excluded.len(), sets.full.excluded.bytes())
+        };
         Ok(json!({
             "value": value,
             "mode": mode.as_str(),
             "breadth": self.breadth().as_str(),
+            "relays": relays,
+            "excluded_accounts": excluded,
+            "excluded_bytes": excluded_bytes,
             "crawl_generation": field("crawl_generation"),
             "s_filled": field("s_filled"),
             "file_apply_error": p.file_apply_error,

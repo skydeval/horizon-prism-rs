@@ -676,6 +676,18 @@ async fn delete_for_did(
     step: &Step,
     did: &str,
 ) -> Result<u64, sqlx::Error> {
+    delete_did_rows(pool, scope, step, did, true).await
+}
+
+/// [`delete_for_did`] for a DID named by the caller rather than by the
+/// step's candidates: an empty first batch is not counted as a recheck.
+pub(crate) async fn delete_did_rows(
+    pool: &PgPool,
+    scope: &dyn ScopeGuard,
+    step: &Step,
+    did: &str,
+    count_recheck: bool,
+) -> Result<u64, sqlx::Error> {
     let mut total = 0u64;
     let mut first = true;
     loop {
@@ -691,7 +703,7 @@ async fn delete_for_did(
         let n = query.execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         drop(guard);
-        if first && n == 0 {
+        if count_recheck && first && n == 0 {
             metrics::counter!(METRIC_SKIPPED_BY_RECHECK, "table" => step.table).increment(1);
             tracing::debug!(event = "retention_did_skipped_by_recheck", table = step.table, did, "DID re-entered scope before its rows were deleted");
         }

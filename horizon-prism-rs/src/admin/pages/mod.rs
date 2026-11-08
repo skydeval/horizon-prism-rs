@@ -396,6 +396,7 @@ pub fn describe(command: &str, args: &Value) -> String {
             }
         ),
         "indexing status" => "Read the public data status".to_string(),
+        "firehose forget-cap" => format!("Forget the remembered capability of relay {}", arg(args, "label")),
         "settings set" => {
             let names: Vec<String> = args
                 .get("changes")

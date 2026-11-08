@@ -1266,6 +1266,74 @@ async fn narrowing_deletes_what_full_added_and_refills() {
     db.drop_db().await;
 }
 
+/// The narrowing removes only what full could have added: what community
+/// held when full was entered stays (a cached document of a DID outside S,
+/// an identity row of one, a block with no member side from before), and
+/// the same kinds written during full go. A narrowing stopped by a switch
+/// back to full keeps the first entry's time, and entering full reads the
+/// excluded accounts again.
+#[tokio::test]
+async fn narrowing_keeps_what_community_held_before_full() {
+    const OLD_ACTOR: &str = "did:plc:ffffffffffffffffffffffff";
+    const OLD_DOC: &str = "did:plc:gggggggggggggggggggggggg";
+    let Some(db) = fresh_db("full_narrowing_keeps").await else {
+        return;
+    };
+    let p = &db.pool;
+    members(p, &[MEMBER]).await;
+    in_scope(p, &[MEMBER, B]).await;
+    // Community's own rows, from before full.
+    crate::test_support::graph::block(p, D, B, "3kaaaaaaaaa28").await;
+    exec(
+        p,
+        &format!(
+            "{}; INSERT INTO did_cache (did, doc, fetched_at, stale_at, expires_at) \
+             VALUES ('{OLD_DOC}', '{{}}', now() - interval '1 hour', now(), now() + interval '1 day');",
+            crate::test_support::actors::put_sql(OLD_ACTOR, &[("indexed_at", "now() - interval '1 hour'")])
+        ),
+    )
+    .await;
+    seed(p, "community", Some(json!({"value": "community", "explicit": true})), &Transition::settled(Phase::On, 3, now(), None).to_json()).await;
+    let quick = PublicModeSettings { fill_max_wait: Duration::ZERO, ..settings() };
+    let (pi, scope) = boot(p, quick).await;
+    assert_eq!(pi.startup(&file(Some(PublicScope::Community))).await.expect("startup"), None);
+    assert_eq!(pi.apply_scope(ScopeValue::Full, "cli").await.expect("full").action, "breadth");
+    let since: Value = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'full_since'").fetch_one(p).await.expect("entry time");
+    // What full writes: a stranger's block, identity row and document.
+    let t = (u64::try_from((Utc::now() + TimeDelta::minutes(1)).timestamp_micros()).expect("micros") << 10) + 1;
+    let rev = crate::db::ids::rev_string(i64::from_ne_bytes((t ^ (1u64 << 63)).to_ne_bytes()));
+    crate::test_support::graph::Edge::block(STRANGER, D, "3kaaaaaaaaa29").rev(&rev).put(p).await;
+    exec(
+        p,
+        &format!(
+            "{}; INSERT INTO did_cache (did, doc, fetched_at, stale_at, expires_at) VALUES ('{STRANGER}', '{{}}', now(), now(), now() + interval '1 day');",
+            crate::test_support::actors::put_sql(STRANGER, &[("pds_endpoint", "'https://pds.example'")])
+        ),
+    )
+    .await;
+    // Narrow, stop it by going back to full, then narrow again: the first
+    // entry's time stays, and the excluded set is read from the table.
+    assert_eq!(pi.apply_scope(ScopeValue::Community, "cli").await.expect("narrow").action, "narrowing");
+    scope.read_guard().await.full.excluded.insert(STRANGER);
+    assert_eq!(pi.apply_scope(ScopeValue::Full, "cli").await.expect("back").action, "breadth");
+    assert!(!scope.read_guard().await.full.excluded.contains(STRANGER), "entering full reads the excluded set again");
+    let again: Value = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'full_since'").fetch_one(p).await.expect("entry time");
+    assert_eq!(again, since, "a stopped narrowing keeps the first entry's time");
+    let applied = pi.apply_scope(ScopeValue::Community, "cli").await.expect("narrow");
+    drop(pi.spawn(applied.spawn.expect("the narrowing sweep")));
+    eventually("on, community", async || scope.public_mode() == PublicMode::On && scope.public_breadth() == Breadth::Community).await;
+    // Community's rows stay.
+    assert_eq!(rows_of(p, "blocks", D).await, 1, "a block from before full stays for retention");
+    assert_eq!(count(p, &format!("SELECT count(*) FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = '{OLD_ACTOR}'")).await, 1);
+    assert_eq!(count(p, &format!("SELECT count(*) FROM did_cache WHERE did = '{OLD_DOC}'")).await, 1);
+    // What full wrote goes.
+    assert_eq!(rows_of(p, "blocks", STRANGER).await, 0);
+    assert_eq!(count(p, &format!("SELECT count(*) FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = '{STRANGER}'")).await, 0);
+    assert_eq!(count(p, &format!("SELECT count(*) FROM did_cache WHERE did = '{STRANGER}'")).await, 0);
+    assert_eq!(count(p, "SELECT count(*) FROM worker_state WHERE key IN ('full_since', 'full_groups')").await, 0);
+    db.drop_db().await;
+}
+
 /// Filling, Full → community narrows with `s_filled = false`, so public
 /// reads answer 501 during it; going back to full before it ends re-runs
 /// S's fill at a new crawl generation (and stops the narrowing).
@@ -1520,6 +1588,50 @@ async fn an_unguarded_deletion_purge_stops_a_writer_past_admission() {
     scope.read_guard().await.full.purge_markers.insert(STRANGER);
     let r = writer.apply(STRANGER, "3kaaaaaaaab22", &[post("3kaaaaaaaaab2", "late")], LIVE).await.expect("apply");
     assert_eq!(r.outcomes, [OpOutcome::Rejected("account_deleted")]);
+    db.drop_db().await;
+}
+
+/// A suspension that lasts `suspended_purge_days` removes the account's own
+/// public rows and keeps its like of a member's post; a shorter one, an S
+/// author's and a member's keep everything; 0 days removes nothing.
+#[tokio::test]
+async fn a_long_suspension_removes_the_accounts_public_rows() {
+    use crate::db::retention::RetentionTask;
+    let Some(db) = fresh_db("full_suspended_purge").await else {
+        return;
+    };
+    let p = &db.pool;
+    members(p, &[MEMBER]).await;
+    in_scope(p, &[B]).await;
+    let (_writer, scope) = full_writer(p, &crate::config::FullGroup::ALL).await;
+    for (did, rkey) in [(STRANGER, "3kaaaaaaaaa22"), (D, "3kaaaaaaaaa23"), (B, "3kaaaaaaaaa24"), (MEMBER, "3kaaaaaaaaa25")] {
+        exec(p, &crate::test_support::posts::row_sql(did, rkey)).await;
+    }
+    crate::test_support::interactions::like(p, STRANGER, "3kaaaaaaaaa26", &format!("at://{MEMBER}/app.bsky.feed.post/3kaaaaaaaaa25")).await;
+    crate::test_support::graph::follow(p, STRANGER, D, "3kaaaaaaaaa27").await;
+    exec(
+        p,
+        &format!(
+            "INSERT INTO relay_account_status (account, relay, status, at) SELECT id, 'bsky', 'takendown', now() - interval '31 days' FROM dids WHERE did IN ('{STRANGER}', '{B}', '{MEMBER}'); \
+             INSERT INTO relay_account_status (account, relay, status, at) SELECT id, 'bsky', 'suspended', now() - interval '1 day' FROM dids WHERE did = '{D}';"
+        ),
+    )
+    .await;
+    let settings = crate::db::retention::RetentionSettings::from(&crate::config::RetentionConfig::default());
+    let off = crate::indexing::full::SuspendedPurge::new(scope.clone(), 0).run(p, &scope, &settings).await.expect("off");
+    assert_eq!(off.total(), 0);
+    assert_eq!(rows_of(p, "posts", STRANGER).await, 1);
+    let report = crate::indexing::full::SuspendedPurge::new(scope.clone(), 30).run(p, &scope, &settings).await.expect("purge");
+    assert!(report.total() >= 2, "{report:?}");
+    assert_eq!(rows_of(p, "posts", STRANGER).await, 0);
+    assert_eq!(rows_of(p, "follows", STRANGER).await, 0);
+    assert_eq!(rows_of(p, "likes", STRANGER).await, 1, "a like of a member's post stays");
+    for did in [D, B, MEMBER] {
+        assert_eq!(rows_of(p, "posts", did).await, 1, "{did}");
+    }
+    // A repeated status keeps the suspension's start.
+    crate::indexing::full::record_relay_status(p, STRANGER, "bsky", Some(false), Some("suspended")).await.expect("again");
+    assert_eq!(count(p, &format!("SELECT count(*) FROM relay_account_status r JOIN dids d ON d.id = r.account WHERE d.did = '{STRANGER}' AND r.at < now() - interval '30 days'")).await, 1);
     db.drop_db().await;
 }
 

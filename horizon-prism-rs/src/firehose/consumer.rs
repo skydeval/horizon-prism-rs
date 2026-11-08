@@ -534,7 +534,16 @@ impl Consumer {
     /// The record groups `[full] kinds` enables, for the copy tiers.
     #[must_use]
     pub fn with_full_kinds(mut self, kinds: &[crate::config::FullGroup]) -> Self {
-        self.tiers = Tiers::new(crate::indexing::full::full_set(kinds), self.cfg.old_filtered_relays.clone());
+        let board = self.tiers.board();
+        self.tiers = Tiers::new(crate::indexing::full::full_set(kinds), self.cfg.old_filtered_relays.clone()).with_board(board);
+        self
+    }
+
+    /// Show the relays' tiers on `board`, and take the operator's requests
+    /// to forget a remembered capability from it.
+    #[must_use]
+    pub fn with_tier_board(mut self, board: Arc<super::tier::TierBoard>) -> Self {
+        self.tiers = self.tiers.with_board(board);
         self
     }
 
@@ -1124,8 +1133,9 @@ impl Consumer {
         };
         // The relay reader's stamp, remembered per relay label.
         let label = self.watermarks.label_for(event.relay()).to_string();
+        let forgot = self.tiers.take_forgets();
         let tier = self.tiers.tier(&label, event.cap());
-        if self.tiers.observe(&label, event.cap()) {
+        if self.tiers.observe(&label, event.cap()) || forgot {
             self.tiers.persist(&self.pool).await?;
         }
         match event {

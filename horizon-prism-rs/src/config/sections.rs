@@ -143,11 +143,19 @@ pub struct FullConfig {
     pub suspended_accounts: SuspendedAccounts,
     /// Relay labels whose `#account` statuses count as a suspension.
     pub takedown_relays: Vec<String>,
+    /// A suspension lasting this many days removes the account's stored
+    /// public rows; 0 never does.
+    pub suspended_purge_days: u32,
 }
 
 impl Default for FullConfig {
     fn default() -> Self {
-        Self { kinds: FullGroup::ALL.to_vec(), suspended_accounts: SuspendedAccounts::RefractOnly, takedown_relays: vec!["bsky".to_string()] }
+        Self {
+            kinds: FullGroup::ALL.to_vec(),
+            suspended_accounts: SuspendedAccounts::RefractOnly,
+            takedown_relays: vec!["bsky".to_string()],
+            suspended_purge_days: 30,
+        }
     }
 }
 
