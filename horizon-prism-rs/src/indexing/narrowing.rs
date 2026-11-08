@@ -260,7 +260,9 @@ fn names(list: SweepList) -> &'static [&'static str] {
 /// account outside S, the members and R, is cleared while its rev is still
 /// the trial's; an account's counts go only when the record names it and
 /// no follow or post of anyone names it any more, so the counts community
-/// keeps for accounts S follows stay; and the count rows and trend hours
+/// keeps for accounts S follows stay, and an account's counts the record
+/// names that are all back at zero go whatever else holds the account (a
+/// zero row reads like no row); and the count rows and trend hours
 /// the trial's removed rows brought back to zero go, as they read like no
 /// row at all.
 fn trial_steps() -> Vec<Step> {
@@ -273,9 +275,10 @@ fn trial_steps() -> Vec<Step> {
             sql: format!(
                 "DELETE FROM actor_counts WHERE id IN (SELECT ac.id FROM actor_counts ac \
                    JOIN (SELECT a AS id FROM full_trial_rows UNION SELECT s_a FROM full_trial_rows WHERE s_a IS NOT NULL) r ON r.id = ac.id \
-                 WHERE NOT {} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id) \
+                 WHERE (ac.followers_count = 0 AND ac.follows_count = 0 AND ac.posts_count = 0) \
+                    OR (NOT {} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id) \
                    AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.subject = ac.id) AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author = ac.id) \
-                   AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = ac.id) LIMIT {BATCH_SIZE})",
+                   AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = ac.id)) LIMIT {BATCH_SIZE})",
                 kept(&account)
             ),
             candidates: None,

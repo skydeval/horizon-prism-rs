@@ -600,6 +600,7 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
             reply("3kaaaaaaaab29", &s_post, Some(&d_post)),
             like("3kaaaaaaaab2c", &post_uri(B, "3kaaaaaaaab2a")),
             follow("3kaaaaaaaab2d", LATE),
+            follow("3kaaaaaaaab2f", OTHER),
             post("3kaaaaaaaab2e", "deleted during the exit"),
         ],
         LIVE,
@@ -618,7 +619,7 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     d_tables.sort_unstable();
     assert_eq!(
         d_tables,
-        ["feed_items", "feed_items", "feed_items", "feed_items", "follows", "likes", "likes", "posts", "posts", "posts"],
+        ["feed_items", "feed_items", "feed_items", "feed_items", "follows", "follows", "likes", "likes", "posts", "posts", "posts"],
         "the reply's row is community's; its feed item is not: {rec:?}"
     );
     let quoting = rec.iter().find(|r| r.1 == D && r.0 == "posts" && r.6.is_some()).expect("the reply that quotes");
@@ -645,6 +646,7 @@ async fn the_exit_from_community_removes_what_the_trial_added() {
     assert_eq!(count(p, profile_rev).await, 0, "the trial's profile is cleared");
     assert_eq!(count(p, "SELECT count(*) FROM actors").await, actors_before, "the identity row stays");
     assert_eq!(rows_of(p, "actor_counts", LATE).await, 1, "community's counts of an account S follows stay");
+    assert_eq!(rows_of(p, "actor_counts", OTHER).await, 0, "a kept identity row's counts the trial brought back to zero go");
     assert_eq!(count(p, "SELECT count(*) FROM post_counts WHERE like_count + repost_count + reply_count + quote_count = 0").await, 0, "no count row left at zero");
     assert_eq!(count(p, "SELECT count(*) FROM tag_activity_hourly WHERE posts + likes + reposts + replies <= 0").await, 0, "no trend hour left at zero");
     for table in super::trial::FULL_ONLY {
