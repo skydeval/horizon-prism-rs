@@ -324,7 +324,7 @@ pub fn warnings(kinds: &[FullGroup], database_bytes: Option<u64>, free_bytes: Op
         format!("{writer_lanes} writer lanes apply the firehose (firehose.writer_lanes); `admin indexing full-check` advises whether they keep up with the relays.")
     });
     out.push(
-        "The history crawl is not part of this version: full stores the network from now on, and accounts outside S read as in community until their history is crawled."
+        "The history crawl ([full_crawl]) fetches every listed account's repository at repos_per_sec; accounts outside S read as in community until their history is crawled, and the crawl pauses when the volume's free space falls under [full] pause_free_percent."
             .to_string(),
     );
     out

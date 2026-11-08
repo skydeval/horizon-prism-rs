@@ -212,9 +212,14 @@ async fn stack(p: &PgPool, full: FullConfig, crawl: FullCrawlConfig, relays: &[(
     pi.apply_scope(ScopeValue::Full, "cli").await.expect("full");
     let writer = Writer::new(p.clone(), scope.clone(), Arc::new(DisabledPrivateTier));
     let fake = Arc::new(Fake::default());
-    let relays = relays.iter().map(|(label, base)| Relay { label: (*label).into(), base: (*base).into() }).collect();
     let low_water: Arc<crate::firehose::consumer::LowWater> = Arc::default();
-    let crawler = Crawler::new(writer.clone(), fake.clone(), crawl, full, relays, Arc::default(), Vec::new(), 600).with_clocks(Arc::clone(&low_water), Arc::default()).without_claimers();
+    // Every relay has sent unstamped copies: Whole.
+    let mut tiers = crate::firehose::tier::Tiers::new(crate::indexing::full::full_set(&FullGroup::ALL), Vec::<String>::new());
+    for (label, _) in relays {
+        tiers.observe(label, None);
+    }
+    let relays = relays.iter().map(|(label, base)| Relay { label: (*label).into(), base: (*base).into() }).collect();
+    let crawler = Crawler::new(writer.clone(), fake.clone(), crawl, full, relays, tiers.board(), Vec::new(), 600).with_clocks(Arc::clone(&low_water), Arc::default()).without_claimers();
     Stack { pool: p.clone(), scope, _pi: pi, writer, fake, crawler, low_water }
 }
 

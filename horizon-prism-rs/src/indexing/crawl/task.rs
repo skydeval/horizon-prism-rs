@@ -177,16 +177,13 @@ impl Crawler {
     }
 
     /// The relays whose listing the crawl and the re-list read: those whose
-    /// copies are Whole or Covered (a relay not seen yet counts as its
-    /// unstamped tier: Whole unless listed as an old filtered relay).
+    /// copies this process has seen, Whole or Covered. A configured relay
+    /// that sends nothing (no reader runs for it) is not listed.
     pub(super) fn listing_relays(&self) -> Vec<Relay> {
         let board = self.tiers.relays();
         self.relays
             .iter()
-            .filter(|r| match board.get(&r.label) {
-                Some(t) => t.tier != CopyTier::Aside,
-                None => !self.old_filtered.contains(&r.label),
-            })
+            .filter(|r| board.get(&r.label).is_some_and(|t| t.tier != CopyTier::Aside) && !self.old_filtered.contains(&r.label))
             .cloned()
             .collect()
     }
