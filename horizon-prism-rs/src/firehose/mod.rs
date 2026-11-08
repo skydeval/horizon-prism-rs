@@ -8,6 +8,7 @@ pub mod classifier;
 pub mod consumer;
 pub mod coverage;
 pub mod deadletter;
+pub mod dedupe;
 pub mod extract;
 pub mod feed;
 pub mod follows_pass;

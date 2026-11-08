@@ -230,6 +230,33 @@ pub enum IndexingAction {
         #[command(subcommand)]
         action: FullTrialAction,
     },
+    /// Advice only: whether this machine applies the full network as fast
+    /// as the relays send it. Builds a scratch database beside this one
+    /// (dropped after), seeds it, applies commits like the network's at
+    /// each lane count and compares with the relays' rate.
+    FullCheck {
+        /// Seeded accounts.
+        #[arg(long, default_value_t = 200_000)]
+        accounts: u32,
+        /// Seeded posts.
+        #[arg(long, default_value_t = 500_000)]
+        posts: u32,
+        /// Seeded likes.
+        #[arg(long, default_value_t = 2_000_000)]
+        likes: u32,
+        /// Seeded follows.
+        #[arg(long, default_value_t = 500_000)]
+        follows: u32,
+        /// Commits applied at each lane count.
+        #[arg(long, default_value_t = 20_000)]
+        commits: u32,
+        /// Lane counts to try, comma-separated.
+        #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
+        lanes: Vec<u32>,
+        /// Keep the scratch database afterwards.
+        #[arg(long)]
+        keep: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -436,6 +463,7 @@ impl AdminCmd {
             | Self::Identity { .. }
             | Self::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
             | Self::Refract { action: RefractAction::Status | RefractAction::List { .. } | RefractAction::Show { .. } }
+            | Self::Indexing { action: IndexingAction::FullCheck { .. } }
             | Self::Keygen => return Err("read-only commands run in the CLI".to_string()),
             // They read the saved row's version first: see `settings_change`.
             Self::Settings { action: SettingsAction::Set { .. } | SettingsAction::Reset { .. } } => {
@@ -555,6 +583,7 @@ async fn confirm_scope(pool: &PgPool, cfg: &crate::config::AppConfig, value: Sco
             used.and_then(|u| u64::try_from(u).ok()),
             free,
             cfg.file.storage.budget_bytes,
+            cfg.file.firehose.writer_lanes,
         ));
     } else {
         text.push(
@@ -596,7 +625,7 @@ async fn confirm_trial(pool: &PgPool, cfg: &crate::config::AppConfig, action: &F
             let from = if phase.as_deref() == Some("off") { ScopeValue::KryphocronOnly } else { ScopeValue::Community };
             let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(pool).await.ok();
             let free = crate::indexing::trial::volume(&cfg.env.data_dir);
-            let warnings = crate::indexing::full::warnings(&cfg.file.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free.map(|f| f.0), cfg.file.storage.budget_bytes);
+            let warnings = crate::indexing::full::warnings(&cfg.file.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free.map(|f| f.0), cfg.file.storage.budget_bytes, cfg.file.firehose.writer_lanes);
             // How long the last fill took: its last finished job after its start.
             let last_fill: Option<i64> = sqlx::query_scalar(
                 "SELECT EXTRACT(EPOCH FROM (max(updated_at) - min(not_before)))::bigint FROM backfill_jobs WHERE depth = 'resync' AND state = 'done'",
@@ -706,6 +735,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
             | AdminCmd::Identity { .. }
             | AdminCmd::Settings { action: SettingsAction::List | SettingsAction::Get { .. } }
             | AdminCmd::Refract { action: RefractAction::Status | RefractAction::List { .. } | RefractAction::Show { .. } }
+            | AdminCmd::Indexing { action: IndexingAction::FullCheck { .. } }
     );
     if !is_read_only {
         return None;
@@ -753,6 +783,19 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                     commands::refract::render_list(&commands::pool(&cfg).await?, state.as_deref()).await
                 }
                 AdminCmd::Refract { action: RefractAction::Show { did } } => commands::refract::render_show(&commands::pool(&cfg).await?, did).await,
+                AdminCmd::Indexing { action: IndexingAction::FullCheck { accounts, posts, likes, follows, commits, lanes, keep } } => {
+                    let params = crate::indexing::full_check::Params {
+                        accounts: *accounts,
+                        posts: *posts,
+                        likes: *likes,
+                        follows: *follows,
+                        commits: *commits,
+                        lanes: lanes.clone(),
+                        keep: *keep,
+                        ..crate::indexing::full_check::Params::default()
+                    };
+                    crate::indexing::full_check::run(&cfg, &params).await
+                }
                 _ => Err("not a read-only command".to_string()),
             }
         }

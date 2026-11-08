@@ -54,6 +54,17 @@ pub struct RelayTier {
 struct BoardState {
     relays: BTreeMap<String, RelayTier>,
     forget: Vec<String>,
+    writer: WriterFigures,
+}
+
+/// The consumer's writer, for status: its lanes, whether dedupe is on, the
+/// entries it processed since the start and the copies it dropped.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriterFigures {
+    pub lanes: u32,
+    pub dedupe: bool,
+    pub entries: u64,
+    pub deduped: u64,
 }
 
 /// What the consumer shares about relay tiers: each relay's current tier,
@@ -84,6 +95,17 @@ impl TierBoard {
 
     fn remove(&self, label: &str) {
         self.state().relays.remove(label);
+    }
+
+    /// Set the writer's figures.
+    pub fn set_writer(&self, figures: WriterFigures) {
+        self.state().writer = figures;
+    }
+
+    /// The writer's figures as last set.
+    #[must_use]
+    pub fn writer(&self) -> WriterFigures {
+        self.state().writer
     }
 
     /// Every relay seen since the start, with its tier.

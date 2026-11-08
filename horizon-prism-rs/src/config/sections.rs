@@ -146,6 +146,9 @@ pub struct FullConfig {
     /// A suspension lasting this many days removes the account's stored
     /// public rows; 0 never does.
     pub suspended_purge_days: u32,
+    /// Run the weekly counts repair while indexing the full network, in
+    /// the form that locks no table.
+    pub weekly_count_repair: bool,
 }
 
 impl Default for FullConfig {
@@ -155,6 +158,7 @@ impl Default for FullConfig {
             suspended_accounts: SuspendedAccounts::RefractOnly,
             takedown_relays: vec!["bsky".to_string()],
             suspended_purge_days: 30,
+            weekly_count_repair: false,
         }
     }
 }
@@ -342,6 +346,68 @@ pub struct FirehoseConfig {
     /// A fallback relay URL to the label of the relay it stands in for,
     /// resolved before every per-relay rule.
     pub relay_aliases: BTreeMap<String, String>,
+    /// Drop a relay's copy of a commit another relay's copy already
+    /// applied: `"auto"` while indexing the full network, or always on or
+    /// off.
+    pub dedupe: Dedupe,
+    /// How long a seen copy is remembered.
+    pub dedupe_window_secs: u64,
+    /// The most repos remembered; the least recently seen go first.
+    pub dedupe_repos: u64,
+    /// Writers applying entries side by side, each repo always on the same
+    /// one.
+    pub writer_lanes: u32,
+    /// The most entries one writer is handed at a time.
+    pub lane_queue: u32,
+}
+
+/// `[firehose] dedupe`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dedupe {
+    /// On while indexing the full network.
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl Dedupe {
+    /// Whether duplicate copies are dropped in this breadth.
+    #[must_use]
+    pub fn on(self, full: bool) -> bool {
+        match self {
+            Self::Auto => full,
+            Self::On => true,
+            Self::Off => false,
+        }
+    }
+}
+
+impl Serialize for Dedupe {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::On => s.serialize_bool(true),
+            Self::Off => s.serialize_bool(false),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Dedupe {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Flag(bool),
+            Word(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Flag(true) => Ok(Self::On),
+            Raw::Flag(false) => Ok(Self::Off),
+            Raw::Word(w) if w == "auto" => Ok(Self::Auto),
+            Raw::Word(w) => Err(serde::de::Error::custom(format!("dedupe must be \"auto\", true or false, not {w:?}"))),
+        }
+    }
 }
 
 impl Default for FirehoseConfig {
@@ -368,6 +434,11 @@ impl Default for FirehoseConfig {
             relay_labels,
             old_filtered_relays: Vec::new(),
             relay_aliases: BTreeMap::new(),
+            dedupe: Dedupe::Auto,
+            dedupe_window_secs: 600,
+            dedupe_repos: 2_000_000,
+            writer_lanes: 1,
+            lane_queue: 2000,
         }
     }
 }

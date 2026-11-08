@@ -311,6 +311,15 @@ pub mod hooks {
     /// at its top and goes on, never failing ([`delay`]). Key:
     /// `<database>/<repo>`.
     pub const WRITER_DELAY_REPO: &str = "pp_writer_delay_repo";
+    /// Writer lanes: `Writer::apply_copy` fails at its top as a deadlock
+    /// (`40P01`) would. Key: `<database>/<repo>`.
+    pub const WRITER_CONFLICT: &str = "fl_writer_conflict";
+    /// Writer lanes: a lane waits before it applies an entry of this repo.
+    /// Key: `<database>/<repo>`.
+    pub const LANE_BEFORE_ENTRY: &str = "fl_lane_before_entry";
+    /// The keyset counts repair holds a range's count rows locked, before
+    /// it recomputes them. Key: the database.
+    pub const KEYSET_AFTER_LOCK: &str = "fl_keyset_after_lock";
     /// Firehose throughput §2.4: the consumer sleeps for the armed delay
     /// before it processes an entry ([`delay`]). Key: the database.
     pub const CONSUMER_STALL: &str = "fh_consumer_stall";

@@ -182,12 +182,47 @@ pub struct ApplyReport {
 
 /// A failure that must abort the call and retry it later (§5.3 transient).
 #[derive(Debug, thiserror::Error)]
-#[error("transient write failure: {0}")]
-pub struct Transient(pub String);
+#[error("transient write failure: {message}")]
+pub struct Transient {
+    message: String,
+    /// The database's SQLSTATE, when the database refused.
+    code: Option<String>,
+}
+
+impl Transient {
+    #[must_use]
+    pub fn new(message: impl Into<String>) -> Self {
+        Self { message: message.into(), code: None }
+    }
+
+    /// A failure with the database's SQLSTATE `code`.
+    #[must_use]
+    pub fn with_code(message: impl Into<String>, code: &str) -> Self {
+        Self { message: message.into(), code: Some(code.to_string()) }
+    }
+
+    /// The failure, in words.
+    #[must_use]
+    pub fn into_message(self) -> String {
+        self.message
+    }
+
+    /// The SQLSTATE of a deadlock (`40P01`) or a serialization failure
+    /// (`40001`): another writer's transaction conflicted, and the call can
+    /// be retried at once.
+    #[must_use]
+    pub fn conflict(&self) -> Option<&str> {
+        self.code.as_deref().filter(|c| matches!(*c, "40P01" | "40001"))
+    }
+}
 
 impl From<sqlx::Error> for Transient {
     fn from(e: sqlx::Error) -> Self {
-        Self(e.to_string())
+        let code = match &e {
+            sqlx::Error::Database(db) => db.code().map(|c| c.to_string()),
+            _ => None,
+        };
+        Self { message: e.to_string(), code }
     }
 }
 
@@ -1081,12 +1116,15 @@ impl Writer {
         if let Some(db) = self.pool.connect_options().get_database()
             && crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_HANG, db).await
         {
-            return Err(Transient("injected hang".into()));
+            return Err(Transient::new("injected hang"));
         }
         // Public page T-P17: one repo's commits take longer, and succeed.
         #[cfg(test)]
         if let Some(db) = self.pool.connect_options().get_database() {
             crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_DELAY_REPO, &format!("{db}/{repo}")).await;
+            if crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_CONFLICT, &format!("{db}/{repo}")) {
+                return Err(Transient::with_code("injected deadlock", "40P01"));
+            }
         }
         let now = Utc::now();
         let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();

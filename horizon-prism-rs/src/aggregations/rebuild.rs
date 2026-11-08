@@ -132,6 +132,9 @@ pub struct Rebuild {
     slot_secs: u32,
     /// One sweep at a time, scheduled or `admin scope rebuild`.
     run_lock: Arc<tokio::sync::Mutex<()>>,
+    /// `[full] weekly_count_repair`: whether the weekly counts repair runs
+    /// while indexing the full network.
+    full_weekly_repair: bool,
 }
 
 impl Rebuild {
@@ -147,7 +150,15 @@ impl Rebuild {
             // One hour before the default retention run at 04:00.
             slot_secs: 3 * 3600,
             run_lock: Arc::default(),
+            full_weekly_repair: false,
         }
+    }
+
+    /// Set `[full] weekly_count_repair`.
+    #[must_use]
+    pub fn with_full_weekly_repair(mut self, on: bool) -> Self {
+        self.full_weekly_repair = on;
+        self
     }
 
     /// Set `lists.sync_min_interval_secs` on the rebuild's purges.
@@ -500,13 +511,19 @@ impl Rebuild {
         Ok(())
     }
 
-    /// §9.5 repair; see [`repair_counts`].
+    /// §9.5 repair; see [`repair_counts`]. While indexing the full network
+    /// the keyset form runs instead ([`repair_counts_keyset`]), which locks
+    /// no table.
     ///
     /// # Errors
     ///
     /// Database errors.
     pub async fn repair_counts(&self) -> Result<(), sqlx::Error> {
-        repair_counts(&self.pool).await
+        if self.scope.public_breadth() == crate::indexing::Breadth::Full {
+            repair_counts_keyset(&self.pool).await.map(|_| ())
+        } else {
+            repair_counts(&self.pool).await
+        }
     }
 
     async fn reload_follow_counts(&self) -> Result<(), sqlx::Error> {
@@ -609,7 +626,10 @@ impl Rebuild {
                 tick.tick().await;
                 match self.due().await {
                     Ok(true) => {
-                        if let Err(error) = self.repair_counts().await {
+                        let full = self.scope.public_breadth() == crate::indexing::Breadth::Full;
+                        if full && !self.full_weekly_repair {
+                            tracing::info!(event = "scope_rebuild_counts_skipped", "the weekly counts repair is off while indexing the full network ([full] weekly_count_repair)");
+                        } else if let Err(error) = self.repair_counts().await {
                             tracing::warn!(event = "scope_rebuild_failed", %error, "weekly counts repair failed");
                             continue;
                         }
@@ -707,6 +727,176 @@ pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
     tx.commit().await
 }
 
+/// The `worker_state` key of a keyset counts repair in progress: the first
+/// account id of the next range.
+pub const KEYSET_CURSOR_KEY: &str = "count_repair_cursor";
+/// Account ids per range of the keyset counts repair.
+pub const KEYSET_RANGE: i32 = 5_000;
+/// Retries of one range after a deadlock.
+const KEYSET_RETRIES: u32 = 5;
+
+/// Metric: time to repair one range of the keyset counts repair.
+pub const METRIC_KEYSET_RANGE_SECONDS: &str = "count_repair_range_seconds";
+
+/// What a keyset counts repair did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeysetReport {
+    pub ranges: u64,
+    /// Count rows set to a new value, and removed for having no source.
+    pub updated: u64,
+    pub deleted: u64,
+    /// Ranges retried after a deadlock.
+    pub retries: u64,
+    /// The slowest range.
+    pub slowest: Duration,
+}
+
+/// The counts repair without a table lock, for network-sized tables: per
+/// range of account ids, a short transaction per count table inserts the
+/// range's missing count rows, locks its count rows in key order as the
+/// count triggers do, and only then recomputes them from that range's
+/// sources in a later statement, so a trigger that commits in between is
+/// never lost; count rows with no source left are removed. Ranges commit
+/// on their own, and the repair resumes from its stored cursor after a
+/// restart. A range that deadlocks is retried.
+///
+/// # Errors
+///
+/// Database errors, a range's after its retries.
+pub async fn repair_counts_keyset(pool: &PgPool) -> Result<KeysetReport, sqlx::Error> {
+    let max: Option<i32> = sqlx::query_scalar("SELECT max(id) FROM dids").fetch_one(pool).await?;
+    let mut lo: i32 = sqlx::query_scalar("SELECT (value #>> '{}')::int FROM worker_state WHERE key = $1")
+        .bind(KEYSET_CURSOR_KEY)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(0);
+    let mut report = KeysetReport::default();
+    let max = max.unwrap_or(0);
+    while lo <= max {
+        let hi = lo.saturating_add(KEYSET_RANGE);
+        let r = repair_range(pool, lo, hi).await?;
+        report.ranges += 1;
+        report.updated += r.updated;
+        report.deleted += r.deleted;
+        report.retries += r.retries;
+        report.slowest = report.slowest.max(r.slowest);
+        sqlx::query(
+            "INSERT INTO worker_state (key, value, updated_at) VALUES ($1, to_jsonb($2::int), now()) \
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+        )
+        .bind(KEYSET_CURSOR_KEY)
+        .bind(hi)
+        .execute(pool)
+        .await?;
+        if hi == i32::MAX {
+            break;
+        }
+        lo = hi;
+    }
+    sqlx::query("DELETE FROM worker_state WHERE key = $1").bind(KEYSET_CURSOR_KEY).execute(pool).await?;
+    tracing::info!(event = "count_repair_keyset", ranges = report.ranges, updated = report.updated, deleted = report.deleted, retries = report.retries, slowest_ms = report.slowest.as_millis(), "keyset counts repair finished");
+    Ok(report)
+}
+
+/// One range `[lo, hi)` of account ids: post counts of their posts, then
+/// their account counts, each in its own transaction, retried after a
+/// deadlock or a serialization failure.
+///
+/// # Errors
+///
+/// Database errors, after the retries.
+pub async fn repair_range(pool: &PgPool, lo: i32, hi: i32) -> Result<KeysetReport, sqlx::Error> {
+    let started = std::time::Instant::now();
+    let mut report = KeysetReport { ranges: 1, ..KeysetReport::default() };
+    for table in [CountTable::Posts, CountTable::Actors] {
+        let mut tries = 0;
+        loop {
+            match repair_range_once(pool, table, lo, hi).await {
+                Ok((u, d)) => {
+                    report.updated += u;
+                    report.deleted += d;
+                    break;
+                }
+                Err(sqlx::Error::Database(e)) if tries < KEYSET_RETRIES && e.code().is_some_and(|c| c == "40P01" || c == "40001") => {
+                    tries += 1;
+                    report.retries += 1;
+                    tokio::time::sleep(Duration::from_millis(20 * u64::from(tries))).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    report.slowest = started.elapsed();
+    metrics::histogram!(METRIC_KEYSET_RANGE_SECONDS).record(report.slowest.as_secs_f64());
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CountTable {
+    Posts,
+    Actors,
+}
+
+/// The range's three statements; `(updated, deleted)`.
+async fn repair_range_once(pool: &PgPool, table: CountTable, lo: i32, hi: i32) -> Result<(u64, u64), sqlx::Error> {
+    let (missing, lock, recompute) = match table {
+        CountTable::Posts => (
+            "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+             SELECT a, k, 0, 0, 0, 0 FROM ( \
+               SELECT subj_author AS a, subj_rkey AS k FROM likes WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 \
+               UNION SELECT subj_author, subj_rkey FROM reposts WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 \
+               UNION SELECT parent_author, parent_rkey FROM posts WHERE parent_coll = 1 AND parent_author >= $1 AND parent_author < $2 \
+               UNION SELECT quote_author, quote_rkey FROM posts WHERE quote_coll = 1 AND quote_author >= $1 AND quote_author < $2 \
+             ) s WHERE a IS NOT NULL AND k IS NOT NULL ON CONFLICT (author, rkey) DO NOTHING",
+            "SELECT count(*) FROM (SELECT 1 FROM post_counts WHERE author >= $1 AND author < $2 ORDER BY author, rkey FOR UPDATE) l",
+            "WITH t AS ( \
+               SELECT a, k, sum(l)::int AS l, sum(r)::int AS r, sum(p)::int AS p, sum(q)::int AS q FROM ( \
+                 SELECT subj_author AS a, subj_rkey AS k, count(DISTINCT author) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
+                   WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 GROUP BY 1, 2 \
+                 UNION ALL SELECT subj_author, subj_rkey, 0, count(DISTINCT author), 0, 0 FROM reposts \
+                   WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 GROUP BY 1, 2 \
+                 UNION ALL SELECT parent_author, parent_rkey, 0, 0, 1, 0 FROM posts WHERE parent_coll = 1 AND parent_author >= $1 AND parent_author < $2 \
+                 UNION ALL SELECT quote_author, quote_rkey, 0, 0, 0, 1 FROM posts WHERE quote_coll = 1 AND quote_author >= $1 AND quote_author < $2 \
+               ) s WHERE a IS NOT NULL AND k IS NOT NULL GROUP BY a, k), \
+             u AS (UPDATE post_counts c SET like_count = t.l, repost_count = t.r, reply_count = t.p, quote_count = t.q FROM t \
+                   WHERE c.author = t.a AND c.rkey = t.k \
+                     AND (c.like_count, c.repost_count, c.reply_count, c.quote_count) IS DISTINCT FROM (t.l, t.r, t.p, t.q) RETURNING 1), \
+             d AS (DELETE FROM post_counts c WHERE c.author >= $1 AND c.author < $2 \
+                     AND NOT EXISTS (SELECT 1 FROM t WHERE t.a = c.author AND t.k = c.rkey) RETURNING 1) \
+             SELECT (SELECT count(*) FROM u), (SELECT count(*) FROM d)",
+        ),
+        CountTable::Actors => (
+            "INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) \
+             SELECT d, 0, 0, 0 FROM ( \
+               SELECT subject AS d FROM follows WHERE subject >= $1 AND subject < $2 \
+               UNION SELECT author FROM follows WHERE author >= $1 AND author < $2 \
+               UNION SELECT author FROM posts WHERE author >= $1 AND author < $2 \
+             ) s ON CONFLICT (id) DO NOTHING",
+            "SELECT count(*) FROM (SELECT 1 FROM actor_counts WHERE id >= $1 AND id < $2 ORDER BY id FOR UPDATE) l",
+            "WITH t AS ( \
+               SELECT d, sum(fr)::int AS fr, sum(fs)::int AS fs, sum(p)::int AS p FROM ( \
+                 SELECT subject AS d, count(*) AS fr, 0 AS fs, 0 AS p FROM follows WHERE subject >= $1 AND subject < $2 GROUP BY 1 \
+                 UNION ALL SELECT author, 0, count(*), 0 FROM follows WHERE author >= $1 AND author < $2 GROUP BY 1 \
+                 UNION ALL SELECT author, 0, 0, count(*) FROM posts WHERE author >= $1 AND author < $2 GROUP BY 1 \
+               ) s GROUP BY d), \
+             u AS (UPDATE actor_counts c SET followers_count = t.fr, follows_count = t.fs, posts_count = t.p FROM t \
+                   WHERE c.id = t.d AND (c.followers_count, c.follows_count, c.posts_count) IS DISTINCT FROM (t.fr, t.fs, t.p) RETURNING 1), \
+             d AS (DELETE FROM actor_counts c WHERE c.id >= $1 AND c.id < $2 AND NOT EXISTS (SELECT 1 FROM t WHERE t.d = c.id) RETURNING 1) \
+             SELECT (SELECT count(*) FROM u), (SELECT count(*) FROM d)",
+        ),
+    };
+    let mut tx = pool.begin().await?;
+    sqlx::query(missing).bind(lo).bind(hi).execute(&mut *tx).await?;
+    let _locked: i64 = sqlx::query_scalar(lock).bind(lo).bind(hi).fetch_one(&mut *tx).await?;
+    #[cfg(test)]
+    if let Some(db) = pool.connect_options().get_database() {
+        crate::test_support::hooks::pause(crate::test_support::hooks::KEYSET_AFTER_LOCK, db).await;
+    }
+    let (updated, deleted): (i64, i64) = sqlx::query_as(recompute).bind(lo).bind(hi).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    Ok((u64::try_from(updated).unwrap_or(0), u64::try_from(deleted).unwrap_or(0)))
+}
+
 #[cfg(test)]
 #[path = "sweep_tests.rs"]
 mod sweep_tests;
@@ -743,6 +933,84 @@ mod tests {
         let likes = crate::test_support::interactions::post_counts(p, &format!("at://{LIKED}/app.bsky.feed.post/1")).await.map(|c| c.0);
         assert_eq!(likes, Some(1));
         assert_eq!(rebuild.enqueue_stale_resyncs().await.expect("resync"), 3);
+        db.drop_db().await;
+    }
+
+    /// The keyset counts repair, the form full uses: it fixes wrong counts
+    /// and removes count rows with no source; while it holds one range's
+    /// rows, a writer of another count table goes on, and a like whose
+    /// trigger waits on a locked count row commits after the range and is
+    /// counted, not lost. In full the repair the weekly run and the admin
+    /// command use is this one, and it leaves no cursor behind.
+    #[tokio::test]
+    async fn the_keyset_repair_locks_no_table_and_loses_no_trigger() {
+        use crate::test_support::{graph, hooks, interactions, posts};
+        let Some(db) = fresh_db("count_repair_keyset").await else {
+            return;
+        };
+        let p = &db.pool;
+        let record = serde_json::json!({"$type": "app.bsky.feed.post", "text": "x", "createdAt": "2026-11-01T00:00:00Z"});
+        let post = posts::put_post(p, LIKED, "3kaaaaaaaaab2", "bafyp", "3kaaaaaaaaab2", &record, None).await;
+        let gone = format!("at://{LIKED}/app.bsky.feed.post/3kaaaaaaaaab3");
+        interactions::like(p, MEMBER, "3kaaaaaaaaal1", &post).await;
+        interactions::like(p, FOLLOWED, "3kaaaaaaaaal1", &post).await;
+        interactions::set_post_counts(p, &post, (9, 9, 9, 9)).await;
+        interactions::set_post_counts(p, &gone, (1, 0, 0, 0)).await;
+        interactions::set_actor_counts(p, LIKED, (5, 5, 5)).await;
+        let paused = hooks::arm(hooks::KEYSET_AFTER_LOCK, db.name());
+        let repair = {
+            let p = p.clone();
+            tokio::spawn(async move { repair_counts_keyset(&p).await })
+        };
+        paused.reached().await;
+        // The post counts range holds its rows: a like of the post waits on
+        // its count row; a follow, which writes account counts, goes on.
+        let like = {
+            let (p, post) = (p.clone(), post.clone());
+            tokio::spawn(async move { interactions::like(&p, STALE, "3kaaaaaaaaal1", &post).await })
+        };
+        tokio::time::timeout(Duration::from_secs(5), graph::follow(p, MEMBER, LIKED, "3kaaaaaaaaaf1")).await.expect("a writer of another table goes on");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!like.is_finished(), "the like's trigger waits on the locked count row");
+        paused.release();
+        let report = repair.await.expect("task").expect("repair");
+        like.await.expect("like");
+        assert!(report.ranges >= 1 && report.deleted >= 1, "{report:?}");
+        assert_eq!(interactions::post_counts(p, &post).await, Some((3, 0, 0, 0)), "repaired, and the like that waited is counted");
+        assert_eq!(interactions::post_counts(p, &gone).await, None, "a count row with no source is removed");
+        let counts: (i32, i32, i32) = sqlx::query_as(
+            "SELECT c.followers_count, c.follows_count, c.posts_count FROM actor_counts c JOIN dids d ON d.id = c.id WHERE d.did = $1",
+        )
+        .bind(LIKED)
+        .fetch_one(p)
+        .await
+        .expect("actor counts");
+        assert_eq!(counts, (1, 0, 1));
+        let cursor: Option<serde_json::Value> = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = $1")
+            .bind(KEYSET_CURSOR_KEY)
+            .fetch_optional(p)
+            .await
+            .expect("cursor");
+        assert_eq!(cursor, None);
+        drop(paused);
+        // In full, the weekly run's and the admin command's repair is the
+        // keyset one: it locks no table, so a writer holding a count row
+        // does not make it wait on a table lock it would take.
+        let scope = ScopeState::new(crate::aggregations::ScopeSets::default(), crate::config::ScopePolicy::MembersAndOneHop, 10);
+        {
+            let mut guard = scope.write_guard().await;
+            scope.set_public(
+                &mut guard,
+                crate::indexing::PublicState { mode: crate::indexing::PublicMode::On, breadth: crate::indexing::Breadth::Full, generation: 1, ..crate::indexing::PublicState::default() },
+            );
+        }
+        exec(p, "UPDATE post_counts SET like_count = 42").await;
+        let rebuild = Rebuild::new(p.clone(), scope, Arc::new(crate::private_tier::DisabledPrivateTier), 0);
+        let mut holder = p.begin().await.expect("tx");
+        sqlx::query("LOCK TABLE actor_counts IN ROW EXCLUSIVE MODE").execute(&mut *holder).await.expect("hold");
+        tokio::time::timeout(Duration::from_secs(10), rebuild.repair_counts()).await.expect("no table lock waits on the holder").expect("repair");
+        holder.rollback().await.expect("rollback");
+        assert_eq!(interactions::post_counts(p, &post).await, Some((3, 0, 0, 0)));
         db.drop_db().await;
     }
 

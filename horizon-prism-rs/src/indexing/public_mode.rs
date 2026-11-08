@@ -1512,6 +1512,10 @@ impl PublicIndexing {
             let sets = self.scope.read_guard().await;
             (sets.full.excluded.len(), sets.full.excluded.bytes())
         };
+        let w = self.tier_board.writer();
+        #[allow(clippy::cast_precision_loss)]
+        let dedupe_rate = if w.entries == 0 { 0.0 } else { w.deduped as f64 / w.entries as f64 };
+        let writer = json!({ "lanes": w.lanes, "dedupe": w.dedupe, "entries": w.entries, "deduped": w.deduped, "dedupe_rate": dedupe_rate });
         let trial = self.trial_status().await?;
         Ok(json!({
             "value": value,
@@ -1522,6 +1526,7 @@ impl PublicIndexing {
             "relays": relays,
             "excluded_accounts": excluded,
             "excluded_bytes": excluded_bytes,
+            "writer": writer,
             "crawl_generation": field("crawl_generation"),
             "s_filled": field("s_filled"),
             "file_apply_error": p.file_apply_error,

@@ -188,7 +188,7 @@ pub async fn switch(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
             let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(&state.pool).await.ok();
             let free = stats::space(&state.disks.postgres).or_else(|| stats::space(&state.disks.data)).map(|s| s.free);
             let running = &state.settings.running;
-            let warnings = crate::indexing::full::warnings(&running.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free, running.storage.budget_bytes);
+            let warnings = crate::indexing::full::warnings(&running.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free, running.storage.budget_bytes, running.firehose.writer_lanes);
             Some((
                 "FULL",
                 "Switch to Full network".to_string(),

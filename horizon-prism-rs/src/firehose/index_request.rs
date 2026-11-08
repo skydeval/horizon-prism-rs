@@ -26,7 +26,7 @@ use super::follows_pass::{self, Fetched, FollowsLister, PassSettings};
 use super::gap;
 use super::jobs::{self, Depth};
 use super::writer::{
-    Action, ApplyOptions, ListedRevs, METRIC_SETTLE_UNCOVERED, OpOutcome, RawOp, Raise, Skipped, WriteSource, Writer,
+    Action, ApplyOptions, ListedRevs, METRIC_SETTLE_UNCOVERED, OpOutcome, RawOp, Raise, Skipped, Transient, WriteSource, Writer,
     advance_applied_rev_with_follows, raise_listed_rev, read_follows_clears,
 };
 use crate::private_tier::PrivateTier;
@@ -118,7 +118,7 @@ pub async fn index_record(
         subscription_rules,
         source: WriteSource::IndexRequest,
     };
-    let report = writer.apply(repo, &rev, &[op], options).await.map_err(|e| IndexError::Write(e.0))?;
+    let report = writer.apply(repo, &rev, &[op], options).await.map_err(|e| IndexError::Write(e.into_message()))?;
     Ok(Indexed {
         rev,
         status: status(report.outcomes.first(), record.is_some())?,
@@ -424,7 +424,7 @@ async fn run_catch_up(
                     cid: None,
                     record: None,
                 };
-                let report = writer.apply(did, rev, &[op], catch_up_options(cfg.attempts)).await.map_err(|e| e.0)?;
+                let report = writer.apply(did, rev, &[op], catch_up_options(cfg.attempts)).await.map_err(Transient::into_message)?;
                 if !report.failed.is_empty() {
                     return Ok(Ended::Unsettled("write_failed"));
                 }
@@ -603,7 +603,7 @@ async fn write_page(
     if ops.is_empty() {
         return Ok(failed);
     }
-    let report = writer.apply(did, rev, &ops, catch_up_options(attempts)).await.map_err(|e| e.0)?;
+    let report = writer.apply(did, rev, &ops, catch_up_options(attempts)).await.map_err(Transient::into_message)?;
     for f in &report.failed {
         tracing::warn!(event = "catch_up_record_failed", did, path = %f.path, error = %f.error, "record failed deterministically; readiness cleared");
     }

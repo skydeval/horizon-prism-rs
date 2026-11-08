@@ -279,7 +279,7 @@ pub fn database_free_bytes(data_dir: &std::path::Path) -> Option<u64> {
 /// against the volume, the writer and the crawl.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-pub fn warnings(kinds: &[FullGroup], database_bytes: Option<u64>, free_bytes: Option<u64>, budget_bytes: Option<u64>) -> Vec<String> {
+pub fn warnings(kinds: &[FullGroup], database_bytes: Option<u64>, free_bytes: Option<u64>, budget_bytes: Option<u64>, writer_lanes: u32) -> Vec<String> {
     let gb = |b: u64| format!("{:.1} GB", b as f64 / 1e9);
     // Groups other than likes, follows and reposts are small; likes are
     // about half of the growth.
@@ -318,7 +318,11 @@ pub fn warnings(kinds: &[FullGroup], database_bytes: Option<u64>, free_bytes: Op
         (None, _, _) => out.push("storage.budget_bytes is not set: Health shows no budget warnings.".to_string()),
         _ => {}
     }
-    out.push("One writer applies the firehose; at full's rate it may fall behind the relays.".to_string());
+    out.push(if writer_lanes <= 1 {
+        "One writer lane applies the firehose (firehose.writer_lanes = 1); at full's rate it may fall behind the relays. `admin indexing full-check` advises how many lanes this machine needs.".to_string()
+    } else {
+        format!("{writer_lanes} writer lanes apply the firehose (firehose.writer_lanes); `admin indexing full-check` advises whether they keep up with the relays.")
+    });
     out.push(
         "The history crawl is not part of this version: full stores the network from now on, and accounts outside S read as in community until their history is crawled."
             .to_string(),
@@ -360,11 +364,12 @@ mod tests {
     /// smaller than the volume.
     #[test]
     fn warnings_name_days_and_budget() {
-        let w = warnings(&FullGroup::ALL, Some(100_000_000_000), Some(1_200_000_000_000), Some(500_000_000_000));
+        let w = warnings(&FullGroup::ALL, Some(100_000_000_000), Some(1_200_000_000_000), Some(500_000_000_000), 1);
         assert!(w[0].contains("about 100 days"), "{w:?}");
         assert!(w[1].contains("storage.budget_bytes is 500.0 GB"), "{w:?}");
-        let likes_only = warnings(&[FullGroup::Likes], None, Some(600_000_000_000), None);
+        let likes_only = warnings(&[FullGroup::Likes], None, Some(600_000_000_000), None, 4);
         assert!(likes_only[0].contains("about 100 days"), "{likes_only:?}");
+        assert!(w.iter().any(|l| l.contains("One writer lane")) && likes_only.iter().any(|l| l.starts_with("4 writer lanes")));
         assert!(likes_only.iter().any(|l| l.contains("not set")));
     }
 }

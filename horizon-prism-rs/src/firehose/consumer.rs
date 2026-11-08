@@ -38,17 +38,22 @@ use redis::aio::ConnectionManager;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 
+use std::collections::HashMap;
+
 use super::coverage::CoverageHandle;
-use super::deadletter::{self, DeadLetter};
+use super::dedupe::{CopyKey, CopyKind, Dedupe};
 use super::gap::{self, GapCause};
-use super::router::route_identity;
 use super::scripts::{self, CheckedRead, GapEvidence, ReanchorMode, ScriptError};
-use super::stream::{Commit, Event, IdentityKind, Readable, StreamEntry, decode, parse_read_reply, readable_despite, repo_hint};
-use super::tier::{CopyTier, Tiers};
+use super::stream::{Event, StreamEntry, decode, parse_read_reply};
+use super::tier::Tiers;
 use super::watermark::{Watermarks, contribution};
 use super::writer::{ApplyOptions, Transient, WriteSource, Writer};
 use crate::config::FirehoseConfig;
-use crate::subscriptions::triggers;
+
+mod lanes;
+
+use lanes::{Done, Lane, Work};
+pub use lanes::{CONFLICT_RETRIES, LowWater, METRIC_LANE_BUSY, METRIC_LANE_QUEUE, METRIC_LANE_RETRIES, lane_of};
 
 /// `XAUTOCLAIM` min-idle (§5.3).
 pub const AUTOCLAIM_MIN_IDLE_MS: u64 = 60_000;
@@ -316,6 +321,8 @@ pub struct Throughput {
     pub backlog_busy: Duration,
     /// `processed` by [`EntryPath`], in [`EntryPath::ALL`]'s order.
     pub by_path: [u64; 4],
+    /// Of `processed`, copies dropped as duplicates.
+    pub deduped: u64,
     window: VecDeque<Sample>,
     span: Duration,
 }
@@ -328,6 +335,7 @@ impl Throughput {
             backlog_processed: 0,
             backlog_busy: Duration::ZERO,
             by_path: [0; 4],
+            deduped: 0,
             window: VecDeque::new(),
             span,
         }
@@ -478,10 +486,13 @@ pub struct Consumer {
     /// The thread outline's sender, when the outline is on (thread outline
     /// design §3.1).
     outline: Option<crate::thread_outline::Sender>,
-    /// The entry in progress's outline ops, sent once it is processed.
-    outline_ops: Vec<crate::thread_outline::ops::Op>,
     /// Each relay's copy tier, from the stamps its entries carry.
     tiers: Tiers,
+    /// The copies applied within the dedupe window.
+    dedupe: Dedupe,
+    /// The low-water entry, shared with whoever needs the consumer's own
+    /// clock.
+    low_water: Arc<LowWater>,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -498,7 +509,12 @@ impl Consumer {
     ) -> Self {
         let pool = writer.pool().clone();
         register_series();
+        for lane in 0..cfg.writer_lanes.max(1) {
+            metrics::gauge!(METRIC_LANE_QUEUE, "lane" => lane.to_string()).set(0.0);
+            metrics::gauge!(METRIC_LANE_BUSY, "lane" => lane.to_string()).increment(0.0);
+        }
         let cfg_old_filtered = cfg.old_filtered_relays.clone();
+        let (dedupe_window, dedupe_repos) = (cfg.dedupe_window_secs, cfg.dedupe_repos);
         Self {
             #[cfg(test)]
             test: TestTuning {
@@ -523,12 +539,19 @@ impl Consumer {
             owed: false,
             step: StepStats::default(),
             outline: None,
-            outline_ops: Vec::new(),
             tiers: Tiers::new(
                 crate::indexing::full::full_set(&crate::config::FullGroup::ALL),
                 cfg_old_filtered,
             ),
+            dedupe: Dedupe::new(Duration::from_secs(dedupe_window), dedupe_repos),
+            low_water: Arc::default(),
         }
+    }
+
+    /// The low-water entry, read where the consumer's clock is needed.
+    #[must_use]
+    pub fn low_water(&self) -> Arc<LowWater> {
+        Arc::clone(&self.low_water)
     }
 
     /// The record groups `[full] kinds` enables, for the copy tiers.
@@ -1022,36 +1045,252 @@ impl Consumer {
         parse_read_reply(reply.map_err(redis_error)?).map_err(ConsumerError::Shape)
     }
 
-    /// Process entries in stream order; ack the processed ones in one
-    /// pipelined call, including on a transient failure part-way through.
+    /// Process a batch: each entry is read in stream order (decoded, its
+    /// tier taken, a duplicate copy dropped), then applied by its repo's
+    /// lane, the lanes side by side; once they are done, the entries are
+    /// booked and acked in stream order up to the first one that failed or
+    /// was not reached, so watermarks and the outline never pass an entry
+    /// that did not commit. Entries after it, committed or not, are read
+    /// again from the pending list and applied again, which writing by rev
+    /// makes harmless. A lane is handed at most `lane_queue` entries at a
+    /// time; a batch that would give one more is split.
     async fn process_batch(&mut self, entries: Vec<StreamEntry>) -> Result<(), ConsumerError> {
         #[cfg(test)]
         self.test.record.lock().expect("record").batches.push((Instant::now(), entries.len()));
+        let entries = Arc::new(entries);
+        let dedupe = self.dedupe_on();
+        let mut start = 0;
+        let mut carry = None;
+        while start < entries.len() {
+            self.low_water.set(Some(&entries[start].id));
+            let (end, outcome, next) = if self.lanes() == 1 {
+                (entries.len(), self.run_inline(&entries, start, dedupe).await, None)
+            } else {
+                self.run_lanes(&entries, start, carry.take(), dedupe).await
+            };
+            self.finish(&entries[start..end], outcome).await?;
+            start = end;
+            carry = next;
+        }
+        Ok(())
+    }
+
+    fn lanes(&self) -> usize {
+        usize::try_from(self.cfg.writer_lanes).unwrap_or(1).max(1)
+    }
+
+    /// Whether duplicate copies are dropped: read per batch, so a switch of
+    /// breadth takes effect at the next one.
+    fn dedupe_on(&self) -> bool {
+        self.cfg.dedupe.on(self.writer.scope().public_breadth() == crate::indexing::Breadth::Full)
+    }
+
+    /// One lane's own handles.
+    fn lane(&self, index: usize) -> Lane {
+        Lane {
+            index,
+            label: index.to_string(),
+            writer: self.writer.clone(),
+            pool: self.pool.clone(),
+            redis: self.redis.clone(),
+            dead_letter_stream: self.cfg.dead_letter_stream.clone(),
+            dead_letter_maxlen: self.cfg.dead_letter_maxlen,
+            options: self.apply_options(),
+            outline: self.outline.is_some(),
+            watermarks: self.watermarks.clone(),
+            system_accounts: self.system_accounts.clone(),
+            sync_min_interval_secs: self.sync_min_interval_secs,
+            seen: HashMap::new(),
+        }
+    }
+
+    /// One lane, in this task: each entry read and applied before the next
+    /// is read, as a single writer always has. Stops at the first failure.
+    async fn run_inline(&mut self, entries: &Arc<Vec<StreamEntry>>, start: usize, dedupe: bool) -> Vec<Option<Result<Done, ConsumerError>>> {
+        let mut lane = self.lane(0);
+        let mut out = Vec::with_capacity(entries.len() - start);
+        let started = Instant::now();
+        for entry in &entries[start..] {
+            let result = match self.dispatch(entry, dedupe).await {
+                Ok(work) => lane.run(entry, work).await,
+                Err(e) => Err(e),
+            };
+            let failed = result.is_err();
+            out.push(Some(result));
+            if failed {
+                break;
+            }
+        }
+        lane.book_busy(started.elapsed());
+        out.resize_with(entries.len() - start, || None);
+        out
+    }
+
+    /// The lanes, each in a task of its own. Entries are read in stream
+    /// order until one lane would be handed more than `lane_queue`: that
+    /// entry's work is carried to the next round. A read that fails stops
+    /// the reading there. A lane that fails stops the others before their
+    /// next entry.
+    #[allow(clippy::type_complexity)]
+    async fn run_lanes(
+        &mut self,
+        entries: &Arc<Vec<StreamEntry>>,
+        start: usize,
+        mut carry: Option<Work>,
+        dedupe: bool,
+    ) -> (usize, Vec<Option<Result<Done, ConsumerError>>>, Option<Work>) {
+        let n = self.lanes();
+        let limit = usize::try_from(self.cfg.lane_queue).unwrap_or(usize::MAX).max(1);
+        let mut queues: Vec<Vec<(usize, Work)>> = (0..n).map(|_| Vec::new()).collect();
+        let mut out: Vec<Option<Result<Done, ConsumerError>>> = Vec::new();
+        let mut end = start;
+        let mut next = None;
+        for (i, entry) in entries.iter().enumerate().skip(start) {
+            let work = match carry.take() {
+                Some(work) => Ok(work),
+                None => self.dispatch(entry, dedupe).await,
+            };
+            match work {
+                Ok(Work::Done(done)) => out.push(Some(Ok(done))),
+                Ok(work) => {
+                    let lane = lane_of(work.repo(entry).as_str(), n);
+                    if queues[lane].len() >= limit {
+                        next = Some(work);
+                        break;
+                    }
+                    out.push(None);
+                    queues[lane].push((i - start, work));
+                }
+                Err(e) => {
+                    out.push(Some(Err(e)));
+                    end = i + 1;
+                    break;
+                }
+            }
+            end = i + 1;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut tasks = Vec::with_capacity(n);
+        for (index, queue) in queues.into_iter().enumerate() {
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(METRIC_LANE_QUEUE, "lane" => index.to_string()).set(queue.len() as f64);
+            if queue.is_empty() {
+                continue;
+            }
+            let mut lane = self.lane(index);
+            let entries = Arc::clone(entries);
+            let stop = Arc::clone(&stop);
+            tasks.push(tokio::spawn(async move {
+                let started = Instant::now();
+                let mut done = Vec::with_capacity(queue.len());
+                for (at, work) in queue {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    let result = lane.run(&entries[start + at], work).await;
+                    if result.is_err() {
+                        stop.store(true, Ordering::Release);
+                    }
+                    done.push((at, result));
+                }
+                lane.book_busy(started.elapsed());
+                metrics::gauge!(METRIC_LANE_QUEUE, "lane" => lane.label.clone()).set(0.0);
+                done
+            }));
+        }
+        let mut panicked = None;
+        for task in tasks {
+            match task.await {
+                Ok(done) => {
+                    for (at, result) in done {
+                        out[at] = Some(result);
+                    }
+                }
+                Err(e) => panicked = Some(ConsumerError::Shape(format!("a writer lane failed: {e}"))),
+            }
+        }
+        if let Some(e) = panicked
+            && let Some(slot) = out.iter_mut().find(|r| r.is_none())
+        {
+            *slot = Some(Err(e));
+        }
+        (end, out, next)
+    }
+
+    /// Book and ack, in stream order, every entry up to the first that did
+    /// not commit; then return that entry's failure, or the first failure
+    /// of any lane.
+    async fn finish(&mut self, entries: &[StreamEntry], outcome: Vec<Option<Result<Done, ConsumerError>>>) -> Result<(), ConsumerError> {
         let mut acks: Vec<String> = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            if let Some(o) = &mut self.outline {
-                o.before_entry(&entry.id);
-            }
-            self.outline_ops.clear();
-            match self.process_entry(entry).await {
-                Ok(path) => {
-                    self.count(entry, path);
+        let mut failure = None;
+        let mut stopped = false;
+        for (entry, result) in entries.iter().zip(outcome) {
+            match result {
+                Some(Ok(done)) if !stopped => {
                     if let Some(o) = &mut self.outline {
-                        o.commit(&entry.id, std::mem::take(&mut self.outline_ops));
+                        o.before_entry(&entry.id);
+                    }
+                    self.book_done(entry, done);
+                    acks.push(entry.id.clone());
+                }
+                Some(Err(e)) => {
+                    stopped = true;
+                    if failure.is_none() {
+                        failure = Some(e);
                     }
                 }
-                Err(error) => {
-                    self.outline_through(&acks);
-                    if let Err(ack_error) = self.ack(&acks).await {
-                        tracing::warn!(event = "firehose_ack_failed", error = %ack_error, "acking committed entries failed; they will be re-applied");
-                    }
-                    return Err(error);
-                }
+                Some(Ok(_)) | None => stopped = true,
             }
-            acks.push(entry.id.clone());
+        }
+        self.tiers.board().set_writer(super::tier::WriterFigures {
+            lanes: u32::try_from(self.lanes()).unwrap_or(u32::MAX),
+            dedupe: self.dedupe_on(),
+            entries: self.throughput.processed,
+            deduped: self.throughput.deduped,
+        });
+        // The low-water entry: the oldest not committed, else the last read.
+        match entries.get(acks.len()) {
+            Some(next) => self.low_water.set(Some(&next.id)),
+            None => self.low_water.set(acks.last().map(String::as_str)),
         }
         self.outline_through(&acks);
-        self.ack(&acks).await
+        match failure {
+            Some(error) => {
+                if let Err(ack_error) = self.ack(&acks).await {
+                    tracing::warn!(event = "firehose_ack_failed", error = %ack_error, "acking committed entries failed; they will be re-applied");
+                }
+                Err(error)
+            }
+            None if acks.len() < entries.len() => {
+                if let Err(ack_error) = self.ack(&acks).await {
+                    tracing::warn!(event = "firehose_ack_failed", error = %ack_error, "acking committed entries failed; they will be re-applied");
+                }
+                Err(ConsumerError::Shape("a writer lane stopped without a result".into()))
+            }
+            None => self.ack(&acks).await,
+        }
+    }
+
+    /// Book one committed entry: counted, its outline ops sent, its relay's
+    /// watermark advanced, its copy marked seen.
+    fn book_done(&mut self, entry: &StreamEntry, done: Done) {
+        self.count(entry, done.path);
+        if done.duplicate {
+            self.throughput.deduped += 1;
+        }
+        if let Some((label, c)) = done.watermark {
+            self.watermarks.observe(&label, c);
+            // Thread outline design §3.3 (R5-4): each relay's liveness ring.
+            if let Some(o) = &self.outline {
+                o.outline().observe_relay(&label, c.timestamp_millis());
+            }
+        }
+        if let Some(o) = &mut self.outline {
+            o.commit(&entry.id, done.outline);
+        }
+        if let Some((repo, key)) = done.seen {
+            self.dedupe.insert(&repo, key, Instant::now());
+        }
     }
 
     /// Tell the outline writer every entry through the last of `processed`
@@ -1076,7 +1315,9 @@ impl Consumer {
         let _ = entry;
     }
 
-    async fn process_entry(&mut self, entry: &StreamEntry) -> Result<EntryPath, ConsumerError> {
+    /// Read one entry in stream order: decode it, take and remember its
+    /// relay's tier, and drop a copy another relay's copy already applied.
+    async fn dispatch(&mut self, entry: &StreamEntry, dedupe: bool) -> Result<Work, ConsumerError> {
         #[cfg(test)]
         {
             crate::test_support::hooks::delay(crate::test_support::hooks::CONSUMER_STALL, &self.test.db).await;
@@ -1094,42 +1335,7 @@ impl Consumer {
         }
         let event = match decode(entry) {
             Ok(e) => e,
-            Err(error) => {
-                let readable = readable_despite(entry);
-                // Thread outline design §2, §3.1: a bad-rev commit's post
-                // ops, and a parseable dead letter's, record holes.
-                if self.outline.is_some() {
-                    self.outline_ops = crate::thread_outline::ops::refused_ops(entry, readable.as_ref());
-                }
-                // A refusal that could not matter is counted and dropped
-                // (actionable-warnings design §6): an event naming no DID,
-                // or a commit refused for its rev alone whose ops, with a
-                // valid rev, would have written nothing.
-                let dropped = match readable {
-                    Some(Readable::NotADid) => Some("did"),
-                    Some(Readable::Commit { repo, ops }) => (!self.writer.would_write(&repo, &ops).await).then_some("rev"),
-                    None => None,
-                };
-                if let Some(check) = dropped {
-                    metrics::counter!(deadletter::METRIC_MALFORMED_DROPPED, "check" => check).increment(1);
-                    tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check, %error, "a malformed entry that could not matter was dropped");
-                    return Ok(EntryPath::NoTx);
-                }
-                // Deterministic: dead-letter the whole entry (§6.11.6).
-                let (repo, rev) = repo_hint(entry);
-                let letter = DeadLetter {
-                    orig_id: entry.id.clone(),
-                    entry_type: entry.field("type").unwrap_or_default().to_string(),
-                    seq: entry.field("seq").unwrap_or_default().to_string(),
-                    repo,
-                    rev,
-                    error,
-                    data: entry.raw("data").map(<[u8]>::to_vec).unwrap_or_default(),
-                    ..DeadLetter::default()
-                };
-                self.dead_letter(&[letter]).await?;
-                return Ok(EntryPath::DeadLetter);
-            }
+            Err(error) => return Ok(Work::Undecodable(error)),
         };
         // The relay reader's stamp, remembered per relay label.
         let label = self.watermarks.label_for(event.relay()).to_string();
@@ -1138,14 +1344,18 @@ impl Consumer {
         if self.tiers.observe(&label, event.cap()) || forgot {
             self.tiers.persist(&self.pool).await?;
         }
-        match event {
+        Ok(match event {
             Event::Sync(sync) => {
                 // A repo reset. Members' tracked chains follow it as before:
                 // the next commit that does not chain is a link, and the
                 // head prober resyncs a repo that diverged.
                 tracing::debug!(event = "firehose_sync", id = %entry.id, relay = %label, tier = tier.as_str(), repo = %sync.did, rev = %sync.rev, "repo sync received");
                 metrics::counter!(METRIC_STREAM_EVENTS, "type" => "sync").increment(1);
-                Ok(EntryPath::NoTx)
+                let key = if dedupe { CopyKey::of(&sync.rev, CopyKind::Sync, tier, sync.cap.as_ref()) } else { None };
+                match key {
+                    Some(k) if self.dedupe.drops(&sync.did, &k, Instant::now()) => Work::Done(Done::duplicate(&label, None)),
+                    key => Work::Sync { did: sync.did, key, label },
+                }
             }
             Event::Resume(resume) => {
                 tracing::info!(
@@ -1160,112 +1370,30 @@ impl Consumer {
                     "a relay reader reported events it did not publish"
                 );
                 metrics::counter!(METRIC_STREAM_EVENTS, "type" => "resume").increment(1);
-                Ok(EntryPath::NoTx)
+                Work::Done(Done::nothing())
             }
-            Event::Identity { kind, did, relay, active, status, .. } => {
-                // In full, a takedown relay's account statuses are recorded.
-                if kind == IdentityKind::Account && active.is_some() {
-                    let (full, relays) = {
-                        let sets = self.writer.scope().read_guard().await;
-                        (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone())
-                    };
-                    if full && relays.contains(&label) {
-                        crate::indexing::full::record_relay_status(&self.pool, &did, &label, active, status.as_deref()).await?;
-                    } else if full && active == Some(false) && label == super::watermark::UNKNOWN_RELAY {
-                        tracing::warn!(event = "firehose_unaliased_status", relay = ?relay, %did, "an account status from a relay URL with no label or alias; list it in firehose.relay_aliases if it stands in for a takedown relay");
+            Event::Identity { kind, did, relay, active, status, .. } => Work::Identity { kind, did, relay, active, status, label },
+            Event::Commit(commit) => {
+                self.coverage.observe(&commit.repo, &commit.rev, &label);
+                tracing::debug!(
+                    event = "firehose_ops",
+                    id = %entry.id,
+                    relay = %label,
+                    repo = %commit.repo,
+                    rev = %commit.rev,
+                    ops = commit.ops.len(),
+                    "commit received"
+                );
+                let key = if dedupe { CopyKey::of(&commit.rev, CopyKind::Commit, tier, commit.cap.as_ref()) } else { None };
+                match key {
+                    Some(k) if self.dedupe.drops(&commit.repo, &k, Instant::now()) => {
+                        let watermark = contribution(entry.id_ms(), commit.time).map(|c| (label.clone(), c));
+                        Work::Done(Done::duplicate(&label, watermark))
                     }
+                    key => Work::Commit { commit, label, tier, key },
                 }
-                if self.outline.is_some()
-                    && let Some(key) = crate::thread_outline::ops::status_relay(&self.watermarks, relay.as_deref())
-                {
-                    self.outline_ops = crate::thread_outline::ops::status_op(kind, &did, &key, active, entry.seq()).into_iter().collect();
-                }
-                let queued = route_identity(&self.pool, kind, &did, &self.system_accounts).await?;
-                // The live feed counts every event and shows the queued ones
-                // (admin-ui-live-feed design §4.1).
-                if let Some(tap) = self.writer.feed() {
-                    tap.identity(kind, &did, queued, Some(self.watermarks.label_for(relay.as_deref())));
-                }
-                // Rule 4 (§4.3): an owner of a subscribed list that looks
-                // gone is looked at again; an ordinary owner's events
-                // cause no sync.
-                let owner_event = matches!(kind, IdentityKind::Identity | IdentityKind::Account);
-                if owner_event && self.writer.scope().read_guard().await.subscribed.tracks(&did) {
-                    triggers::owner_event(&self.pool, &did, self.sync_min_interval_secs).await?;
-                }
-                Ok(EntryPath::Identity)
             }
-            Event::Commit(commit) => self.process_commit(entry, commit, label, tier).await,
-        }
-    }
-
-    async fn process_commit(&mut self, entry: &StreamEntry, commit: Commit, label: String, tier: CopyTier) -> Result<EntryPath, ConsumerError> {
-        self.coverage.observe(&commit.repo, &commit.rev, &label);
-        tracing::debug!(
-            event = "firehose_ops",
-            id = %entry.id,
-            relay = %label,
-            repo = %commit.repo,
-            rev = %commit.rev,
-            ops = commit.ops.len(),
-            "commit received"
-        );
-        // A tracked repo's chain is advanced only by a whole copy: any other
-        // copy may have dropped a commit its filter left out, in every
-        // public-indexing mode.
-        let options = ApplyOptions { advance_applied_rev: tier == CopyTier::Whole, ..self.apply_options() };
-        let report = self
-            .writer
-            .apply_copy(Some(&label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier)
-            .await?;
-        // A malformed op that could not matter is counted, not dead-lettered
-        // (actionable-warnings design §6.3).
-        let dropped = report.failed.iter().filter(|f| !f.matters).count();
-        if dropped > 0 {
-            metrics::counter!(deadletter::METRIC_MALFORMED_DROPPED, "check" => "record").increment(dropped as u64);
-            tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check = "record", repo = %commit.repo, ops = dropped, "malformed ops that could not matter were dropped");
-        }
-        if report.failed.iter().any(|f| f.matters) {
-            let data = entry.raw("data").map(<[u8]>::to_vec).unwrap_or_default();
-            let letters: Vec<DeadLetter> = report
-                .failed
-                .iter()
-                .filter(|f| f.matters)
-                .map(|f| DeadLetter {
-                    orig_id: entry.id.clone(),
-                    entry_type: "commit".to_string(),
-                    relay: label.clone(),
-                    seq: entry.field("seq").unwrap_or_default().to_string(),
-                    repo: commit.repo.clone(),
-                    rev: commit.rev.clone(),
-                    action: f.action.as_str().to_string(),
-                    path: f.path.clone(),
-                    error: f.error.clone(),
-                    data: data.clone(),
-                })
-                .collect();
-            self.dead_letter(&letters).await?;
-        }
-        if let Some(c) = contribution(entry.id_ms(), commit.time) {
-            self.watermarks.observe(&label, c);
-            // Thread outline design §3.3 (R5-4): each relay's liveness ring.
-            if let Some(o) = &self.outline {
-                o.outline().observe_relay(&label, c.timestamp_millis());
-            }
-        }
-        self.outline_ops = report.outline;
-        Ok(if report.transaction { EntryPath::Tx } else { EntryPath::NoTx })
-    }
-
-    async fn dead_letter(&mut self, letters: &[DeadLetter]) -> Result<(), ConsumerError> {
-        deadletter::write(
-            &mut self.redis,
-            &self.cfg.dead_letter_stream,
-            self.cfg.dead_letter_maxlen,
-            letters,
-        )
-        .await?;
-        Ok(())
+        })
     }
 
     async fn ack(&mut self, ids: &[String]) -> Result<(), ConsumerError> {
@@ -1600,6 +1728,8 @@ mod tests {
     use super::*;
 
     mod bench;
+    // Writer lanes and dedupe.
+    mod lanes;
     mod live;
     mod outline;
     // The public page's live feed beside a running consumer (public-page

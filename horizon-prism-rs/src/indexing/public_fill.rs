@@ -188,10 +188,16 @@ impl PublicIndexing {
             return Ok(());
         }
         let started = Instant::now();
-        // In full, the locking repair would stop ingest for hours, and no
-        // read uses local counts until a group's history is complete: it
-        // is skipped.
-        if self.breadth() != Breadth::Full {
+        // In full, the locking repair would stop ingest for hours: the
+        // keyset repair, which locks no table, runs in the background.
+        if self.breadth() == Breadth::Full {
+            let pool = self.pool.clone();
+            drop(tokio::spawn(async move {
+                if let Err(error) = crate::aggregations::rebuild::repair_counts_keyset(&pool).await {
+                    tracing::warn!(event = "count_repair_keyset_failed", %error, "the keyset counts repair after the fill failed; the weekly repair or the admin command runs it again");
+                }
+            }));
+        } else {
             #[cfg(test)]
             self.hooks.repairs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             repair_counts(&self.pool).await?;

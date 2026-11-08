@@ -32,7 +32,7 @@ use chrono::Utc;
 use super::backfill::{ListPage, ListedRecord};
 use super::classifier::NSID_FOLLOW;
 use super::records::GraphRecord;
-use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Writer, clear_follows_verified};
+use super::writer::{Action, ApplyOptions, OpOutcome, RawOp, Transient, Writer, clear_follows_verified};
 
 /// `follows_pass_total{outcome}`: passes by how they ended.
 pub const METRIC_PASS: &str = "follows_pass_total";
@@ -309,6 +309,6 @@ fn delete(rkey: &str) -> RawOp {
 /// One op in its own transaction at rev R. Returns whether it failed
 /// deterministically after the writer's attempts.
 async fn write(writer: &Writer, options: ApplyOptions, did: &str, rev: &str, op: RawOp) -> Result<bool, String> {
-    let report = writer.apply(did, rev, &[op], options).await.map_err(|e| e.0)?;
+    let report = writer.apply(did, rev, &[op], options).await.map_err(Transient::into_message)?;
     Ok(matches!(report.outcomes.first(), Some(OpOutcome::Failed(_))))
 }

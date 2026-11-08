@@ -758,7 +758,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     let rebuild = Rebuild::new(pool.clone(), scope.clone(), Arc::clone(&private), cfg.file.scope.rebuild_grace_days)
         .with_sync_min_interval_secs(lists.sync_min_interval_secs)
         .with_max_purges(cfg.file.scope.sweep_max_purges)
-        .with_retention_at(cfg.file.retention.run_at_utc);
+        .with_retention_at(cfg.file.retention.run_at_utc)
+        .with_full_weekly_repair(cfg.file.full.weekly_count_repair);
     if cfg.file.scope.rebuild_grace_days > 1 {
         tracing::warn!(
             event = "scope_grace_slows_unfollow",
