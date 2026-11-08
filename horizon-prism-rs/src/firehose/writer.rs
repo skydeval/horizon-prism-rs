@@ -139,6 +139,14 @@ pub enum WriteSource {
     Crawl,
 }
 
+/// Where a live copy was read: its stream entry id's milliseconds, and
+/// whether its relay reader stamped it with its capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveStream {
+    pub ms: i64,
+    pub stamped: bool,
+}
+
 /// What happened to one op.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpOutcome {
@@ -1128,10 +1136,10 @@ impl Writer {
         self.apply_live(relay, repo, rev, since, ops, options, tier, None).await
     }
 
-    /// [`Writer::apply_copy`] for a copy read from the stream at
-    /// `stream_ms` (its entry id's milliseconds): in breadth Full, every
-    /// such copy also runs full indexing's continuity statements, written
-    /// or not.
+    /// [`Writer::apply_copy`] for a copy read from the stream (`stream`:
+    /// its entry id's milliseconds, and whether the relay reader stamped
+    /// it): in breadth Full, every such copy also runs full indexing's
+    /// continuity statements, written or not.
     ///
     /// # Errors
     ///
@@ -1146,7 +1154,7 @@ impl Writer {
         ops: &[RawOp],
         options: ApplyOptions,
         tier: super::tier::CopyTier,
-        stream_ms: Option<i64>,
+        stream: Option<LiveStream>,
     ) -> Result<ApplyReport, Transient> {
         // Firehose throughput design §2.4: a hung database, before the
         // nothing-to-write check so it holds every entry alike.
@@ -1260,8 +1268,8 @@ impl Writer {
         let forced = false;
         // Full indexing's continuity: every live copy with a rev runs its
         // statements, so the transaction always runs.
-        let continuity = match stream_ms {
-            Some(ms) if sets.public.breadth == crate::indexing::Breadth::Full && options.source == WriteSource::Firehose => Some(ms),
+        let continuity = match stream {
+            Some(s) if sets.public.breadth == crate::indexing::Breadth::Full && options.source == WriteSource::Firehose => Some(s),
             _ => None,
         };
         if !forced && continuity.is_none() && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
@@ -1429,7 +1437,8 @@ impl Writer {
         // Full indexing's continuity, after every write that fires a count
         // trigger.
         let mut first_sight = false;
-        if let (Some(stream_ms), Some(account)) = (continuity, repo_id) {
+        if let (Some(stream), Some(account)) = (continuity, repo_id) {
+            let stream_ms = stream.ms;
             if tier == super::tier::CopyTier::Aside {
                 crate::indexing::crawl::continuity::on_aside(&mut tx, account, rev, stream_ms, relay.unwrap_or("other")).await?;
             } else {
@@ -1442,6 +1451,7 @@ impl Writer {
                     crawl_generation: i64::try_from(sets.public.crawl_generation).unwrap_or(i64::MAX),
                     groups: &groups,
                     failed: failed_enabled,
+                    stamped: stream.stamped,
                 };
                 first_sight = crate::indexing::crawl::continuity::on_copy(&mut tx, &copy).await?.inserted;
             }
@@ -1490,6 +1500,7 @@ impl Writer {
             crawl_generation: i64::try_from(guard.public.crawl_generation).unwrap_or(i64::MAX),
             groups: &groups,
             failed: false,
+            stamped: true,
         };
         let mut tx = self.pool.begin().await?;
         lock_dids_shared(&mut tx, &[repo.to_string()]).await?;

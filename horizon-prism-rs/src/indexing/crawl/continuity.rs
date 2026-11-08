@@ -31,6 +31,10 @@ pub struct Copy<'a> {
     pub groups: &'a [String],
     /// A failed op of an enabled group: a hole at once.
     pub failed: bool,
+    /// The relay reader stamped the copy. An unstamped (older) reader
+    /// sends no `since`, so its copies cannot chain: continuity is reduced
+    /// to the re-list's comparison of heads.
+    pub stamped: bool,
 }
 
 /// What the copy did to the account's row.
@@ -140,6 +144,12 @@ pub async fn on_copy(conn: &mut PgConnection, c: &Copy<'_>) -> Result<Advanced, 
         return Ok(out);
     }
     match c.since {
+        // An older reader's copy carries no `since`: it is taken as the
+        // next commit.
+        None if !c.stamped => {
+            sqlx::query("UPDATE full_crawl SET chain_rev = $2 WHERE account = $1").bind(c.account).bind(c.rev).execute(&mut *conn).await?;
+            advance(conn, c.account).await?;
+        }
         // A commit with no `since` on an established chain: a re-created
         // repo.
         None => {

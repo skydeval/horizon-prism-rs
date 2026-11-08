@@ -265,8 +265,14 @@ impl Stack {
     /// A live Whole copy of `did`'s commit `rev` with `since`, read at
     /// stream time `ms`.
     async fn live(&self, did: &str, rev: &str, since: Option<&str>, ops: &[RawOp], ms: i64, tier: CopyTier) {
+        self.live_from(did, rev, since, ops, ms, tier, true).await;
+    }
+
+    /// A live copy from a relay reader that stamps its copies or not.
+    #[allow(clippy::too_many_arguments)]
+    async fn live_from(&self, did: &str, rev: &str, since: Option<&str>, ops: &[RawOp], ms: i64, tier: CopyTier, stamped: bool) {
         let options = ApplyOptions { advance_applied_rev: false, dead_letter_readiness: false, attempts: 1, live: true, subscription_rules: false, source: WriteSource::Firehose };
-        self.writer.apply_live(Some("bsky"), did, rev, since, ops, options, tier, Some(ms)).await.expect("live");
+        self.writer.apply_live(Some("bsky"), did, rev, since, ops, options, tier, Some(crate::firehose::writer::LiveStream { ms, stamped })).await.expect("live");
     }
 
     fn low_water(&self, ms: i64) {
@@ -498,6 +504,15 @@ async fn links_become_holes_after_the_window_and_a_sync_at_once() {
     assert_eq!((last.as_deref(), chain.as_deref(), e), (Some("3kaaaaaaaaz22"), Some("3kaaaaaaaaz22"), epoch + 2));
     s.live(STRANGER, "3kaaaaaabaa22", Some("3kaaaaaaaaz22"), none, 7_000, CopyTier::Whole).await;
     assert_eq!(count(&s.pool, "SELECT count(*) FROM full_chain_links").await, 0, "the next commit chains");
+    // An older reader sends no `since`: its copies chain as the next
+    // commit, never a hole.
+    s.live_from(STRANGER, "3kaaaaaabab22", None, none, 7_500, CopyTier::Whole, false).await;
+    let (_, _, chain, e, ..) = s.row(STRANGER).await;
+    assert_eq!((chain.as_deref(), e), (Some("3kaaaaaabab22"), epoch + 2), "an unstamped copy with no since is no hole");
+    // A stamped one with no `since` on an established chain is a
+    // re-created repository: a hole at once.
+    s.live(STRANGER, "3kaaaaaabac22", None, none, 7_600, CopyTier::Whole).await;
+    assert_eq!(s.row(STRANGER).await.3, epoch + 3);
     // An Aside relay's `#sync` writes nothing.
     assert!(!s.writer.apply_sync(STRANGER, "3kaaaaaabzz22", CopyTier::Aside, 8_000).await.expect("sync"));
     db.drop_db().await;

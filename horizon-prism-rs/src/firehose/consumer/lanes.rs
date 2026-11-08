@@ -308,6 +308,7 @@ impl Lane {
     /// The writer's call for one copy, retried in place when another
     /// lane's transaction conflicted with it.
     async fn apply(&self, commit: &Commit, label: &str, tier: CopyTier, stream_ms: Option<i64>) -> Result<ApplyReport, Transient> {
+        let stream = stream_ms.map(|ms| crate::firehose::writer::LiveStream { ms, stamped: commit.cap.is_some() });
         // A tracked repo's chain is advanced only by a whole copy: any other
         // copy may have dropped a commit its filter left out, in every
         // public-indexing mode.
@@ -316,7 +317,7 @@ impl Lane {
         loop {
             let result = self
                 .writer
-                .apply_live(Some(label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier, stream_ms)
+                .apply_live(Some(label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier, stream)
                 .await;
             match result {
                 Err(t) if tries < CONFLICT_RETRIES && t.conflict().is_some() => {
