@@ -474,7 +474,7 @@ pub enum Class {
 }
 
 /// The tables full writes only in breadth Full: the exit empties them.
-pub const FULL_ONLY: [&str; 9] = [
+pub const FULL_ONLY: [&str; 10] = [
     "full_crawl",
     "full_crawl_groups",
     "relay_account_status",
@@ -484,6 +484,7 @@ pub const FULL_ONLY: [&str; 9] = [
     "full_gaps",
     "full_incomplete",
     "crawl_identity",
+    "external_labels",
 ];
 
 /// The coverage table: every table of the schema in one class. A table in

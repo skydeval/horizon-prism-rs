@@ -657,6 +657,24 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .with_queues(Arc::clone(&first_sight), Arc::clone(&on_demand));
         tasks.push(crawler.spawn());
     }
+    // Full indexing's third-party labels: the subscriptions and the views'
+    // reads; idle outside breadth Full.
+    {
+        let labelers = crate::refract::labels::Labelers::new(resolver.clone());
+        let settings = crate::indexing::labels::Settings::from_config(&cfg.file.full);
+        let upstream = crate::indexing::labels::upstream::Upstream::new(nets.internal().client().clone(), labelers.clone(), settings.cache_secs);
+        let labels = crate::indexing::labels::ExternalLabels::new(settings, upstream);
+        scope.set_external_labels(Arc::clone(&labels)).await;
+        let subscriber = crate::indexing::labels::subscriber::Subscriber::new(
+            pool.clone(),
+            scope.clone(),
+            labels,
+            labelers,
+            nets.internal().client().clone(),
+            &cfg.file.identity.plc_url,
+        );
+        tasks.push(subscriber.spawn());
+    }
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
 

@@ -166,6 +166,30 @@ pub struct FullConfig {
     pub blocks_source: BlocksSource,
     /// Where counts come from once a group's history is complete.
     pub counts: FullCounts,
+    /// How third-party labels reach views.
+    pub labels: FullLabels,
+    /// The labelers subscribed to under `labels = "subscribe"`.
+    pub label_sources: Vec<String>,
+    /// Replay each subscribed labeler from its first label; off, the
+    /// subscription starts at the tip and older subjects' labels are read
+    /// from the labeler.
+    pub label_backfill: bool,
+    /// How long a labeler's answer for a subject is kept.
+    pub label_cache_secs: u32,
+}
+
+/// Bluesky's moderation labeler.
+pub const BLUESKY_MODERATION_LABELER: &str = "did:plc:ar7c4by46qjdydhdevvrndac";
+
+/// `[full] labels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullLabels {
+    /// Subscribe to `label_sources` and store their labels.
+    #[default]
+    Subscribe,
+    /// Ask each labeler a request accepts, per request, cached.
+    Upstream,
 }
 
 /// `[full] blocks_source`.
@@ -208,6 +232,10 @@ impl Default for FullConfig {
             status_pass_pages_per_sec: 5,
             blocks_source: BlocksSource::Local,
             counts: FullCounts::Auto,
+            labels: FullLabels::Subscribe,
+            label_sources: vec![BLUESKY_MODERATION_LABELER.to_string()],
+            label_backfill: true,
+            label_cache_secs: 60,
         }
     }
 }

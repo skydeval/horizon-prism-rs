@@ -70,6 +70,9 @@ metrics-exporter-prometheus = "0.16"
 governor = "0.10"
 moka = { version = "0.12", features = ["future", "sync"] }
 futures = "0.3"
+# Full indexing's label subscriptions (`subscribeLabels`), over rustls with
+# ring, as the HTTP clients use.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "__rustls-tls"] }
 arc-swap = "1"
 rand = "0.9"
 chrono = "0.4"
@@ -95,6 +98,8 @@ rustix = { version = "1", features = ["fs"] }
 zstd = "0.13"
 
 [dev-dependencies]
+# The fake labeler's `subscribeLabels` stream in the label tests.
+axum = { version = "0.8", features = ["ws"] }
 # The SQL guards over the crate's own source (db/sql_guard.rs).
 regex = "1"
 # tokio::time::pause for the lag sampler's hang test (firehose throughput §4.5).

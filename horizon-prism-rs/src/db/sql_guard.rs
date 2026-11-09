@@ -24,7 +24,7 @@ use regex::Regex;
 const ALLOWED: &[(&str, &str, usize, &str)] = &[
     ("split_part", "admin/pages/labels.rs", 1, "the operator's labels keep their subject as text"),
     ("split_part", "hydration/labels.rs", 1, "the operator's labels keep their subject as text"),
-    ("split_part", "indexing/narrowing.rs", 1, "constellation_counts keeps its target as text"),
+    ("split_part", "indexing/narrowing.rs", 3, "constellation_counts and external_labels keep their subjects as text"),
     ("split_part", "hydration/notifications.rs", 2, "notification rows keep their record URI as text"),
     ("split_part", "private_tier/ingest.rs", 10, "the private tier keeps text URIs on its own rows"),
     ("split_part", "private_tier/schema.rs", 20, "the private tier keeps text URIs on its own rows"),

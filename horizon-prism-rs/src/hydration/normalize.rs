@@ -130,6 +130,19 @@ pub(crate) fn same_label(a: &Value, b: &Value) -> bool {
     ["src", "uri", "val"].iter().all(|k| a.get(*k) == b.get(*k)) && a.get("neg").and_then(Value::as_bool).unwrap_or(false) == b.get("neg").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// The labels of `labels` that apply to the record version `cid`: a label
+/// naming a `cid` applies to that version only.
+pub(crate) fn for_version(labels: &[Value], cid: Option<&str>) -> Vec<Value> {
+    labels
+        .iter()
+        .filter(|l| match (l.get("cid").and_then(Value::as_str), cid) {
+            (Some(want), Some(have)) => want == have,
+            _ => true,
+        })
+        .cloned()
+        .collect()
+}
+
 /// Local labels, then the kept upstream ones that are not among them.
 fn merged_labels(local: Option<&Vec<Value>>, kept: &[Value]) -> Option<Vec<Value>> {
     if local.is_none() && kept.is_empty() {
@@ -369,7 +382,8 @@ fn walk(v: &mut Value, overlay: &Overlay, report: &mut NormalizeReport) {
                     subject_author.as_deref().unwrap_or_default(),
                     m.get("indexedAt").and_then(Value::as_str),
                 );
-                if let Some(mut labels) = merged_labels(overlay.labels.get(uri), &kept) {
+                let local = overlay.labels.get(uri).map(|ls| for_version(ls, m.get("cid").and_then(Value::as_str)));
+                if let Some(mut labels) = merged_labels(local.as_ref(), &kept) {
                     add_missing_labels(&mut labels, own);
                     m.insert("labels".into(), Value::Array(labels));
                 } else if !own.is_empty() {

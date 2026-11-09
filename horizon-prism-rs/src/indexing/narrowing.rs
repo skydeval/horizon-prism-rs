@@ -97,6 +97,20 @@ fn bounded(step: Step, trial: bool) -> Step {
     }
 }
 
+/// Whether the subject of a label (a DID or an at-URI, text) is still
+/// stored: an account with an identity row; a post that is stored; another
+/// record whose author has an identity row.
+fn label_subject_stored(col: &str) -> String {
+    let actor = |did: &str| format!("EXISTS (SELECT 1 FROM actors la JOIN dids ld ON ld.id = la.id WHERE ld.did = {did})");
+    format!(
+        "(CASE WHEN {col} LIKE 'did:%' THEN {} \
+          WHEN split_part({col}, '/', 4) = 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM ref_of({col}) lr JOIN posts lp ON lp.author = lr.author AND lp.rkey = lr.rkey WHERE lr.coll = 1) \
+          ELSE {} END)",
+        actor(col),
+        actor(&format!("split_part({col}, '/', 3)"))
+    )
+}
+
 /// The tables only full writes, and the rows of shared tables full adds to
 /// that no retention step covers.
 fn full_only_steps() -> Vec<Step> {
@@ -129,18 +143,21 @@ fn full_only_steps() -> Vec<Step> {
         batched("crawl_identity", "account", "ci", "TRUE", Bind::None),
         batched("full_crawl", "account", "fc", "TRUE", Bind::None),
         batched("refract_excluded", "account", "rx", "TRUE", Bind::None),
+        // After the record tables: a label of a subject no longer stored.
+        batched_composite("external_labels", &["src", "uri", "cid", "val"], "el", &format!("NOT {}", label_subject_stored("el.uri")), Bind::None),
         // Last: the entry time bounds the steps above until here.
         batched(
             "worker_state",
             "key",
             "w",
             &format!(
-                "w.key IN ('{}', '{}', '{}', '{}', '{}')",
+                "w.key IN ('{}', '{}', '{}', '{}', '{}', '{}')",
                 super::full::GROUPS_KEY,
                 super::full::SINCE_KEY,
                 super::crawl::LIST_KEY,
                 super::crawl::RELIST_KEY,
-                super::crawl::groups_change::CHANGES_KEY
+                super::crawl::groups_change::CHANGES_KEY,
+                super::labels::STATE_KEY
             ),
             Bind::None,
         ),
@@ -149,7 +166,7 @@ fn full_only_steps() -> Vec<Step> {
 
 /// The narrowing sweep's steps, in order: every community scope step, then
 /// the full-only ones.
-pub const STEP_NAMES: [&str; 35] = [
+pub const STEP_NAMES: [&str; 36] = [
     "posts",
     "post_search",
     "likes",
@@ -184,13 +201,14 @@ pub const STEP_NAMES: [&str; 35] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
+    "external_labels",
     "worker_state",
 ];
 
 /// The steps a drain from full runs after the drain's own tables: the
 /// shared tables full adds to that the drain does not touch, then the
 /// full-only ones.
-pub const FULL_DRAIN_STEP_NAMES: [&str; 19] = [
+pub const FULL_DRAIN_STEP_NAMES: [&str; 20] = [
     "post_search",
     "blocks",
     "actor_self_records",
@@ -209,12 +227,13 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 19] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
+    "external_labels",
     "worker_state",
 ];
 
 /// A trial's narrowing: the narrowing's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_STEP_NAMES: [&str; 38] = [
+pub const TRIAL_STEP_NAMES: [&str; 39] = [
     "posts",
     "post_search",
     "likes",
@@ -252,12 +271,13 @@ pub const TRIAL_STEP_NAMES: [&str; 38] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
+    "external_labels",
     "worker_state",
 ];
 
 /// A trial's drain from full: the drain's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 20] = [
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 21] = [
     "post_search",
     "blocks",
     "actor_self_records",
@@ -277,6 +297,7 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 20] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
+    "external_labels",
     "worker_state",
 ];
 
@@ -358,6 +379,7 @@ fn trial_steps() -> Vec<Step> {
             bind: Bind::None,
         },
         batched_composite("relay_account_status", &["account", "relay"], "ras", "TRUE", Bind::None),
+        batched_composite("external_labels", &["src", "uri", "cid", "val"], "el", "TRUE", Bind::None),
         Step {
             table: TRIAL_PROFILES,
             sql: format!(

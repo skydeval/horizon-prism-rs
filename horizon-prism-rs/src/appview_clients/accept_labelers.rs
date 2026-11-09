@@ -282,6 +282,26 @@ pub fn current() -> Option<Arc<LabelerScope>> {
     SCOPE.try_with(Arc::clone).ok()
 }
 
+tokio::task_local! {
+    static REQUESTED: Arc<AcceptLabelers>;
+}
+
+/// Run `work` with the labelers a request accepts known to the views it
+/// builds (full indexing merges their labels). Every XRPC request runs
+/// inside it; `None` runs `work` as it is.
+pub async fn with_requested<F: std::future::Future>(accept: Option<AcceptLabelers>, work: F) -> F::Output {
+    match accept {
+        Some(accept) => REQUESTED.scope(Arc::new(accept), work).await,
+        None => work.await,
+    }
+}
+
+/// The labelers the request being served accepts, if it named any.
+#[must_use]
+pub fn requested() -> Option<Arc<AcceptLabelers>> {
+    REQUESTED.try_with(Arc::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

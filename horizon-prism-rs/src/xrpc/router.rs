@@ -145,6 +145,13 @@ fn expected_verb(allow: Option<&HeaderValue>, requested: &Method) -> &'static st
 
 /// Response fix-ups that need the whole router's view of a response: the
 /// wrong-verb body (§6.3) and `Retry-After` on `NotReady` (§II-7.1).
+/// Every request runs with the labelers its `atproto-accept-labelers`
+/// names known to the views it builds.
+async fn requested_labelers(request: Request, next: Next) -> Response {
+    let accept = crate::appview_clients::accept_labelers::AcceptLabelers::from_headers(request.headers());
+    crate::appview_clients::accept_labelers::with_requested(accept, next.run(request)).await
+}
+
 async fn finish(State(cfg): State<FinalConfig>, request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     if let Some(WrongVerb(requested)) = response.extensions().get::<WrongVerb>().cloned() {
@@ -262,6 +269,7 @@ pub fn finalize_with(routes: Router, state: AppState, cfg: FinalConfig, usage: U
                 }
             },
         )
+        .layer(middleware::from_fn(requested_labelers))
         .layer(middleware::from_fn_with_state(cfg, finish))
         .layer(middleware::from_fn_with_state(gate, public_gate))
         .layer(middleware::from_fn_with_state(state, global_limit))

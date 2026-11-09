@@ -1025,6 +1025,22 @@ impl Hydrator {
                 "cts": ts(cts),
             }));
         }
+        // Full indexing: the labels of the labelers the request accepts.
+        let external = {
+            let sets = self.scope().read_guard().await;
+            (sets.public.breadth == crate::indexing::Breadth::Full && sets.public.mode.is_on()).then(|| sets.full.labels.clone()).flatten()
+        };
+        if let (Some(external), Some(accept)) = (external, crate::appview_clients::accept_labelers::requested()) {
+            let accepted: Vec<String> = accept.entries().iter().map(|e| e.did.clone()).filter(|d| *d != self.inner.cfg.labeler_did).collect();
+            match external.for_subjects(self.pool(), subjects, &accepted).await {
+                Ok(found) => {
+                    for (subject, labels) in found {
+                        normalize::add_missing_labels(out.entry(subject).or_default(), labels);
+                    }
+                }
+                Err(error) => tracing::warn!(event = "external_labels_read_failed", %error, "reading third-party labels failed; views carry the operator's labels only"),
+            }
+        }
         Ok(out)
     }
 

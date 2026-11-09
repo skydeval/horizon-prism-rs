@@ -118,6 +118,8 @@ pub struct FullSets {
     /// Counts read locally once their group's history is complete
     /// (`[full] counts = "auto"`).
     pub counts_auto: bool,
+    /// Third-party labels merged into views in breadth Full.
+    pub labels: Option<Arc<crate::indexing::labels::ExternalLabels>>,
 }
 
 /// Whether full indexing stores every account's blocks and list blocks:
@@ -412,6 +414,11 @@ impl ScopeState {
     /// Any database error.
     /// The crawl's inputs on the read path: the on-demand queue (none when
     /// `[full] on_demand = "off"`) and whether a history cutoff is set.
+    /// Third-party labels for views in breadth Full.
+    pub async fn set_external_labels(&self, labels: Arc<crate::indexing::labels::ExternalLabels>) {
+        self.write_guard().await.full.labels = Some(labels);
+    }
+
     pub async fn set_crawl_reads(&self, on_demand: Option<Arc<crate::indexing::crawl::OnDemand>>, history_cutoff: bool) {
         let mut sets = self.write_guard().await;
         sets.full.on_demand = on_demand;
