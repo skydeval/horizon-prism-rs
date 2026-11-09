@@ -106,10 +106,29 @@ pub struct FullSets {
     /// Accounts members read whose history the crawl has not marked: moved
     /// up the crawl queue (`[full] on_demand = "members"`).
     pub on_demand: Option<Arc<crate::indexing::crawl::OnDemand>>,
-    /// A history cutoff is set (`[full_crawl] skip_older_than_days`):
-    /// crawled accounts outside S and the members keep reading today's
-    /// sources, so an aged-out record never reads as missing.
+    /// A history cutoff is set (`[full_crawl] skip_older_than_days` or
+    /// `[retention] max_age_days`): crawled accounts outside S and the
+    /// members, and interaction data, keep reading today's sources, so an
+    /// aged-out record never reads as missing.
     pub history_cutoff: bool,
+    /// Every account's blocks and list blocks are stored, lifting Rule M
+    /// (`[full] blocks_source = "local"` with the `blocks` and `lists`
+    /// groups on).
+    pub blocks_local: bool,
+    /// Counts read locally once their group's history is complete
+    /// (`[full] counts = "auto"`).
+    pub counts_auto: bool,
+}
+
+/// Whether full indexing stores every account's blocks and list blocks:
+/// `blocks_source = "local"` with both the `blocks` and `lists` groups on.
+/// Otherwise blocks keep a member side.
+#[must_use]
+pub fn blocks_lifted(full: &crate::config::FullConfig) -> bool {
+    use crate::config::FullGroup;
+    full.blocks_source == crate::config::BlocksSource::Local
+        && full.kinds.contains(&FullGroup::Blocks)
+        && full.kinds.contains(&FullGroup::Lists)
 }
 
 /// A small concurrent set of DIDs (bounded by the Refract communities).
@@ -414,8 +433,17 @@ impl ScopeState {
         if relays.is_empty() {
             tracing::warn!(event = "full_no_takedown_relay", "full.takedown_relays names no configured relay: suspended_accounts has no effect");
         }
+        let blocks_local = blocks_lifted(full);
+        if full.blocks_source == crate::config::BlocksSource::Local && !blocks_local {
+            tracing::warn!(
+                event = "full_blocks_source_set_aside",
+                "full.blocks_source = \"local\" needs the blocks and lists groups in full.kinds; set aside: blocks keep a member side, and inbound list blocks are read from Farsight when it is configured"
+            );
+        }
         let mut sets = self.write_guard().await;
         sets.full.kinds = full.kinds.clone();
+        sets.full.blocks_local = blocks_local;
+        sets.full.counts_auto = full.counts == crate::config::FullCounts::Auto;
         sets.full.excluded.replace(excluded.into_iter().collect());
         sets.full.takedown_relays = if full.suspended_accounts == crate::config::SuspendedAccounts::RefractOnly { relays.clone() } else { Vec::new() };
         sets.full.status_relays = relays;

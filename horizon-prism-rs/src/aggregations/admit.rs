@@ -221,7 +221,7 @@ fn admit_by_rules(input: &AdmissionInput, sets: &ScopeSets, view: View) -> Admis
     // Rule M (member-blocks-only design §2), in every mode and before the
     // off rule: a block kind is stored only with a member side.
     if input.kind.is_block_kind() {
-        return block_rule(input, sets);
+        return block_rule(input, sets, view);
     }
     // The public-root-gate rule (public-root-gates design §3.2), in every
     // mode: the public row as a `threadgates` record decides; when it is not
@@ -320,7 +320,12 @@ fn restored_rule(input: &AdmissionInput, sets: &ScopeSets) -> Option<Admission> 
 /// member not being removed. Being in S, or a private owner, admits no block.
 /// A list block names a list, not an account, so it has no subjects and only
 /// the first arm admits it.
-fn block_rule(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
+///
+/// Full indexing lifts it (`[full] blocks_source = "local"` with the
+/// `blocks` and `lists` groups on, breadth Full): any other account's block
+/// or list block is admitted by the full arm, whose copy tier and account
+/// status the writer checks, as for every other full-arm op.
+fn block_rule(input: &AdmissionInput, sets: &ScopeSets, view: View) -> Admission {
     if sets.is_member(&input.author) {
         return Admission::Admit(AdmitRule::AuthorInScope);
     }
@@ -333,6 +338,13 @@ fn block_rule(input: &AdmissionInput, sets: &ScopeSets) -> Admission {
     }
     if input.subjects.iter().any(|s| sets.purge_kind(s) == Some(PurgeKind::MemberRemoved)) {
         return Admission::Reject(RejectReason::Purging(PurgeKind::MemberRemoved));
+    }
+    if view.1 == crate::indexing::Breadth::Full
+        && sets.full.blocks_local
+        && [crate::config::FullGroup::Blocks, crate::config::FullGroup::Lists].iter().all(|g| sets.full.kinds.contains(g))
+        && !sets.full.excluded.contains(&input.author)
+    {
+        return Admission::Admit(AdmitRule::Full);
     }
     Admission::Reject(RejectReason::NoMemberSide)
 }
@@ -490,6 +502,47 @@ mod tests {
         assert_eq!(RejectReason::NoMemberSide.as_str(), "no_member_side");
         assert!(LIST_BLOCK.is_block_kind() && RecordKind::Block.is_block_kind());
         assert!(!RecordKind::Table("list_items").is_block_kind() && !RecordKind::Follow.is_block_kind());
+    }
+
+    /// Blocks by option: in breadth Full with every account's blocks stored,
+    /// a block or list block with no member side is admitted by the full
+    /// arm; members' arms keep their own answers; an account excluded after
+    /// its Refract restoration ended, community, and the trial's shadow
+    /// (community) view keep the member side.
+    #[test]
+    fn full_lifts_the_member_side_rule_for_blocks() {
+        use crate::config::FullGroup;
+        use crate::indexing::Breadth;
+        const LIST_BLOCK: RecordKind = RecordKind::Table("list_blocks");
+        let mut s = sets();
+        s.public.breadth = Breadth::Full;
+        s.full.kinds = FullGroup::ALL.to_vec();
+        s.full.blocks_local = true;
+        let full = Admission::Admit(AdmitRule::Full);
+        assert_eq!(admit(&input(STRANGER, RecordKind::Block, &[OTHER]), &s), full);
+        assert_eq!(admit(&input(SCOPED, LIST_BLOCK, &[]), &s), full);
+        assert_eq!(admit(&input(MEMBER, RecordKind::Block, &[OTHER]), &s), Admission::Admit(AdmitRule::AuthorInScope));
+        assert_eq!(admit(&input(STRANGER, RecordKind::Block, &[MEMBER]), &s), Admission::Admit(AdmitRule::InboundToMember));
+        let shadow = admit_as(&input(STRANGER, RecordKind::Block, &[OTHER]), &s, PublicMode::On, Breadth::Community);
+        assert_eq!(shadow, Admission::Reject(RejectReason::NoMemberSide), "the trial's start mode would not store it");
+        let mut excluded = s.clone();
+        excluded.full.excluded = std::sync::Arc::default();
+        excluded.full.excluded.replace([STRANGER.to_string()].into_iter().collect());
+        assert_eq!(admit(&input(STRANGER, RecordKind::Block, &[OTHER]), &excluded), Admission::Reject(RejectReason::NoMemberSide));
+        let mut farsight = s.clone();
+        farsight.full.blocks_local = false;
+        assert_eq!(admit(&input(STRANGER, RecordKind::Block, &[OTHER]), &farsight), Admission::Reject(RejectReason::NoMemberSide));
+        let mut no_lists = s.clone();
+        no_lists.full.kinds.retain(|g| *g != FullGroup::Lists);
+        assert_eq!(admit(&input(STRANGER, LIST_BLOCK, &[]), &no_lists), Admission::Reject(RejectReason::NoMemberSide));
+        let mut community = s.clone();
+        community.public.breadth = Breadth::Community;
+        assert_eq!(admit(&input(STRANGER, RecordKind::Block, &[OTHER]), &community), Admission::Reject(RejectReason::NoMemberSide));
+        // The lifted config, as read at startup.
+        let cfg = crate::config::FullConfig::default();
+        assert!(crate::aggregations::scope_state::blocks_lifted(&cfg));
+        assert!(!crate::aggregations::scope_state::blocks_lifted(&crate::config::FullConfig { blocks_source: crate::config::BlocksSource::Farsight, ..cfg.clone() }));
+        assert!(!crate::aggregations::scope_state::blocks_lifted(&crate::config::FullConfig { kinds: vec![FullGroup::Blocks], ..cfg }));
     }
 
     /// Private posting §4.4 (review 11, finding 6): an owner's gate on its

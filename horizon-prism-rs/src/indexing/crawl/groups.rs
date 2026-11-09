@@ -2,8 +2,9 @@
 //! generation (bumped when the group is added or removed), its state
 //! (`crawling`, `paused`, `complete`, or `removed` for a group taken out of
 //! `[full] kinds`, which keeps its generation), whether it was marked
-//! complete by hand with accounts left over, and whether a group add's
-//! owed-set update has finished.
+//! complete by hand with accounts left over, whether a group add's
+//! owed-set update has finished, and whether the counts repair has run
+//! since the group turned complete.
 
 use std::collections::BTreeMap;
 
@@ -19,6 +20,9 @@ pub struct Group {
     pub state: String,
     pub incomplete: bool,
     pub union_done: bool,
+    /// The counts repair ran after the group turned complete, so its counts
+    /// may be read locally.
+    pub counts_ready: bool,
 }
 
 impl Group {
@@ -62,6 +66,7 @@ impl Groups {
                                 state: g.get("state").and_then(Value::as_str).unwrap_or(CRAWLING).to_string(),
                                 incomplete: g.get("incomplete").and_then(Value::as_bool).unwrap_or(false),
                                 union_done: g.get("union_done").and_then(Value::as_bool).unwrap_or(true),
+                                counts_ready: g.get("counts_ready").and_then(Value::as_bool).unwrap_or(false),
                             },
                         )
                     })
@@ -76,7 +81,7 @@ impl Groups {
         let groups: serde_json::Map<String, Value> = self
             .groups
             .iter()
-            .map(|(k, g)| (k.clone(), json!({ "generation": g.generation, "state": g.state, "incomplete": g.incomplete, "union_done": g.union_done })))
+            .map(|(k, g)| (k.clone(), json!({ "generation": g.generation, "state": g.state, "incomplete": g.incomplete, "union_done": g.union_done, "counts_ready": g.counts_ready })))
             .collect();
         json!({ "crawl_generation": self.crawl_generation, "groups": groups })
     }

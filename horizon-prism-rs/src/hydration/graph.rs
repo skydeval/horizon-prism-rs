@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use super::actor::ProfileKind;
 use super::feed::{local_cursor, parse_local_cursor};
 use super::{Hydrator, SYNC_BUDGET, ViewError, ViewResult, Viewer};
+use crate::config::FullGroup;
 use crate::moderation::Gate;
 use crate::hydration::HydrationError;
 use crate::xrpc::pools::Requester;
@@ -139,7 +140,8 @@ impl Hydrator {
     }
 
     /// `app.bsky.graph.getFollowers`: Constellation first for every subject,
-    /// local `follows` only when Constellation is unavailable (§7.1).
+    /// local `follows` only when Constellation is unavailable (§7.1), or
+    /// when full indexing holds every follow (the interaction rule).
     ///
     /// # Errors
     ///
@@ -150,6 +152,7 @@ impl Hydrator {
             Err(e) => return Ok(Err(e)),
         };
         if !cursor.is_some_and(|c| c.starts_with("L:"))
+            && !self.interactions().await.local(FullGroup::Follows)
             && let Some(client) = self.backlinks()
         {
             let remote = cursor.and_then(|c| c.strip_prefix("C:"));
@@ -347,6 +350,7 @@ impl Hydrator {
         for (subject, author) in stored {
             by_subject.entry(subject).or_default().push(author);
         }
+        let follows_local = self.interactions().await.local(FullGroup::Follows);
         let mut out: HashMap<String, Vec<String>> = HashMap::new();
         for subject in subjects {
             if deadline.is_some_and(|d| Instant::now() >= d) {
@@ -354,9 +358,10 @@ impl Hydrator {
             }
             let mut known = by_subject.remove(subject).unwrap_or_default();
             // Followers this AppView does not store, from Constellation: a
-            // bounded scan, each page charged to the caller's share.
+            // bounded scan, each page charged to the caller's share. None
+            // when full indexing holds every follow.
             let mut remote: Vec<String> = Vec::new();
-            if let Some(client) = self.backlinks() {
+            if let Some(client) = self.backlinks().filter(|_| !follows_local) {
                 let mut cursor: Option<String> = None;
                 let mut truncated = false;
                 for page in 0..pages {

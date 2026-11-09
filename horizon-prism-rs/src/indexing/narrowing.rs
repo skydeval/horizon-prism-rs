@@ -73,9 +73,9 @@ fn and_also(mut step: Step, extra: &str) -> Step {
 /// Community retention's step for `table`, limited to the rows full could
 /// have written. Rows community already held when full was entered are
 /// community's own: its retention decides them, as if full had not run.
-/// Admission keeps only blocks with a member side in every breadth, so the
-/// block steps find only older rows; identity rows are dated by their
-/// creation.
+/// Blocks and list blocks with no member side are full's (stored only when
+/// full lifts the member-side rule) when written since full was entered;
+/// identity rows are dated by their creation.
 fn bounded(step: Step) -> Step {
     match step.table {
         "blocks" => and_also(step, &rev_since_entry("b.rev")),

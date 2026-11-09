@@ -539,6 +539,58 @@ pub async fn complete_groups(pool: &PgPool, crawl_generation: i64) -> Result<Vec
     Ok(turned)
 }
 
+/// The complete groups whose counts no repair has covered since they turned
+/// complete.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn counts_pending(pool: &PgPool, crawl_generation: i64) -> Result<Vec<String>, sqlx::Error> {
+    Ok(read_groups(pool)
+        .await?
+        .filter(|g| g.crawl_generation == crawl_generation)
+        .map(|g| g.groups.iter().filter(|(_, x)| x.enabled() && x.complete() && !x.counts_ready).map(|(k, _)| k.clone()).collect())
+        .unwrap_or_default())
+}
+
+/// One counts repair for the groups that turned complete: the keyset repair
+/// (no table lock), then those of them still complete at `crawl_generation`
+/// are marked ready, so their counts read locally. Returns the groups
+/// marked.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn repair_counts_for_complete(pool: &PgPool, crawl_generation: i64) -> Result<Vec<String>, sqlx::Error> {
+    let pending = counts_pending(pool, crawl_generation).await?;
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::aggregations::rebuild::repair_counts_keyset(pool).await?;
+    let mut tx = pool.begin().await?;
+    let Some(mut g) = groups::read_for_update(&mut tx).await? else {
+        return Ok(Vec::new());
+    };
+    if g.crawl_generation != crawl_generation {
+        return Ok(Vec::new());
+    }
+    let mut marked = Vec::new();
+    for name in pending {
+        if let Some(x) = g.groups.get_mut(&name)
+            && x.enabled()
+            && x.complete()
+        {
+            x.counts_ready = true;
+            marked.push(name);
+        }
+    }
+    if !marked.is_empty() {
+        groups::write(&mut tx, &g).await?;
+    }
+    tx.commit().await?;
+    Ok(marked)
+}
+
 /// Set every Crawling group Paused, or every Paused one Crawling again.
 ///
 /// # Errors

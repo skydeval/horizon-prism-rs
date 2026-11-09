@@ -100,6 +100,9 @@ impl Table {
 
 /// The most authors a Refract unread count asks Farsight about.
 const FARSIGHT_AUTHORS: usize = 100;
+/// The most unread authors an unread count checks for inbound list blocks
+/// in stored rows.
+const LOCAL_LIST_BLOCK_AUTHORS: usize = 10_000;
 
 /// A like or repost row: URI, subject URI and CID, `created_at`, `via` URI
 /// and CID.
@@ -438,13 +441,18 @@ impl Hydrator {
         // before the viewer's mutes so that what is asked does not depend
         // on them; then the rows of the authors that block the viewer
         // through a list are subtracted, under the count's own exclusions.
+        // Once full indexing holds every block and list (the interaction
+        // rule), the inbound list blocks come from stored rows instead.
         let mut count = count;
-        if count > 0
-            && let Some(lookup) = crate::xrpc::backstop::farsight()
-        {
+        let local_lists = count > 0 && self.interactions().await.list_blocks();
+        let lookup = if local_lists { None } else { crate::xrpc::backstop::farsight() };
+        if count > 0 && (local_lists || lookup.is_some()) {
             // A count is not a render: it never starts a fallback call
             // (design-v3 §5.14.17.2 "Which lookups may ask").
-            lookup.set_no_fallback();
+            if let Some(lookup) = &lookup {
+                lookup.set_no_fallback();
+            }
+            let cap = lookup.as_ref().map_or(LOCAL_LIST_BLOCK_AUTHORS, |l| l.capacity());
             let authors: Vec<String> = sqlx::query_scalar(
                 "SELECT n.author_did FROM notifications n WHERE n.recipient_did = $1 \
                    AND n.indexed_at > COALESCE($2::timestamptz, \
@@ -457,14 +465,13 @@ impl Hydrator {
             )
             .bind(me)
             .bind(seen_at)
-            .bind(i64::try_from(lookup.capacity()).unwrap_or(i64::MAX))
+            .bind(i64::try_from(cap).unwrap_or(i64::MAX))
             .fetch_all(self.pool())
             .await?;
-            let blockers: Vec<String> = lookup
-                .inbound_list_blocks(me, &authors, &std::collections::HashSet::new())
-                .await
-                .into_keys()
-                .collect();
+            let blockers: Vec<String> = match &lookup {
+                Some(lookup) => lookup.inbound_list_blocks(me, &authors, &std::collections::HashSet::new()).await.into_keys().collect(),
+                None => self.local_inbound_list_blocks(me, &authors).await?.into_keys().collect(),
+            };
             if !blockers.is_empty() {
                 let hidden: i64 = sqlx::query_scalar(&format!(
                     "SELECT count(*) FROM notifications n WHERE n.recipient_did = $1 AND {EXCLUSIONS} AND {} \

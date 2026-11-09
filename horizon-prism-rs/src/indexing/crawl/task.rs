@@ -1,12 +1,13 @@
 //! The crawl task: while breadth is Full it follows the crawl generation,
 //! seeds the members and S, pages the relays' listings into the queue,
 //! runs `concurrency` claimers at `repos_per_sec`, reads the takedown
-//! relays' statuses, turns groups Complete, pauses at the free-space floor,
-//! and runs the sweeper and the re-list. Live ingest is never stopped.
+//! relays' statuses, turns groups Complete (then repairs the counts once,
+//! before they read locally), pauses at the free-space floor, and runs the
+//! sweeper and the re-list. Live ingest is never stopped.
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use redis::aio::ConnectionManager;
@@ -73,6 +74,8 @@ pub struct Crawler {
     /// read it from.
     pub(super) fixed_tail: Option<i64>,
     progress: Arc<std::sync::Mutex<Progress>>,
+    /// A counts repair after a group turned complete is running.
+    repairing: Arc<AtomicBool>,
 }
 
 impl Crawler {
@@ -114,6 +117,7 @@ impl Crawler {
             claimers: true,
             fixed_tail: None,
             progress: Arc::default(),
+            repairing: Arc::default(),
         }
     }
 
@@ -304,7 +308,35 @@ impl Crawler {
                     tracing::info!(event = "full_group_complete", group = %g, crawl_generation = generation, "a group's history is complete");
                 }
             }
+            self.repair_counts_after_complete(generation).await?;
         }
+        Ok(())
+    }
+
+    /// With `[full] counts = "auto"`, one keyset counts repair for the groups
+    /// that turned complete, in the background; their counts read locally
+    /// once it has finished.
+    async fn repair_counts_after_complete(&self, generation: i64) -> Result<(), sqlx::Error> {
+        if self.full.counts != crate::config::FullCounts::Auto || self.repairing.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if state::counts_pending(&self.pool, generation).await?.is_empty() {
+            return Ok(());
+        }
+        self.repairing.store(true, Ordering::SeqCst);
+        let pool = self.pool.clone();
+        let repairing = Arc::clone(&self.repairing);
+        tokio::spawn(async move {
+            match state::repair_counts_for_complete(&pool, generation).await {
+                Ok(marked) => {
+                    for g in &marked {
+                        tracing::info!(event = "full_group_counts_ready", group = %g, crawl_generation = generation, "the counts repair ran: the group's counts read locally");
+                    }
+                }
+                Err(error) => tracing::warn!(event = "full_counts_repair_failed", %error, "the counts repair after a group turned complete failed; it runs again"),
+            }
+            repairing.store(false, Ordering::SeqCst);
+        });
         Ok(())
     }
 

@@ -240,7 +240,8 @@ impl super::Hydrator {
     /// stays (never a local zero) and the target is queued on `cc:refresh`.
     /// A count Constellation does not carry is never touched. A
     /// viewer-private request reads the rows and queues nothing (design-v4
-    /// §8.1).
+    /// §8.1). A count full indexing holds whole (the interaction rule) is
+    /// the local one, zero included.
     ///
     /// # Errors
     ///
@@ -250,6 +251,11 @@ impl super::Hydrator {
         count_targets(view, &mut targets);
         targets.sort();
         targets.dedup();
+        // The interaction rule: counts full indexing holds whole replace the
+        // upstream ones; only the others are read from Constellation's rows.
+        let ix = self.interactions().await;
+        let local = self.local_counts(&ix, &targets).await?;
+        targets.retain(|t| !ix.counts_all_local(t));
         // One read for every target and one enqueue for those to refresh
         // (threadlens-hydration design §2.3, F4).
         let mut rows = counts::cached_many(self.pool(), &targets, &self.inner.cfg.counts).await?;
@@ -274,6 +280,18 @@ impl super::Hydrator {
             metrics::counter!(METRIC_UPSTREAM_COUNTS, "source" => source).increment(1);
         }
         self.enqueue_refresh_many(req, &refresh).await;
+        for c in found.values_mut() {
+            ix.mask(c);
+        }
+        for (t, l) in local {
+            let c = found.entry(t).or_default();
+            c.likes = l.likes.or(c.likes);
+            c.reposts = l.reposts.or(c.reposts);
+            c.replies = l.replies.or(c.replies);
+            c.quotes = l.quotes.or(c.quotes);
+            c.followers = l.followers.or(c.followers);
+            metrics::counter!(METRIC_UPSTREAM_COUNTS, "source" => "local").increment(1);
+        }
         apply_counts(view, &found);
         Ok(())
     }

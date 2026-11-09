@@ -21,6 +21,7 @@ pub mod feed;
 pub mod graph;
 pub mod hint;
 pub mod identity;
+pub mod interactions;
 pub mod labelers;
 pub mod labels;
 pub mod lens;
@@ -44,6 +45,8 @@ pub mod trends;
 pub mod upstream;
 #[cfg(test)]
 mod compact_notify_tests;
+#[cfg(test)]
+mod interactions_tests;
 #[cfg(test)]
 mod compact_ref_tests;
 #[cfg(test)]
@@ -1115,8 +1118,14 @@ impl Hydrator {
         // Inbound list blocks, from Farsight (design-v3 §5.14.5): asked only
         // when this request carries a handle, about the accounts with no
         // direct block. An account that blocks the viewer through a list is
-        // treated as one that blocks it directly.
-        if let Some(lookup) = crate::xrpc::backstop::farsight() {
+        // treated as one that blocks it directly. Once full indexing holds
+        // every block and list (the interaction rule), from stored rows.
+        if self.interactions().await.list_blocks() {
+            let direct: HashSet<String> = out.blocking.keys().chain(&out.blocked_by).cloned().collect();
+            let rest: Vec<String> = dids.iter().filter(|d| !direct.contains(*d)).cloned().collect();
+            let by_list = self.local_inbound_list_blocks(me, &rest).await?;
+            out.blocked_by.extend(by_list.into_keys());
+        } else if let Some(lookup) = crate::xrpc::backstop::farsight() {
             let direct: HashSet<String> = out.blocking.keys().chain(&out.blocked_by).cloned().collect();
             let by_list = lookup.inbound_list_blocks(me, dids, &direct).await;
             out.blocked_by.extend(by_list.into_keys());
@@ -1380,6 +1389,11 @@ impl Hydrator {
         let Some(client) = self.constellation() else {
             return out;
         };
+        // The interaction rule: a count full indexing holds whole is read
+        // locally, so Constellation is asked only for the others.
+        let ix = self.interactions().await;
+        let asked: Vec<String> = targets.iter().filter(|t| !ix.counts_all_local(t)).cloned().collect();
+        let targets = asked.as_slice();
         let cfg = &self.inner.cfg.counts;
         let mut misses: Vec<String> = Vec::new();
         // One read for every target (threadlens-hydration design §2.3, F4).
@@ -1438,6 +1452,9 @@ impl Hydrator {
                     }
                 }
             }
+        }
+        for c in out.values_mut() {
+            ix.mask(c);
         }
         out
     }

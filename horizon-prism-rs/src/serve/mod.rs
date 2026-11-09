@@ -386,7 +386,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
     scope
         .set_crawl_reads(
             (cfg.file.full.on_demand == crate::config::OnDemand::Members).then(|| Arc::clone(&on_demand)),
-            cfg.file.full_crawl.skip_older_than_days > 0,
+            cfg.file.full_crawl.skip_older_than_days > 0 || cfg.file.retention.max_age_days > 0,
         )
         .await;
     let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private)).with_ids(ids).with_first_sight(Arc::clone(&first_sight));

@@ -692,8 +692,11 @@ impl Hydrator {
                      LEFT JOIN constellation_counts cc ON cc.target = c.uri",
                 );
                 // A stored Constellation count is used only while §II-9.6
-                // would still use it.
-                if self.inner.cfg.counts.public_source == CountsSource::Local {
+                // would still use it, and not once full indexing holds every
+                // count of a post (the interaction rule).
+                let ix = self.interactions().await;
+                let post_counts_local = [crate::config::FullGroup::Likes, crate::config::FullGroup::Reposts, crate::config::FullGroup::Posts].iter().all(|g| ix.counts(*g));
+                if self.inner.cfg.counts.public_source == CountsSource::Local || post_counts_local {
                     qb.push(" AND false");
                 } else {
                     let stale = i32::try_from(self.inner.cfg.counts.stale_max_secs).unwrap_or(i32::MAX);

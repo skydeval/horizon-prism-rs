@@ -668,9 +668,11 @@ impl Hydrator {
     /// the replies its listing names from `cursor`, at most `limit`, and
     /// the listing's next cursor. `None` when the listing gave no answer
     /// (no budget, or Constellation did not respond). With no
-    /// Constellation configured there is no such phase: an empty page.
+    /// Constellation configured, or with full indexing holding every post
+    /// (the interaction rule: the local rows are every reply), there is no
+    /// such phase: an empty page.
     pub async fn lens_listed_replies(&self, req: &Requester, uri: &str, limit: u32, cursor: Option<&str>) -> Option<(Vec<String>, Option<String>)> {
-        if self.backlinks().is_none() {
+        if self.backlinks().is_none() || self.interactions().await.local(crate::config::FullGroup::Posts) {
             return Some((Vec::new(), None));
         }
         let page = self.links_page(req, uri, super::feed::NSID_POST, ".reply.parent.uri", limit, cursor).await.ok()??;

@@ -80,13 +80,13 @@ pub async fn reconcile_kinds(pool: &PgPool, crawl_generation: i64, kinds: &[Full
     let mut changes = read_changes(&mut tx).await?;
     for name in &added {
         let generation = g.groups.get(name).map_or(0, |x| x.generation) + 1;
-        g.groups.insert(name.clone(), Group { generation, state: groups::CRAWLING.to_string(), incomplete: false, union_done: false });
+        g.groups.insert(name.clone(), Group { generation, state: groups::CRAWLING.to_string(), incomplete: false, union_done: false, counts_ready: false });
         // A removal sweep still running stops here.
         changes.insert(name.clone(), json!({ "op": "add", "generation": generation, "cursor": 0 }));
     }
     for name in &removed {
         let generation = g.groups.get(name).map_or(0, |x| x.generation) + 1;
-        g.groups.insert(name.clone(), Group { generation, state: groups::REMOVED.to_string(), incomplete: false, union_done: true });
+        g.groups.insert(name.clone(), Group { generation, state: groups::REMOVED.to_string(), incomplete: false, union_done: true, counts_ready: false });
         changes.insert(name.clone(), json!({ "op": "remove", "generation": generation, "cursor": 0, "step": 0 }));
     }
     groups::write(&mut tx, &g).await?;

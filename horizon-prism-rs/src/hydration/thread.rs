@@ -299,7 +299,10 @@ impl Hydrator {
         .bind(post)
         .fetch_all(self.pool())
         .await?;
-        if let Some(client) = self.backlinks() {
+        // Likers this AppView does not store, unless full indexing holds
+        // every like (the interaction rule).
+        let likes_local = self.interactions().await.local(crate::config::FullGroup::Likes);
+        if let Some(client) = self.backlinks().filter(|_| !likes_local) {
             let follows: HashSet<String> = sqlx::query_scalar(
                 "SELECT fs.did FROM follows f JOIN dids fs ON fs.id = f.subject WHERE f.author = (SELECT id FROM dids WHERE did = $1)",
             )
@@ -401,9 +404,11 @@ impl Hydrator {
                         .fetch_one(self.pool())
                         .await?;
                     // A follow not stored here may still exist: look for the
-                    // author among the viewer's followers on Constellation.
+                    // author among the viewer's followers on Constellation,
+                    // unless full indexing holds every follow.
                     match follows {
                         true => true,
+                        false if self.interactions().await.local(crate::config::FullGroup::Follows) => false,
                         false => match self.follower_scan(req, me, author).await {
                             Some(found) => found,
                             None => {
@@ -569,6 +574,9 @@ impl Hydrator {
         // Constellation lists for it (design-v3 §11 G-6).
         let mut children: HashMap<String, Vec<String>> = HashMap::new();
         let mut frontier = vec![uri.to_string()];
+        // Full indexing holding every post (the interaction rule): the local
+        // rows are every reply, and Constellation is not asked.
+        let replies_local = self.interactions().await.local(crate::config::FullGroup::Posts);
         for _ in 0..depth {
             let budget = max_nodes.saturating_sub(uris.len());
             if frontier.is_empty() || budget == 0 {
@@ -595,6 +603,9 @@ impl Hydrator {
                 children.entry(parent).or_default().push(child.clone());
                 uris.push(child.clone());
                 frontier.push(child);
+            }
+            if replies_local {
+                continue;
             }
 
             // Replies Constellation lists and this AppView does not store,

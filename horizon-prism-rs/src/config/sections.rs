@@ -162,6 +162,34 @@ pub struct FullConfig {
     pub relist_pages_per_sec: u32,
     /// Pages a second of a status-only pass of the takedown relays.
     pub status_pass_pages_per_sec: u32,
+    /// Where blocks and list blocks are answered from.
+    pub blocks_source: BlocksSource,
+    /// Where counts come from once a group's history is complete.
+    pub counts: FullCounts,
+}
+
+/// `[full] blocks_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlocksSource {
+    /// From stored rows: every account's blocks and list blocks are stored
+    /// (needs the `blocks` and `lists` groups).
+    #[default]
+    Local,
+    /// Through `[farsight]`; only blocks with a member side are stored.
+    Farsight,
+}
+
+/// `[full] counts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullCounts {
+    /// Local once the counted group's history is complete, else
+    /// Constellation.
+    #[default]
+    Auto,
+    /// Always Constellation.
+    Constellation,
 }
 
 impl Default for FullConfig {
@@ -178,6 +206,8 @@ impl Default for FullConfig {
             relist_every_days: 7,
             relist_pages_per_sec: 5,
             status_pass_pages_per_sec: 5,
+            blocks_source: BlocksSource::Local,
+            counts: FullCounts::Auto,
         }
     }
 }

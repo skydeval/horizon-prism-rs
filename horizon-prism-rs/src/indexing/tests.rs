@@ -1522,6 +1522,62 @@ async fn full_admits_any_author_for_enabled_groups() {
     db.drop_db().await;
 }
 
+/// Blocks by option: in full with `blocks_source = "local"` and the
+/// `blocks` and `lists` groups on, any account's block and list block is
+/// stored; an Aside copy's non-member block is dropped while its block of a
+/// member is stored; with `"farsight"`, without the `lists` group, or in
+/// community, a block keeps a member side.
+#[tokio::test]
+async fn blocks_by_option() {
+    use crate::config::{BlocksSource, FullConfig, FullGroup};
+    use crate::firehose::tier::CopyTier;
+    let Some(db) = fresh_db("full_blocks_by_option").await else {
+        return;
+    };
+    let p = &db.pool;
+    members(p, &[MEMBER]).await;
+    let (writer, scope) = full_writer(p, &FullGroup::ALL).await;
+    let block = |rkey: &str, subject: &str| op("app.bsky.graph.block", rkey, json!({"subject": subject, "createdAt": "2026-11-01T00:00:00Z"}));
+    let list_block = |rkey: &str| {
+        op("app.bsky.graph.listblock", rkey, json!({"subject": format!("at://{B}/app.bsky.graph.list/3kaaaaaaaaal1"), "createdAt": "2026-11-01T00:00:00Z"}))
+    };
+    let r = writer.apply(STRANGER, "3kaaaaaaaac21", &[block("3kaaaaaaaaac1", D), list_block("3kaaaaaaaaac2")], LIVE).await.expect("apply");
+    assert_eq!(r.outcomes, [OpOutcome::Written, OpOutcome::Written], "the member-side rule is lifted");
+    assert_eq!(rows_of(p, "blocks", STRANGER).await, 1);
+    assert_eq!(rows_of(p, "list_blocks", STRANGER).await, 1);
+    // An Aside copy: the block of a non-member is dropped, the block of a
+    // member stored as in community.
+    let r = writer
+        .apply_copy(Some("bsky"), D, "3kaaaaaaaac22", None, &[block("3kaaaaaaaaac3", STRANGER), block("3kaaaaaaaaac4", MEMBER)], LIVE, CopyTier::Aside)
+        .await
+        .expect("aside");
+    assert_eq!(r.outcomes, [OpOutcome::Rejected("aside"), OpOutcome::Written]);
+    // `blocks_source = "farsight"`, or the lists group off: a member side.
+    for (n, full) in [
+        FullConfig { blocks_source: BlocksSource::Farsight, ..FullConfig::default() },
+        FullConfig { kinds: FullGroup::ALL.iter().copied().filter(|g| *g != FullGroup::Lists).collect(), ..FullConfig::default() },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        scope.load_full(p, &full, &["bsky".to_string()]).await.expect("full sets");
+        let n = ["b", "c"][n];
+        let ops = [block(&format!("3kaaaaaaaaad{n}"), D), block(&format!("3kaaaaaaaaae{n}"), MEMBER)];
+        let r = writer.apply(B, &format!("3kaaaaaaaaf2{n}"), &ops, LIVE).await.expect("apply");
+        assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side"), OpOutcome::Written], "{:?}", full.blocks_source);
+    }
+    // Community keeps the member side whatever the option says.
+    scope.load_full(p, &FullConfig::default(), &["bsky".to_string()]).await.expect("full sets");
+    {
+        let mut sets = scope.write_guard().await;
+        let community = PublicState { breadth: Breadth::Community, ..sets.public };
+        scope.set_public(&mut sets, community);
+    }
+    let r = writer.apply(B, "3kaaaaaaaac24", &[block("3kaaaaaaaaac7", D), list_block("3kaaaaaaaaac8")], LIVE).await.expect("community");
+    assert_eq!(r.outcomes, [OpOutcome::Rejected("no_member_side"), OpOutcome::Rejected("no_member_side")]);
+    db.drop_db().await;
+}
+
 /// The post-lock status check: in full, a deleted account's and a
 /// relay-suspended account's records are not admitted by the full arm, and
 /// one Refract lists or `suspended_accounts = "all"` lets through; an

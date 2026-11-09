@@ -137,7 +137,11 @@ impl Hydrator {
         // Inbound list blocks, for a ready member, from Farsight on the
         // caller's share: the list's URI, as the reference returns. With no
         // answer the field is left out and the response still goes out.
+        // Once full indexing holds every block and list (the interaction
+        // rule), from stored rows.
+        let local_lists = member && self.interactions().await.list_blocks();
         let blocked_by_list: Pairs = match self.farsight().filter(|_| member) {
+            _ if local_lists => self.local_inbound_list_blocks(&actor, &dids).await?,
             Some(farsight) => {
                 let (lists, complete) = farsight.request(req).relationship_lists(&actor, &dids, self.cache()).await;
                 if !complete {

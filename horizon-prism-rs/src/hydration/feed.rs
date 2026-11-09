@@ -11,7 +11,7 @@ use super::actor::{ProfileContext, ProfileKind};
 use super::normalize::is_private_uri;
 use super::{CountMode, Hydrator, PostRow, PublicEmit, ViewError, ViewResult, Viewer, ts};
 use crate::aggregations::counts::Counts;
-use crate::config::BookmarkCount;
+use crate::config::{BookmarkCount, FullGroup};
 use crate::db::ids::{COLL_LIKE, COLL_REPOST, UriParts, uri_parts};
 use crate::db::locks::uri_author;
 use crate::moderation::Gate;
@@ -980,7 +980,8 @@ impl Hydrator {
     }
 
     /// Actors who liked or reposted `uri`: Constellation first, local rows
-    /// only when Constellation is unavailable (§7.1). Entries are
+    /// only when Constellation is unavailable (§7.1), or when full indexing
+    /// holds every like or repost (the interaction rule). Entries are
     /// `(did, record uri, createdAt)`.
     async fn interaction_actors(
         &self,
@@ -991,7 +992,8 @@ impl Hydrator {
         cursor: Option<&str>,
     ) -> Result<(Vec<(String, DateTime<Utc>)>, Option<String>), HydrationError> {
         let remote_cursor = cursor.and_then(|c| c.strip_prefix("C:"));
-        let remote = if cursor.is_some_and(|c| c.starts_with("L:")) {
+        let group = if collection == NSID_LIKE { FullGroup::Likes } else { FullGroup::Reposts };
+        let remote = if cursor.is_some_and(|c| c.starts_with("L:")) || self.interactions().await.local(group) {
             None
         } else {
             self.links_page(req, uri, collection, ".subject.uri", limit, remote_cursor)
@@ -1133,7 +1135,7 @@ impl Hydrator {
             .map_or((None, None), |(a, b)| ((!a.is_empty()).then_some(a), (!b.is_empty()).then_some(b)));
         let mut uris: Vec<String> = Vec::new();
         let mut next: Option<String> = None;
-        let remote = if cursor.is_some_and(|c| c.starts_with("L:")) {
+        let remote = if cursor.is_some_and(|c| c.starts_with("L:")) || self.interactions().await.local(FullGroup::Posts) {
             None
         } else {
             // No budget for either listing is a 429 for the page: a partial
