@@ -35,6 +35,10 @@ pub struct Copy<'a> {
     /// sends no `since`, so its copies cannot chain: continuity is reduced
     /// to the re-list's comparison of heads.
     pub stamped: bool,
+    /// The commit carries at least one op. A repository's first commit
+    /// carries none; some PDS implementations send no `since` on any
+    /// commit, and theirs carry ops.
+    pub carries_ops: bool,
 }
 
 /// What the copy did to the account's row.
@@ -144,14 +148,15 @@ pub async fn on_copy(conn: &mut PgConnection, c: &Copy<'_>) -> Result<Advanced, 
         return Ok(out);
     }
     match c.since {
-        // An older reader's copy carries no `since`: it is taken as the
-        // next commit.
-        None if !c.stamped => {
+        // An older reader's copy carries no `since`, and some PDS
+        // implementations never send one: such a copy is taken as the next
+        // commit (the re-list's comparison of heads is the backstop).
+        None if !c.stamped || c.carries_ops => {
             sqlx::query("UPDATE full_crawl SET chain_rev = $2 WHERE account = $1").bind(c.account).bind(c.rev).execute(&mut *conn).await?;
             advance(conn, c.account).await?;
         }
-        // A commit with no `since` on an established chain: a re-created
-        // repo.
+        // An op-less commit with no `since` on an established chain: a
+        // re-created repo's first commit.
         None => {
             hole(conn, c.account, c.crawl_generation, c.groups, "no_since").await?;
             out.holed = true;

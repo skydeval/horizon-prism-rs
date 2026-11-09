@@ -509,9 +509,17 @@ async fn links_become_holes_after_the_window_and_a_sync_at_once() {
     s.live_from(STRANGER, "3kaaaaaabab22", None, none, 7_500, CopyTier::Whole, false).await;
     let (_, _, chain, e, ..) = s.row(STRANGER).await;
     assert_eq!((chain.as_deref(), e), (Some("3kaaaaaabab22"), epoch + 2), "an unstamped copy with no since is no hole");
-    // A stamped one with no `since` on an established chain is a
-    // re-created repository: a hole at once.
-    s.live(STRANGER, "3kaaaaaabac22", None, none, 7_600, CopyTier::Whole).await;
+    // Some PDSes send no `since` on any commit: a stamped commit with ops
+    // and no `since` chains as the next commit, again and again.
+    for (rev, ms) in [("3kaaaaaabac22", 7_550), ("3kaaaaaabad22", 7_560)] {
+        s.live(STRANGER, rev, None, &[op("app.bsky.feed.post", &format!("{rev}p"), post("no since"))], ms, CopyTier::Whole).await;
+        let (_, last, chain, e, ..) = s.row(STRANGER).await;
+        assert_eq!((last.as_deref(), chain.as_deref(), e), (Some(rev), Some(rev), epoch + 2), "a commit with ops and no since is no hole");
+    }
+    assert_eq!(count(&s.pool, "SELECT count(*) FROM full_chain_links").await, 0);
+    // A stamped op-less one with no `since` on an established chain is a
+    // re-created repository's first commit: a hole at once.
+    s.live(STRANGER, "3kaaaaaabae22", None, none, 7_600, CopyTier::Whole).await;
     assert_eq!(s.row(STRANGER).await.3, epoch + 3);
     // An Aside relay's `#sync` writes nothing.
     assert!(!s.writer.apply_sync(STRANGER, "3kaaaaaabzz22", CopyTier::Aside, 8_000).await.expect("sync"));

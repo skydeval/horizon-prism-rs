@@ -1452,6 +1452,7 @@ impl Writer {
                     groups: &groups,
                     failed: failed_enabled,
                     stamped: stream.stamped,
+                    carries_ops: !ops.is_empty(),
                 };
                 first_sight = crate::indexing::crawl::continuity::on_copy(&mut tx, &copy).await?.inserted;
             }
@@ -1501,6 +1502,7 @@ impl Writer {
             groups: &groups,
             failed: false,
             stamped: true,
+            carries_ops: false,
         };
         let mut tx = self.pool.begin().await?;
         lock_dids_shared(&mut tx, &[repo.to_string()]).await?;
