@@ -74,12 +74,24 @@ fn and_also(mut step: Step, extra: &str) -> Step {
 /// have written. Rows community already held when full was entered are
 /// community's own: its retention decides them, as if full had not run.
 /// Blocks and list blocks with no member side are full's (stored only when
-/// full lifts the member-side rule) when written since full was entered;
-/// identity rows are dated by their creation.
-fn bounded(step: Step) -> Step {
+/// full lifts the member-side rule) when committed since full was entered,
+/// by the commit's own clock; a trial's exit also takes those its record
+/// names, whose clock was behind. Identity rows are dated by their creation.
+fn bounded(step: Step, trial: bool) -> Step {
+    let since = |alias: &str, tbl: super::trial::TrialTable| {
+        let rev = rev_since_entry(&format!("{alias}.rev"));
+        if trial {
+            format!(
+                "({rev} OR EXISTS (SELECT 1 FROM full_trial_rows tr WHERE tr.tbl = {} AND tr.a = {alias}.author AND tr.b = {alias}.rkey))",
+                tbl.code()
+            )
+        } else {
+            rev
+        }
+    };
     match step.table {
-        "blocks" => and_also(step, &rev_since_entry("b.rev")),
-        "list_blocks" => and_also(step, &rev_since_entry("lb.rev")),
+        "blocks" => and_also(step, &since("b", super::trial::TrialTable::Blocks)),
+        "list_blocks" => and_also(step, &since("lb", super::trial::TrialTable::ListBlocks)),
         "actors" => and_also(step, &since_entry("a.indexed_at")),
         _ => step,
     }
@@ -373,10 +385,11 @@ pub fn step_index(list: SweepList, name: &str) -> Option<usize> {
 pub(super) fn steps(list: SweepList, private_row_authors: Vec<String>) -> Vec<Step> {
     let mut all: Vec<Step> = Vec::new();
     // The trial's steps first, so they stand in for the ordinary ones.
-    if matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull) {
+    let trial = matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull);
+    if trial {
         all.extend(trial_steps());
     }
-    all.extend(scope_steps(private_row_authors).into_iter().map(bounded));
+    all.extend(scope_steps(private_row_authors).into_iter().map(|s| bounded(s, trial)));
     all.extend(full_only_steps());
     names(list)
         .iter()
@@ -557,6 +570,12 @@ mod tests {
         assert!(tomb.sql.contains("full_trial_rows"), "{}", tomb.sql);
         let ras = built.iter().find(|s| s.table == "relay_account_status").expect("relay statuses");
         assert!(ras.sql.contains("WHERE TRUE"), "{}", ras.sql);
+        // A trial's exit also takes the blocks and list blocks its record
+        // names; the ordinary narrowing goes by the commit's clock alone.
+        for table in ["blocks", "list_blocks"] {
+            let step = built.iter().find(|s| s.table == table).expect("block step");
+            assert!(step.sql.contains("full_trial_rows") && step.sql.contains("rev >="), "{}", step.sql);
+        }
         let ordinary = steps(SweepList::Narrowing, Vec::new());
         assert!(!ordinary.iter().any(|s| s.sql.contains("full_trial_rows")));
         // A drain's own tables are not run again as steps, except the

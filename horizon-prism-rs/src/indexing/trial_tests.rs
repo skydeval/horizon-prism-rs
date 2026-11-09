@@ -763,8 +763,26 @@ async fn the_check_removes_what_the_exit_left() {
         ),
     )
     .await;
-    // A list block the exit leaves (its rev is older than the trial), put
-    // in the record by hand.
+    // A block the trial recorded whose commit clock was behind the trial's
+    // start: the exit takes it by the record.
+    exec(
+        p,
+        &format!(
+            "INSERT INTO dids (did) VALUES ('{STRANGER}'), ('{OTHER}') ON CONFLICT DO NOTHING; \
+             INSERT INTO blocks (author, rkey, subject, rev, created_at) \
+               SELECT a.id, 78, o.id, rev_to_bigint('2kaaaaaaaaaa2'), now() FROM dids a, dids o WHERE a.did = '{STRANGER}' AND o.did = '{OTHER}'; \
+             INSERT INTO full_trial_rows (tbl, a, b, c) SELECT 5, id, 78, 0 FROM dids WHERE did = '{STRANGER}';"
+        ),
+    )
+    .await;
+    // A list block the exit never saw (written after it, before the
+    // check), put in the record by hand.
+    let (reached, resume) = pi.hooks.arm("trial_check");
+    let ending = {
+        let pi = pi.clone();
+        tokio::spawn(async move { pi.end_trial("manual").await })
+    };
+    reached.notified().await;
     exec(
         p,
         &format!(
@@ -776,12 +794,15 @@ async fn the_check_removes_what_the_exit_left() {
         ),
     )
     .await;
-    pi.end_trial("manual").await.expect("end");
+    resume.notify_one();
+    ending.await.expect("join").expect("end");
     settled(&scope).await;
     let (state, result) = last_trial(p).await;
     assert_eq!(state, "passed", "faults are removed, then the check passes: {result}");
     let counts = &result["counts"];
     assert_eq!(counts["missed"]["list_blocks"], 1, "{result}");
+    assert!(counts["missed"].get("blocks").is_none(), "the exit took the recorded block: {result}");
+    assert_eq!(rows_of(p, "blocks", STRANGER).await, 0);
     assert_eq!(counts["unexplained"]["posts"], 1, "the R author pending removal: {result}");
     assert_eq!(counts["kept_author"], 4, "LATE's and OTHER's posts and feed items: {result}");
     assert!(result["words"].as_str().unwrap_or_default().contains("list_blocks 1"), "{result}");
