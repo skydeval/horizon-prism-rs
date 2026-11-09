@@ -1,13 +1,61 @@
 # Changelog
 
-All notable changes to Horizon-Prism-rs (Horizon-Prism for short), grouped by
-development phase, newest first. **Read the upgrade notes of every phase you
-cross before upgrading.** Every schema migration needs one start with
-`APP_ALLOW_STARTUP_MIGRATE=1` (`docker/README.md`, "Schema migrations").
+All notable changes to Horizon-Prism-rs (Horizon-Prism for short), newest
+first: by version from 0.1.0, by development phase before it. **Read the
+upgrade notes of every version and phase you cross before upgrading.** Every
+schema migration needs one start with `APP_ALLOW_STARTUP_MIGRATE=1`
+(`docker/README.md`, "Schema migrations").
 
-New entries go under `## [Unreleased]` and move into a phase when it closes.
+New entries go under `## [Unreleased]` and move into a version when it is
+released.
 
 ## [Unreleased]
+
+## [0.2.0] (2026-11-09)
+
+Full network indexing.
+
+### Added
+
+- **Full network indexing** (`[indexing] public_scope = "full"`): every
+  public account and record the relays carry, with the history crawl
+  (`[full_crawl]`), third-party labels (`[full]`), and blocks, counts and
+  interaction checks read locally once an account group's history is
+  complete. Plan for the space: see "Full network" in `docs/operations.md`.
+- **Full trials** (`admin indexing full-trial start`, or Try full network on
+  the admin Indexing page): a bounded full run that records every row it
+  adds, removes them when it ends and checks the result. Limits in
+  `[full_trial]`.
+- **Writer lanes and relay dedupe** (`[firehose] writer_lanes`, `dedupe`):
+  full needs 4 to 8 lanes.
+- `admin indexing full-check`, and Full network, crawl, labels,
+  suspensions and writer checks on Health; full figures in
+  `admin indexing status` and metrics.
+- The Blocks page shows Farsight's version.
+
+### Changed
+
+- The horizon-firehose sidecar is 0.2.0. Full uses its `sync` and `resume`
+  entries; an older sidecar still works, with a Health warning.
+
+### Known issues
+
+- A full trial started from `kryphocron_only` can, when it ends, remove post
+  counts and tag activity from before the trial and leave its fill's jobs
+  queued. Start trials from `community` until this is fixed.
+- Full ingest needs fast disk writes: one test host applied about a third of
+  what three relays sent. Watch the consumer lag on Health during a trial.
+
+### Upgrade notes
+
+- Migrations 0062 to 0065 (full indexing, trials, history crawl, full
+  labels). Back up first: going back to 0.1.0 needs the database restored
+  from before the upgrade.
+- Update the horizon-firehose image to 0.2.0 (`docker/docker-compose.yml`).
+
+## [0.1.0] (2026-11-02)
+
+Everything before full indexing: the phases below, then this.
 
 ### Added
 

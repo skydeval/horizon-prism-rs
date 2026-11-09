@@ -69,9 +69,48 @@ internal_nameservers = []
 
 [indexing]
 # kryphocron_only | community | full. Default: kryphocron_only.
-# Set this, or run `admin indexing public-scope`, to change it (design §3.3).
+# Set this, or run `admin indexing public-scope`, to change it. Switching to
+# full is confirmed with the word FULL; [full] below says what it stores.
 # public_scope = "kryphocron_only"
 fill_max_wait_hours = 24
+
+[full]
+kinds = ["posts", "likes", "reposts", "follows", "blocks", "lists", "profiles", "starter_packs", "polls"]
+blocks_source = "local"
+counts = "auto"
+labels = "subscribe"
+label_sources = ["did:plc:ar7c4by46qjdydhdevvrndac"]
+label_backfill = false
+label_cache_secs = 60
+takedown_relays = ["bsky"]
+suspended_accounts = "refract_only"
+suspended_purge_days = 30
+at_budget = "pause_crawl"
+pause_free_percent = 5
+on_demand = "members"
+relist_every_days = 7
+relist_pages_per_sec = 5
+status_pass_pages_per_sec = 5
+weekly_count_repair = false
+
+[full_crawl]
+enabled = true
+repos_per_sec = 20
+per_pds_rate_per_sec = 2
+concurrency = 4
+max_car_bytes = 67108864
+skip_older_than_days = 0
+identity_source = "per_did"
+plc_rate_per_sec = 10
+verify_signatures = true
+max_attempts = 10
+claim_lease_secs = 1800
+
+[full_trial]
+hours = 24.0
+max_added_gb = 50.0
+end_below_free_percent = 10
+history = false
 
 [scope]
 policy = "members_and_one_hop"
@@ -103,10 +142,18 @@ private_relays = ["bsky", "microcosm"]
 lag_warn_entries = 100000
 coverage_window_secs = 600
 coverage_capacity = 3000000
+writer_lanes = 1
+lane_queue = 2000
+dedupe = "auto"
+dedupe_window_secs = 600
+dedupe_repos = 2000000
+old_filtered_relays = []
 
 [firehose.relay_labels]
 "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos" = "bsky"
 "wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos" = "microcosm"
+
+[firehose.relay_aliases]
 
 [identity]
 plc_url = "https://plc.directory"
@@ -125,6 +172,8 @@ lodestar_url = ""
 lodestar_request_rate_per_sec = 100.0
 lodestar_request_burst = 200
 lodestar_timeout_ms = 1500
+refresher_concurrency = 4
+refresher_queue_max = 100000
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

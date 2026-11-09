@@ -28,10 +28,80 @@ public_nameservers = []
 internal_nameservers = []
 
 [indexing]
-# kryphocron_only | community | full (full is refused). Default: kryphocron_only.
-# Set this, or run `admin indexing public-scope`, to change it (design §3.3).
+# kryphocron_only | community | full. Default: kryphocron_only.
+# Set this, or run `admin indexing public-scope`, to change it. Switching to
+# full is confirmed with the word FULL; [full] below says what it stores.
 # public_scope = "kryphocron_only"
 fill_max_wait_hours = 24
+
+# Full network indexing (public_scope = "full"). Nothing here applies in
+# kryphocron_only or community.
+[full]
+# The record groups stored for every account: posts, likes, reposts,
+# follows, blocks, lists, profiles, starter_packs, polls. A group left out
+# follows community's rules. Read at startup.
+kinds = ["posts", "likes", "reposts", "follows", "blocks", "lists", "profiles", "starter_packs", "polls"]
+# "local": every account's blocks and list blocks are stored (needs blocks
+# and lists in kinds). "farsight": only blocks with a member side; the rest
+# from [farsight].
+blocks_source = "local"
+# "auto": counts from stored rows once a group's history is complete, else
+# Constellation. "constellation": always Constellation.
+counts = "auto"
+# "subscribe": subscribe to label_sources and store their labels.
+# "upstream": ask each labeler per request.
+labels = "subscribe"
+label_sources = ["did:plc:ar7c4by46qjdydhdevvrndac"]
+# Replay each labeler's history from its first label (hours and several GB
+# for Bluesky's labeler). Off: from now on, older subjects asked per request.
+label_backfill = false
+label_cache_secs = 60
+# Relays whose account statuses count as a suspension (labels of
+# [firehose.relay_labels]).
+takedown_relays = ["bsky"]
+# "refract_only": an account they report suspended is hidden unless Refract
+# keeps it. "all": served while its own server serves it.
+suspended_accounts = "refract_only"
+# A suspension this long removes the account's own public records (0 never).
+suspended_purge_days = 30
+# When the database volume's free space falls under pause_free_percent:
+# "pause_crawl" or "none". Live ingest never stops.
+at_budget = "pause_crawl"
+pause_free_percent = 5
+# Who moves an account up the crawl queue by reading it: "members" or "off".
+on_demand = "members"
+# A periodic re-list of the relays as a backstop (0 off), and the paging
+# rates of re-lists and status passes.
+relist_every_days = 7
+relist_pages_per_sec = 5
+status_pass_pages_per_sec = 5
+# The weekly counts repair while full runs (in a form that locks no table).
+weekly_count_repair = false
+
+[full_crawl]
+# The history crawl. Off: the network is stored live only.
+enabled = true
+repos_per_sec = 20
+per_pds_rate_per_sec = 2
+concurrency = 4
+# A larger repository is read collection by collection instead.
+max_car_bytes = 67108864
+# Records older than this many days are not written (0 writes all).
+skip_older_than_days = 0
+# "per_did": one directory read per account, at plc_rate_per_sec.
+# "plc_export": the directory's export of identity.plc_url, in bulk.
+identity_source = "per_did"
+plc_rate_per_sec = 10
+verify_signatures = true
+max_attempts = 10
+claim_lease_secs = 1800
+
+[full_trial]
+# A trial's limits; each can be given per trial on the command.
+hours = 24.0
+max_added_gb = 50.0
+end_below_free_percent = 10
+history = false
 
 [scope]
 # members_only | members_and_follows | members_and_interactions | members_and_one_hop
@@ -97,12 +167,29 @@ lag_warn_entries = 100000
 # Relay coverage tracker (design §5.11).
 coverage_window_secs = 600
 coverage_capacity = 3000000
+# Writer lanes apply entries side by side, each account always on the same
+# lane. 1 is enough for community; full needs more (`admin indexing
+# full-check` advises how many).
+writer_lanes = 1
+lane_queue = 2000
+# Copies of the same commit from several relays: "auto" drops repeats while
+# full runs; true or false forces it.
+dedupe = "auto"
+dedupe_window_secs = 600
+dedupe_repos = 2000000
+# Labels of relays whose sidecar is older (no capability stamp) and runs a
+# record filter: full sets their copies aside.
+old_filtered_relays = []
 
 # Short labels for each sidecar's _relay value (the full relay URL); used as the
 # metrics relay label. Unlisted values are labeled "other".
 [firehose.relay_labels]
 "wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos" = "bsky"
 "wss://relay.fire.hose.cam/xrpc/com.atproto.sync.subscribeRepos" = "microcosm"
+
+# A sidecar's fallback relay URL → the label of the relay it stands in for,
+# so a failover keeps that relay's account statuses and watermark.
+[firehose.relay_aliases]
 
 [identity]
 plc_url = "https://plc.directory"
@@ -138,6 +225,12 @@ lodestar_request_rate_per_sec = 100.0
 lodestar_request_burst = 200
 # One call's time limit, in milliseconds (100 to 10000).
 lodestar_timeout_ms = 1500
+# The identity refresher, which re-reads accounts after relay events: how
+# many at once, and the most it holds waiting. Past the bound, waiting
+# handle checks of accounts that are not members are dropped; account and
+# deletion checks never are.
+refresher_concurrency = 4
+refresher_queue_max = 100000
 
 [kryphocron]
 oracle_freshness_bound_secs = 120

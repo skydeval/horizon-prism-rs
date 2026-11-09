@@ -17,10 +17,12 @@ A block counts only when it is a public `app.bsky.graph.block` record, or a memb
 | A member blocks anyone | yes |
 | Anyone blocks a member | yes |
 | A member's own list block | yes |
-| A non-member blocks a non-member | no, in every indexing mode |
-| A non-member's list block | no (see inbound list blocks) |
+| A non-member blocks a non-member | no, except in the full network (below) |
+| A non-member's list block | no (see inbound list blocks), except in the full network |
 
-Being in scope through follows or interactions never brings in an account's other blocks. Nightly retention deletes any stored block that no longer has a member side, and removing a member deletes its blocks of non-members, others' blocks of it, and its list blocks. A block record edited so that it no longer names a member removes the stored row.
+In the [full network](indexing-and-scope.md#full-network) with `[full] blocks_source = "local"` (the default) and the `blocks` and `lists` groups on, every account's blocks and list blocks are stored. Once both groups' histories are complete, inbound list blocks, `blockingByList` on lists any account owns, Thread Lens and Refract's block checks are answered from them instead of Farsight. Only moderation lists apply.
+
+Outside the full network, being in scope through follows or interactions never brings in an account's other blocks. Nightly retention deletes any stored block that no longer has a member side, and removing a member deletes its blocks of non-members, others' blocks of it, and its list blocks. A block record edited so that it no longer names a member removes the stored row.
 
 ### How a block hides content
 

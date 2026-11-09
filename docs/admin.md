@@ -28,7 +28,7 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Moderation | Blocks · Farsight | Farsight's status (when configured); the fallback and the memory of blocks. |
 | Moderation | Communities · Refract | Refract (when used): the communities and visitors' own likes, an Accounts tab with each account, and a Pending ends tab. |
 | Moderation | Thread Lens | Who may use Thread Lens, and its request limit. |
-| Data | Indexing | What Horizon-Prism indexes, the switch between kryphocron only and community, and a refill's progress. |
+| Data | Indexing | What Horizon-Prism indexes, the switch between kryphocron only, community and the full network, a refill's progress, the full network's state and settings, and a full network trial. |
 | Data | Storage | Database size against its budget, Redis, account ids, disks and compression; the budget and how long records are kept. |
 | Data | Jobs | Backfill and sync jobs; retry, scope check. |
 | Data | Problems | Dead letters; replay or drop. |
@@ -40,7 +40,7 @@ The menu groups the pages by task. Appearance sits under your name at the top of
 | Network | Account lookups · lodestar | Lodestar's state and counts; its address, with its rate and longest wait under Advanced. |
 | Network | Profiles and caching | How long other networks' profiles are reused, and each network's background refresh. |
 | Network | Request limits | Every request limit in one table: per second and at once. |
-| System | Health | Database, Redis, relays, disk and background checks, with one line per feature. |
+| System | Health | Database, Redis, relays, disk and background checks, with one line per feature; while the full network is indexed, its crawl, labels, suspensions and writer. |
 | System | Stats | How much is indexed, table sizes, requests per method. |
 | System | About this server | Read-only facts about this server. |
 | System | Audit log | Every change, who made it, how it ended, and sign-ins. |
@@ -68,11 +68,12 @@ Commands that change state are queued and executed by the running `app`. The CLI
 | `settings` | `list`, `get`, `set`, `reset` | Saved settings, as in the UI. |
 | `restart` | | Restart `app` under a supervisor. |
 | `label` | `add`, `remove`, `list` | Operator labels on accounts and records. |
-| `indexing` | `public-scope`, `status` | Turn public indexing on or off; show progress. |
+| `indexing` | `public-scope`, `status`, `full-trial`, `full-check`, `full-complete` | Switch public indexing; show progress; try the full network for a while; check this machine against the relays; mark a full-network history complete by hand. |
 | `scope` | `rebuild` | Run the scope check now. |
 | `backfill`, `resync` | | Re-index accounts. `resync --private-and-members` is the recovery step after a relay gap. |
 | `deadletter` | `list`, `replay`, `drop`, `sweep` | Records that failed to index. |
 | `stream` | `info` | The stream's state, as on Relays. |
+| `firehose` | `forget-cap` | Forget a relay's remembered reader capability, after its filter is gone. |
 | `commands` | `list` | Queued admin commands and their state. |
 | `lists` | `sync`, `purge` | Copies of lists used by members' list mutes and blocks. |
 | `farsight` | `status`, `prime`, `forget` | Farsight (optional). |

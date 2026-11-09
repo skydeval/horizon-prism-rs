@@ -61,7 +61,7 @@ An account a member interacts with again just before removal is kept.
 |---|---|
 | `kryphocron_only` (default for a fresh install) | Only what kryphocron, Thread Lens and Horizon features need. Public `app.bsky.*` reads answer `501 NotImplemented`. |
 | `community` | Everything in scope. Horizon-Prism also serves public reads for its members. |
-| `full` | Not built yet: refused at startup. |
+| `full` | The public network as well, for the record groups `[full] kinds` lists (all by default), with each account's history crawled. See [Full network](#full-network) below. |
 
 In `kryphocron_only`, Horizon-Prism keeps:
 - every stored block, and follows with a member at either end;
@@ -81,8 +81,8 @@ labels, handle resolution, and the `app.nearhorizon.*` methods.
 
 ### Changing it
 
-Run `admin indexing public-scope kryphocron_only|community`, use the switch on the
-admin UI's storage settings page, or set the key in `app.toml` and restart.
+Run `admin indexing public-scope kryphocron_only|community|full`, use the switch
+on the admin UI's Indexing page, or set the key in `app.toml` and restart.
 `admin indexing status` shows the current phase and progress.
 
 - **`community` → `kryphocron_only`** deletes the dropped data in the background, table by table, in
@@ -95,8 +95,109 @@ admin UI's storage settings page, or set the key in `app.toml` and restart.
   `community`; the `app.toml` key applies only when it changed since the
   last start.
 
+- **To `full`** needs the typed word `FULL`. Its confirm page and the CLI show
+  the free disk and how long it lasts at full's growth, the storage budget,
+  the writer lanes against the relays' rate, the last `admin indexing
+  full-check`, and how labels arrive. Nothing refuses it. From
+  `kryphocron_only`, S is refilled first, as for `community`.
+- **`full` → `community`** needs the typed word `COMMUNITY`. Rows full added
+  are deleted in the background, then S is refilled; public requests answer
+  501 during that refill, for up to `indexing.fill_max_wait_hours`.
+- **`full` → `kryphocron_only`** deletes what both added.
+
 Take a `pg_dump` before switching to `kryphocron_only`: deleted data does not come back in
-full.
+full. A trial of `full` that removes what it added is in
+[operations.md](../operations.md#trying-full).
+
+## Full network
+
+With `indexing.public_scope = "full"`, Horizon-Prism stores the public records
+of every account for the record groups in `[full] kinds`, from the relays and
+from a crawl of each account's history. Kryphocron is unchanged: it never
+widens beyond members.
+
+### Record groups
+
+| Group | Records |
+|---|---|
+| `posts` | posts, threadgates, postgates |
+| `likes` | likes |
+| `reposts` | reposts |
+| `follows` | follows |
+| `blocks` | blocks and list blocks |
+| `lists` | lists, list items, list opt-outs |
+| `profiles` | profiles and other per-account records |
+| `starter_packs` | starter packs |
+| `polls` | Horizon polls |
+
+A group left out of `kinds` follows `community`'s rules. Changing `kinds`
+takes effect at the next start: an added group's history is crawled, a removed
+group's rows of accounts outside scope are deleted.
+
+### Where reads come from
+
+- **An account's own records** are read locally once its history for that
+  group is crawled. Until then, and for an account the crawl could not finish,
+  they come from where `community` reads them.
+- **Interaction data** (counts, likers, reposters, quotes, replies, followers,
+  known followers, blocks by list) is read locally once a group's whole
+  history is complete, and its counts once they were checked after that.
+  Until then it comes from Constellation, the AppViews and Farsight, as in
+  `community`. `[full] counts = "constellation"` keeps counts on Constellation.
+- **A gap in the stream** (a trim, a lost relay range) sends both back to
+  those sources until the relays' listings are compared again.
+- With a history cutoff (`[full_crawl] skip_older_than_days` or
+  `retention.max_age_days`), interaction data stays on those sources.
+
+### Relays
+
+Full takes public records only from relays whose filter passes every
+collection it stores. A relay whose filter leaves one out is set aside for
+full, and Health names it. A relay whose reader sends no capability stamp
+still works, with less per-account continuity: the periodic re-list
+(`[full] relist_every_days`) finds what it missed.
+
+### Blocks
+
+`[full] blocks_source = "local"` (default) stores every account's blocks and
+list blocks; it needs the `blocks` and `lists` groups. `"farsight"` keeps
+only blocks with a member side and asks Farsight for the rest.
+
+### Suspended accounts
+
+`[full] takedown_relays` (default `bsky`) are the relays whose account
+statuses count as a suspension.
+
+- `suspended_accounts = "refract_only"` (default): an account such a relay
+  reports suspended or taken down is hidden and not crawled, unless
+  [Refract](refract.md) keeps it. After `suspended_purge_days` (default 30) its
+  own public records are deleted; records involving members stay.
+- `"all"`: such accounts are served while their own server serves them.
+- A relay's `deactivated` or `deleted` hides the account at once; its own
+  server's answer confirms or undoes it.
+- Members are never hidden by a relay's status.
+
+### Labels
+
+`[full] labels = "subscribe"` (default) subscribes to the labelers in
+`label_sources` (default Bluesky's moderation labeler) and stores their
+labels. A request gets the labels of the labelers it accepts.
+`label_backfill` (default off) replays each labeler's history first; for
+Bluesky's labeler that is hours and several GB. Off, labels of older posts
+and of accounts are read from the labeler per request. `"upstream"` reads
+every labeler per request.
+
+### History crawl
+
+`[full_crawl]` lists every account the relays carry and fetches each
+repository, verified against the account's key, at `repos_per_sec`. Members
+come first, then S, then accounts members read, then the rest. The crawl
+pauses when the database volume's free space falls under `[full]
+pause_free_percent`; live ingest goes on. With `enabled = false`, full stores
+the network as it happens and serves like `community` for older records.
+
+`admin indexing full-complete --incomplete [group]` marks a group's history
+complete by hand; the accounts not crawled yet keep reading the other sources.
 
 ## What is stored, and why
 
@@ -120,7 +221,10 @@ batches:
 | Public rows of an account that left scope | The next run after it left, except rows that involve a member (above) |
 | Tombstones | After `retention.tombstone_days` (default 7) |
 | Notifications | After `retention.notification_days` (default 90) |
-| Posts, likes, reposts and feed items older than `retention.max_age_days` | Only when set (default 0, off), and only for accounts that are neither members nor followed by a member. Follows and blocks are never age-capped. |
+| Posts, likes, reposts and feed items older than `retention.max_age_days` | Only when set (default 0, off), and only for accounts that are neither members nor followed by a member. Follows and blocks are never age-capped. It waits for the indexes it reads, which are built in the background after an upgrade. |
+
+In `full`, the groups in `[full] kinds` are not deleted when an account
+leaves scope; the other groups follow the rules above.
 
 When an account leaves scope, its kryphocron posts and audiences are removed
 at once, except its replies in members' threads.
@@ -140,8 +244,8 @@ After that, Horizon-Prism follows the account through the firehose (see
 
 ## Guarantees
 
-- No records of an account outside scope are kept, except records that involve
-  a member and Refract's accounts.
+- Outside `full`, no records of an account outside scope are kept, except
+  records that involve a member and Refract's accounts.
 - An unfollow or an expired interaction removes the account within about a
   day (plus the grace, if set).
 - Members, and records that involve them, are never removed by the scope check

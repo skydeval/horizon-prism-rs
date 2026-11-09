@@ -33,6 +33,83 @@ Key metrics:
 | `public_feed_reader_lag_seconds` | How far the public page's live reader is behind the stream's own tail, or how long since it last finished a loop. Past 30 s it skips to the tail. |
 | `public_feed_late_total` | Live-feed lines released after their half-second slot: Redis or the host is near saturation. Should stay at 0. |
 | `public_feed_undecodable_total` | Stream entries the live reader could not read as an event; they give no line. |
+| `public_indexing_breadth{breadth}` | 1 for the running breadth: `community`, `full`, or `narrowing` while full is being left. |
+| `full_group_history{group,state}` | 1 for each record group's history state: `crawling`, `paused`, `complete`. |
+| `full_crawl_repos_total{state,reason}`, `full_crawl_paused`, `full_crawl_car_bytes` | Crawled repositories by outcome; 1 while the crawl waits at the free-space floor; fetched repository sizes. |
+| `full_crawl_identity_reads_total{source}` | The crawl's account lookups: `plc`, `did_web`, `plc_export`. |
+| `firehose_dedupe_dropped_total{relay}`, `firehose_lane_queue_entries{lane}`, `firehose_lane_retries_total{lane,code}` | Copies of a commit already applied from another relay; each writer lane's queue; conflicts retried in a lane. |
+| `full_labels_lag_seconds{src}` | How far each subscribed labeler's stream is behind. |
+| `account_suspended_total{relay}` | Suspended or taken-down accounts a takedown relay reported. |
+| `identity_refresher_dropped_total` | Waiting handle checks dropped because the identity refresher's queue was over `identity.refresher_queue_max`. Account and deletion checks are never dropped. |
+| `full_options_set_aside` | Full indexing options that could not hold as written and fell back; Health names each. |
+
+## Full network
+
+### Capacity
+
+Full indexing of every record group grows the database by about 12 GB a day
+from live ingest; likes are about half of it, posts a quarter. A crawl of the
+whole network's history is about 10 TB. `[full] kinds` narrows it: posts and
+profiles alone are about a quarter. Labels from Bluesky's moderation labeler
+are about 770 bytes each; replaying its history (`label_backfill`) takes hours
+at about 700 labels a second.
+
+The writer must keep up with the relays: with full on, set
+`firehose.writer_lanes` (4 to 8 on a mid-size machine) and run
+`admin indexing full-check`, which measures this machine against the relays'
+rate on a scratch database and advises a lane count. Health shows the writer
+against the relays and the last check.
+
+Nothing refuses full for lack of disk. The crawl pauses at
+`[full] pause_free_percent` free; live ingest does not stop.
+
+A relay's sidecar filter may leave out only collections full does not store.
+Leaving out one it stores sets the relay aside for full. Members' commits
+should pass every relay's filter too, or their repositories are re-read.
+
+### Reclaiming disk
+
+Deleting rows (leaving full, ending a trial, retention) does not return disk
+to the system; Postgres keeps the space for reuse. To return it, run
+`pg_repack` on the large tables, or `VACUUM FULL` (which locks each table
+while it runs) in a quiet hour. Horizon-Prism never runs either.
+
+### Backups
+
+Back up the configuration, the database's members, private-tier and
+`operator_settings` rows, or the whole database. Public data is rebuilt by
+the crawl, so a full-network database need not be backed up whole.
+
+### Redis's clock
+
+Full indexing times each account's continuity by the stream's own entry ids,
+which come from Redis's clock. A step forward of that clock makes every
+waiting check fire at once: those accounts are re-crawled. Nothing is served
+wrong; it costs crawl time. Keep the Redis host's clock synced.
+
+### Trying full
+
+`admin indexing full-trial start` (or "Try full network" on the Indexing
+page, typed `FULL`) runs full indexing for a bounded time, records every row
+it adds, then goes back to the mode it started from, removes what it added
+and checks that nothing is left.
+
+- It ends at the first of `[full_trial] hours` (default 24),
+  `max_added_gb` of database growth (default 50) and
+  `end_below_free_percent` of free space on the database volume (default
+  10). `full-trial bounds` changes them while it runs; `full-trial end` (typed
+  `END`) ends it now.
+- Live only by default: no history crawl, and labelers from now on.
+  `--history` (or `[full_trial] history`) crawls history too.
+- Notifications and private-tier effects of rows only the trial stores are
+  not sent.
+- Its result, in words, is on `admin indexing status`, the Indexing page and
+  Health. A failed check keeps the record; `full-trial check` runs it again,
+  `full-trial dismiss` (typed `DISMISS`) drops it.
+- `full-trial keep` (typed `FULL`) keeps full on for real.
+- Not restored: accounts first seen during the trial stay as ids; facts about
+  kept accounts stay; caches refill; disk is reclaimed only by the step
+  above.
 
 ## The public page's live feed
 
