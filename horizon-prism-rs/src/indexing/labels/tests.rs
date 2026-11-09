@@ -413,7 +413,8 @@ async fn the_newest_label_per_key_wins() {
     db.drop_db().await;
 }
 
-/// A label naming a record version applies to that version only; leaving
+/// A label naming a record version applies to that version only, and one
+/// naming a blob of the record applies to the record; leaving
 /// full removes the labels of subjects no longer stored (a narrowing) and
 /// every label (a trial's exit).
 #[tokio::test]
@@ -430,10 +431,22 @@ async fn versions_and_the_narrowing() {
     let list = format!("at://{AUTHOR}/app.bsky.graph.list/3klistaaaaaa2");
     let at = Utc::now() - chrono::TimeDelta::minutes(1);
     let row = |uri: &str, cid: &str, val: &str| super::store::Row { src: LABELER.into(), uri: uri.into(), cid: cid.into(), val: val.into(), neg: false, cts: at, exp: None, sig: None, verified: true };
+    // Another version of the record, and a blob of it.
+    let older = proto_blue::lex_data::Cid::for_cbor(b"an older version").to_string_base32();
+    let blob = proto_blue::lex_data::Cid::for_raw(b"a video").to_string_base32();
     let mut conn = p.acquire().await.expect("conn");
     super::store::upsert(
         &mut conn,
-        vec![row(&post, "", "a"), row(&post, "bafy3kpostaaaaaa2", "b"), row(&post, "bafyolder", "c"), row(AUTHOR, "", "d"), row(&gone, "", "e"), row(STRANGER, "", "f"), row(&list, "", "g")],
+        vec![
+            row(&post, "", "a"),
+            row(&post, "bafy3kpostaaaaaa2", "b"),
+            row(&post, &older, "c"),
+            row(AUTHOR, "", "d"),
+            row(&gone, "", "e"),
+            row(STRANGER, "", "f"),
+            row(&list, "", "g"),
+            row(&post, &blob, "h"),
+        ],
     )
     .await
     .expect("upsert");
@@ -442,7 +455,7 @@ async fn versions_and_the_narrowing() {
     let got = f.labels.for_subjects(p, std::slice::from_ref(&post), &[LABELER.to_string()]).await.expect("labels");
     let mut vals: Vec<&str> = got[&post].iter().map(|l| l["val"].as_str().unwrap_or_default()).collect();
     vals.sort_unstable();
-    assert_eq!(vals, ["a", "b"], "a label of another version does not apply");
+    assert_eq!(vals, ["a", "b", "h"], "a label of another version does not apply; one naming a blob of the record does");
     assert!(f.queried().is_empty());
     let run = |list: crate::indexing::public_mode::SweepList| async move {
         let step = crate::indexing::narrowing::steps(list, Vec::new()).into_iter().find(|s| s.table == "external_labels").expect("step");
@@ -454,8 +467,27 @@ async fn versions_and_the_narrowing() {
     };
     run(crate::indexing::public_mode::SweepList::Narrowing).await;
     let left: Vec<String> = sqlx::query_scalar("SELECT val FROM external_labels ORDER BY val").fetch_all(p).await.expect("left");
-    assert_eq!(left, ["a", "b", "c", "d", "g"], "the stored post, the stored account and its other records keep theirs");
+    assert_eq!(left, ["a", "b", "c", "d", "g", "h"], "the stored post, the stored account and its other records keep theirs");
     run(crate::indexing::public_mode::SweepList::TrialNarrowing).await;
     assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM external_labels").fetch_one(p).await.expect("count"), 0);
     db.drop_db().await;
+}
+
+/// An upstream view's labels are kept for the view's own version: a label
+/// naming another record version goes, one naming a blob stays.
+#[test]
+fn a_view_keeps_the_labels_of_its_version() {
+    let this = proto_blue::lex_data::Cid::for_cbor(b"this version").to_string_base32();
+    let other = proto_blue::lex_data::Cid::for_cbor(b"another version").to_string_base32();
+    let blob = proto_blue::lex_data::Cid::for_raw(b"an image").to_string_base32();
+    let l = |val: &str, cid: Option<&str>| {
+        let mut v = json!({"src": LABELER, "uri": "at://x", "val": val});
+        if let Some(c) = cid {
+            v["cid"] = json!(c);
+        }
+        v
+    };
+    let labels = [l("plain", None), l("this", Some(&this)), l("other", Some(&other)), l("blob", Some(&blob))];
+    let kept: Vec<String> = crate::hydration::normalize::for_version(&labels, Some(&this)).iter().map(|v| v["val"].as_str().unwrap_or_default().to_string()).collect();
+    assert_eq!(kept, ["plain", "this", "blob"]);
 }

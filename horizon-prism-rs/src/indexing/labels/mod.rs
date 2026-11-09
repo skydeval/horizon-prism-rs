@@ -186,7 +186,7 @@ impl ExternalLabels {
             let rows = store::applied(pool, &subjects, &stored_srcs).await?;
             let versions = store::stored_post_cids(pool, &rows).await?;
             for row in rows {
-                if !row.cid.is_empty()
+                if crate::hydration::normalize::names_a_version(&row.cid)
                     && let Some(have) = versions.get(&row.uri)
                     && *have != row.cid
                 {

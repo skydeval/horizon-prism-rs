@@ -130,13 +130,20 @@ pub(crate) fn same_label(a: &Value, b: &Value) -> bool {
     ["src", "uri", "val"].iter().all(|k| a.get(*k) == b.get(*k)) && a.get("neg").and_then(Value::as_bool).unwrap_or(false) == b.get("neg").and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// Whether a label's `cid` names a record version (a DAG-CBOR CID). A
+/// labeler may name a blob of the record instead (a raw CID), which says
+/// what in the record the label is about, not which version.
+pub(crate) fn names_a_version(cid: &str) -> bool {
+    proto_blue::lex_data::Cid::from_str_multibase(cid).is_ok_and(|c| c.codec == proto_blue::lex_data::CBOR_CODEC)
+}
+
 /// The labels of `labels` that apply to the record version `cid`: a label
-/// naming a `cid` applies to that version only.
+/// naming a record version applies to that version only.
 pub(crate) fn for_version(labels: &[Value], cid: Option<&str>) -> Vec<Value> {
     labels
         .iter()
         .filter(|l| match (l.get("cid").and_then(Value::as_str), cid) {
-            (Some(want), Some(have)) => want == have,
+            (Some(want), Some(have)) => want == have || !names_a_version(want),
             _ => true,
         })
         .cloned()
