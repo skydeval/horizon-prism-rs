@@ -13,7 +13,7 @@ Deployment runbook for the stack in `docker/`. Run every command from this `dock
 | `horizon-firehose-microcosm` | relay consumer, `relay.fire.hose.cam` | none |
 | `caddy` | TLS and reverse proxy | `80`, `443` |
 
-The horizon-firehose image is built from a pinned commit of `https://github.com/skydeval/horizon-firehose.git`; there is no registry image. The build needs outbound network access.
+`app` runs the published image `ghcr.io/skydeval/horizon-prism-rs`, at the version this checkout ships with (`APP_VERSION` in `.env` picks another). To build it from source instead, add `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env`. The horizon-firehose image is built from a pinned commit of `https://github.com/skydeval/horizon-firehose.git`; there is no registry image. Pulling and building need outbound network access.
 
 ## First-time bring-up
 
@@ -27,9 +27,10 @@ cp .env.example .env
 
 In `.env`, set `APP_PUBLIC_HOSTNAME`, `CADDY_ACME_EMAIL` and `POSTGRES_PASSWORD` (`openssl rand -hex 32`). Leave the key variables as placeholders for now.
 
-**3. Build images.**
+**3. Get images.** Pull `app` and build the relay sidecars:
 
 ```sh
+docker compose pull app
 docker compose build
 ```
 

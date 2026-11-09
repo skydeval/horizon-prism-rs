@@ -18,7 +18,7 @@ It is a stack you run yourself, not a hosted service. This README calls it Horiz
 
 - A Linux host with Docker and Docker Compose.
 - A public DNS name for the AppView, with ports 80 and 443 reachable (Caddy obtains the certificate).
-- Outbound network access. The relay sidecar (horizon-firehose) is built from source at a pinned commit.
+- Outbound network access. Horizon-Prism's image is published at `ghcr.io/skydeval/horizon-prism-rs`; the relay sidecar (horizon-firehose) is built from source at a pinned commit.
 - Disk for Postgres (set its storage budget in `app.toml`; there is none by default) and about 6 GB of memory for Redis.
 - At least one community PDS whose accounts will be members, crawled by the relays.
 
@@ -29,7 +29,8 @@ Building outside Docker needs Rust 1.90 or newer. The crate is in `horizon-prism
 ```sh
 cd docker
 cp .env.example .env              # set hostname, ACME email, Postgres password
-docker compose build
+docker compose pull app           # the published image
+docker compose build              # the relay sidecars
 docker compose run --rm --no-deps app admin keygen   # copy the keys into .env
 openssl rand -hex 32              # APP_PRIVATE_CURSOR_KEY_HEX in .env
 # add your community PDS hosts to config/app.toml, then:

@@ -18,7 +18,7 @@ Request caches live inside `app`, not in Redis. See [firehose and relays](design
 
 1. **DNS.** Point an A/AAAA record for your hostname (for example `prism.example.org`) at the host. Open ports 80 and 443.
 2. **Environment.** `cp .env.example .env`. Set `APP_PUBLIC_HOSTNAME`, `CADDY_ACME_EMAIL` and `POSTGRES_PASSWORD` (`openssl rand -hex 32`).
-3. **Build.** `docker compose build`. This needs outbound network access.
+3. **Images.** `docker compose pull app` fetches the published image; `docker compose build` builds the relay sidecars. Both need outbound network access. To build `app` from source too, add `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env` first.
 4. **Keys.** `docker compose run --rm --no-deps app admin keygen` prints `APP_SERVICE_SIGNING_KEY_HEX` and `APP_CORRELATION_KEY_HEX`. Put both in `.env`. Then set `APP_PRIVATE_CURSOR_KEY_HEX` to the output of `openssl rand -hex 32`. Keep all three secret and stable:
    - the signing key is published in the AppView's DID document; changing it changes that key;
    - the cursor key must be the same on every replica; rotating it makes open kryphocron feed cursors fail once.
@@ -46,7 +46,7 @@ Request caches live inside `app`, not in Redis. See [firehose and relays](design
 
 1. Read the [changelog](../CHANGELOG.md) for the versions you skip. Some upgrades need a step before they run (for example a new required environment variable).
 2. Back up the database (below).
-3. Pull or build the new image.
+3. Update the checkout (or set `APP_VERSION` in `.env`), then `docker compose pull app`; with `compose.source.yml`, `docker compose build app`.
 4. If migrations are pending, open the gate, `docker compose up -d app`, confirm `migrations_applied` in the log, then close the gate and recreate `app` again.
 5. Check that `docker compose ps app` shows `healthy`.
 

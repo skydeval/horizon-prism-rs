@@ -1,0 +1,12 @@
+# Build `app` from this checkout instead of pulling the published image.
+# Turn it on with this line in .env:
+#   COMPOSE_FILE=docker-compose.yml:compose.source.yml
+# then `docker compose build`. The build context is the repo root (..);
+# see ../.dockerignore.
+
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: horizon-prism-rs:local

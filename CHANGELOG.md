@@ -11,6 +11,15 @@ released.
 
 ## [Unreleased]
 
+### Changed
+
+- **Published image.** `app` runs `ghcr.io/skydeval/horizon-prism-rs`, at the
+  version the checkout ships with (`APP_VERSION` in `.env` picks another).
+  Get it with `docker compose pull app`; `docker compose build` now builds
+  only the relay sidecars. To keep building from source, add
+  `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env`. A compose
+  override that sets `app`'s image or build keeps working.
+
 ## [0.2.0] (2026-11-09)
 
 Full network indexing.

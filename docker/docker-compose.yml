@@ -2,7 +2,7 @@
 #
 # Run from this directory:  docker compose up -d
 # Compose reads interpolation values from ./.env (copy .env.example).
-# The build context for `app` is the repo root (..); see ../.dockerignore.
+# `app` runs the published image; compose.source.yml builds it from source.
 
 name: horizon-prism-rs
 
@@ -69,10 +69,8 @@ services:
       - prism
 
   app:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: horizon-prism-rs:local
+    # The published image. To build from source instead, see compose.source.yml.
+    image: ghcr.io/skydeval/horizon-prism-rs:${APP_VERSION:-0.2.0}
     environment:
       APP_PUBLIC_HOSTNAME: ${APP_PUBLIC_HOSTNAME:?set APP_PUBLIC_HOSTNAME in .env}
       APP_DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
