@@ -96,6 +96,21 @@ fn blocks_since_start(t: &Totals) -> (u64, u64) {
     (sum(&[Outcome::Written, Outcome::ReferenceOnly]), sum(&[Outcome::NoMemberSide]))
 }
 
+/// The Blocks group's first label and its note: in full network indexing
+/// with every account's blocks stored, every block is kept; otherwise only
+/// those with a member on one side.
+#[must_use]
+pub fn blocks_words(every_block: bool) -> (&'static str, &'static str) {
+    if every_block {
+        (
+            "Kept since Prism started",
+            "Prism is indexing the full network and keeps every account's blocks and blocks of whole lists. Blocks with no member involved were not kept while it indexed less.",
+        )
+    } else {
+        ("Kept since Prism started (a member is involved)", "Prism keeps only blocks made by or against a member.")
+    }
+}
+
 /// The scope by its first hold, as of the last nightly clean-up.
 fn holds(s: &Snapshot) -> Vec<Figure> {
     const HOLDS: [(&str, &str); 5] = [
@@ -174,14 +189,19 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     });
 
     let (kept, refused) = blocks_since_start(&state.live.tap().totals());
+    let every_block = {
+        let sets = state.scope.read_guard().await;
+        sets.public.breadth == crate::indexing::Breadth::Full && sets.full.blocks_local
+    };
+    let (kept_label, note) = blocks_words(every_block);
     #[allow(clippy::cast_precision_loss)]
     let blocks = vec![
-        fig("Kept since Prism started (a member is involved)", count(kept as f64)),
+        fig(kept_label, count(kept as f64)),
         fig("Not kept since Prism started (no member involved)", count(refused as f64)),
         fig("Blocks stored", about(rows_of(&s, "blocks"))),
         fig("Blocks of whole lists stored", about(rows_of(&s, "list_blocks"))),
     ];
-    groups.push(FigureGroup { title: "Blocks", figures: blocks, note: "Prism keeps only blocks made by or against a member.".to_string() });
+    groups.push(FigureGroup { title: "Blocks", figures: blocks, note: note.to_string() });
 
     #[allow(clippy::cast_precision_loss)]
     let tables = stats::tables(&s)

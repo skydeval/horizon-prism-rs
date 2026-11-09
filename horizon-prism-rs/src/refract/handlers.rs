@@ -208,13 +208,16 @@ pub async fn gate(s: &RefractState, headers: &HeaderMap, peer: SocketAddr, metho
     })
 }
 
-/// A visitor's blocks (§7.1): Farsight's pair answers, round by round.
+/// A visitor's blocks: Farsight's pair answers, round by round, or
+/// stored blocks and lists once full indexing holds every account's,
+/// complete.
 pub struct Blocks {
     caller: String,
     lookup: Option<Lookup>,
     timeout: Duration,
     judged: HashSet<String>,
     known: KnownBlocks,
+    hydrator: crate::hydration::Hydrator,
 }
 
 impl Blocks {
@@ -230,7 +233,7 @@ impl Blocks {
             lookup.set_visitor();
             lookup
         });
-        Some(Self { caller: caller.did.clone(), lookup, timeout: s.round_timeout, judged: HashSet::new(), known: KnownBlocks::default() })
+        Some(Self { caller: caller.did.clone(), lookup, timeout: s.round_timeout, judged: HashSet::new(), known: KnownBlocks::default(), hydrator: s.app.hydrator.clone() })
     }
 
     /// Judge the authors of `dids` not judged yet. Returns whether any new
@@ -241,11 +244,18 @@ impl Blocks {
             return false;
         }
         self.judged.extend(fresh.iter().cloned());
-        // With no Farsight, no block source at all (C-9 (a)).
-        let Some(lookup) = &self.lookup else {
-            return false;
+        // Full indexing holding every account's blocks and lists: stored
+        // rows answer; a failed read leaves everyone unanswered.
+        let got = if self.hydrator.interactions().await.list_blocks() {
+            let answers = crate::hydration::interactions::local_pair_blocks(self.hydrator.pool(), &self.caller, &fresh).await.unwrap_or_default();
+            crate::farsight::lookup::PairAnswers { answers, calls: 1, vouches: true, ..crate::farsight::lookup::PairAnswers::default() }
+        } else {
+            // With no Farsight, no block source at all (C-9 (a)).
+            let Some(lookup) = &self.lookup else {
+                return false;
+            };
+            lookup.pair_answers(&self.caller, &fresh, PairBudget { max_calls: u32::MAX, timeout: self.timeout }, None).await
         };
-        let got = lookup.pair_answers(&self.caller, &fresh, PairBudget { max_calls: u32::MAX, timeout: self.timeout }, None).await;
         let mut changed = false;
         for did in fresh {
             match got.answers.get(&did) {

@@ -86,12 +86,23 @@ pub struct PackCounts {
     pool: PgPool,
     constellation: Option<ConstellationClient>,
     every: Duration,
+    /// The scope, whose interaction rule says when stored profiles hold
+    /// every joiner (full indexing, the profiles group complete).
+    scope: Option<crate::aggregations::ScopeState>,
 }
 
 impl PackCounts {
     #[must_use]
     pub fn new(pool: PgPool, constellation: Option<ConstellationClient>, every: Duration) -> Self {
-        Self { pool, constellation, every }
+        Self { pool, constellation, every, scope: None }
+    }
+
+    /// With the scope: once full indexing holds every profile, the stored
+    /// joiners are counted and Constellation is not asked.
+    #[must_use]
+    pub fn with_scope(mut self, scope: crate::aggregations::ScopeState) -> Self {
+        self.scope = Some(scope);
+        self
     }
 
     /// Refresh one pack's row. Does nothing for a pack that is not stored.
@@ -100,9 +111,13 @@ impl PackCounts {
     ///
     /// Database errors.
     pub async fn refresh(&self, pack: &str) -> Result<(), sqlx::Error> {
+        let local = match &self.scope {
+            Some(scope) => crate::hydration::interactions::current(scope, &self.pool).await.local(crate::config::FullGroup::Profiles),
+            None => false,
+        };
         let remote = match &self.constellation {
-            Some(c) => c.distinct_dids(pack, PROFILE, JOINED_PATH).await.ok(),
-            None => None,
+            Some(c) if !local => c.distinct_dids(pack, PROFILE, JOINED_PATH).await.ok(),
+            _ => None,
         };
         let (all_time, source) = match remote {
             Some(n) => (i64::try_from(n).unwrap_or(i64::MAX), "constellation"),

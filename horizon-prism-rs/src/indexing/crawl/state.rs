@@ -539,6 +539,60 @@ pub async fn complete_groups(pool: &PgPool, crawl_generation: i64) -> Result<Vec
     Ok(turned)
 }
 
+/// `admin indexing full-complete --incomplete [group]`: mark `group` (or
+/// every enabled group not yet complete) Complete by hand. The accounts the
+/// group still waits for are kept on its incomplete list, so their own
+/// records keep reading today's sources. A group whose add is still
+/// unioning into the crawl rows is left as it is. Returns, per group
+/// marked, how many accounts it was marked without.
+///
+/// # Errors
+///
+/// `Err(Ok(words))` when nothing can be marked; `Err(Err(_))` for a
+/// database error.
+pub async fn complete_by_hand(pool: &PgPool, crawl_generation: i64, group: Option<&str>) -> Result<Vec<(String, u64)>, Result<String, sqlx::Error>> {
+    let db = |e: sqlx::Error| Err(e);
+    let mut tx = pool.begin().await.map_err(db)?;
+    let Some(mut g) = groups::read_for_update(&mut tx).await.map_err(db)?.filter(|g| g.crawl_generation == crawl_generation) else {
+        return Err(Ok("Full indexing is not running, or its histories belong to another generation.".into()));
+    };
+    let names: Vec<String> = match group {
+        Some(name) => match g.groups.get(name) {
+            Some(x) if !x.enabled() => return Err(Ok(format!("The {name} group is not in full.kinds."))),
+            Some(x) if x.complete() => return Err(Ok(format!("The {name} group is already complete."))),
+            Some(x) if !x.union_done => return Err(Ok(format!("The {name} group was just added; wait until every account owes it."))),
+            Some(_) => vec![name.to_string()],
+            None => return Err(Ok(format!("{name} is not a record group of full indexing."))),
+        },
+        None => g.groups.iter().filter(|(_, x)| x.enabled() && !x.complete() && x.union_done).map(|(k, _)| k.clone()).collect(),
+    };
+    if names.is_empty() {
+        return Err(Ok("Every enabled group is complete already.".into()));
+    }
+    let mut out = Vec::new();
+    for name in names {
+        let kept = sqlx::query(
+            "INSERT INTO full_incomplete (grp, account) SELECT $2, f.account FROM full_crawl f \
+             WHERE NOT f.uncovered AND f.state NOT IN ('gone', 'skipped') AND (f.generation <> $1 OR $2 = ANY(f.groups)) \
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(crawl_generation)
+        .bind(&name)
+        .execute(&mut *tx)
+        .await
+        .map_err(db)?
+        .rows_affected();
+        if let Some(x) = g.groups.get_mut(&name) {
+            x.state = groups::COMPLETE.to_string();
+            x.incomplete = true;
+        }
+        out.push((name, kept));
+    }
+    groups::write(&mut tx, &g).await.map_err(db)?;
+    tx.commit().await.map_err(db)?;
+    Ok(out)
+}
+
 /// The complete groups whose counts no repair has covered since they turned
 /// complete.
 ///

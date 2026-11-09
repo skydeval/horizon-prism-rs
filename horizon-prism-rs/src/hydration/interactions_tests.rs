@@ -269,3 +269,64 @@ async fn the_counts_repair_marks_complete_groups_ready() {
     assert!(crate::indexing::crawl::state::repair_counts_for_complete(p, generation + 1).await.expect("repair").is_empty());
     db.drop_db().await;
 }
+
+/// Blocks between two accounts neither of which is the viewer's business
+/// alone: once full indexing holds every block and list, stored rows
+/// answer them each way, direct or through a moderation list, for Thread
+/// Lens's verdicts (bridging on with no Farsight), Refract's pair checks
+/// and a member's outbound `blockingByList` on a list a non-member owns.
+#[tokio::test]
+async fn pair_blocks_read_stored_rows_once_blocks_and_lists_are_complete() {
+    let Some(db) = fresh_db("hydration_local_pair_blocks").await else {
+        return;
+    };
+    let p = &db.pool;
+    for (d, name) in [(MEMBER, "member"), (BOB, "bob"), (CAROL, "carol"), (DAVE, "dave")] {
+        actor(p, d, &format!("{name}.example"), name).await;
+    }
+    exec(p, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{MEMBER}', 'admin', now()) ON CONFLICT DO NOTHING")).await;
+    use crate::test_support::records::{list, list_block, list_item};
+    // Carol blocks Bob directly; Bob blocks the member through Dave's
+    // moderation list; the member blocks Bob through the same list.
+    crate::test_support::graph::block(p, CAROL, BOB, "3kaaaaaaaab12").await;
+    let modlist = list(p, DAVE, "3kaaaaaaaab13", "mods", "app.bsky.graph.defs#modlist").await;
+    list_item(p, DAVE, "3kaaaaaaaab14", &modlist, MEMBER).await;
+    list_item(p, DAVE, "3kaaaaaaaab15", &modlist, BOB).await;
+    list_block(p, BOB, "3kaaaaaaaab16", &modlist).await;
+    let member_block = list_block(p, MEMBER, "3kaaaaaaaab17", &modlist).await;
+
+    let others = [CAROL.to_string(), DAVE.to_string(), MEMBER.to_string(), BOB.to_string()];
+    let pairs = super::interactions::local_pair_blocks(p, BOB, &others).await.expect("pairs");
+    assert_eq!(pairs.len(), 3, "everyone but the account itself is answered");
+    assert!(pairs[CAROL].inbound.direct && !pairs[CAROL].outbound.is_block(), "Carol blocks Bob");
+    assert_eq!(pairs[MEMBER].outbound.list.as_deref(), Some(modlist.as_str()), "Bob blocks the member through the list");
+    assert_eq!(pairs[MEMBER].inbound.list.as_deref(), Some(modlist.as_str()), "and the member blocks Bob through it");
+    assert!(!pairs[DAVE].any_block() && pairs[DAVE].vouched);
+
+    // Thread Lens, with no Farsight: bridging is on once stored rows answer.
+    let cfg = crate::config::ThreadLensConfig::default();
+    let mut off = crate::threadlens::verdict::Judge::new(p.clone(), BOB, None, &cfg);
+    off.baseline(&[CAROL.to_string(), DAVE.to_string()]).await.expect("baseline");
+    assert!(!off.bridging(), "no Farsight and no local answer: off");
+    let mut judge = crate::threadlens::verdict::Judge::new(p.clone(), BOB, None, &cfg).with_local_blocks(true);
+    judge.baseline(&[CAROL.to_string(), DAVE.to_string(), MEMBER.to_string()]).await.expect("baseline");
+    assert!(judge.bridging());
+    use crate::threadlens::verdict::Verdict;
+    assert_eq!(judge.verdict(DAVE), Some(Verdict::Clear));
+    assert_eq!(judge.verdict(CAROL), Some(Verdict::BlockingYou));
+    assert_eq!(judge.verdict(MEMBER), Some(Verdict::BlockedByYou));
+    assert_eq!(judge.blocking_list(MEMBER).as_deref(), Some(modlist.as_str()));
+
+    // A member's outbound list block on a non-member's list: only once
+    // blocks and lists are complete.
+    let h = hydrator_full(p, full_sets(), Arc::new(FixedUpstream::default()), None);
+    let by_list = || async {
+        let r = h.get_relationships(&Requester::test(), MEMBER, &[BOB.to_string()]).await.expect("db").expect("view");
+        r.inner()["relationships"][0].get("blockingByList").cloned()
+    };
+    histories(p, &[FullGroup::Blocks], true).await;
+    assert_eq!(by_list().await, None, "a list a non-member owns is not served before lists are complete");
+    histories(p, &[FullGroup::Blocks, FullGroup::Lists], true).await;
+    assert_eq!(by_list().await, Some(json!(member_block)));
+    db.drop_db().await;
+}

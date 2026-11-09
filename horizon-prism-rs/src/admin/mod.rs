@@ -230,6 +230,23 @@ impl AdminState {
         self
     }
 
+    /// The public-indexing switch serve runs, for full indexing's status
+    /// and trial; without one (a test), a view over the same database and
+    /// scope, which knows no relay tiers and no crawl.
+    #[must_use]
+    pub fn public(&self) -> crate::indexing::PublicIndexing {
+        self.health.public.clone().unwrap_or_else(|| {
+            crate::indexing::PublicIndexing::new(
+                self.pool.clone(),
+                self.scope.clone(),
+                crate::indexing::PublicModeSettings::from_config(&self.settings.running.indexing),
+            )
+            .with_full_kinds(&self.settings.running.full.kinds)
+            .with_trial_defaults(&self.settings.running.full_trial)
+            .with_data_dir(&self.disks.data)
+        })
+    }
+
     /// `[community]` as it applies now.
     #[must_use]
     pub fn members(&self) -> MembersInfo {
@@ -372,6 +389,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/stats", route(get(pages::stats::page)))
         .route("/indexing", route(get(pages::indexing::page)))
         .route("/indexing/switch", route(post(pages::indexing::switch)))
+        .route("/indexing/trial", route(post(pages::indexing::trial)))
+        .route("/indexing/trial-end", route(post(pages::indexing::trial_end)))
+        .route("/indexing/trial-dismiss", route(post(pages::indexing::trial_dismiss)))
         .route("/storage", route(get(pages::storage::page)))
         .route("/private", route(get(pages::private::page)))
         .route("/apps", route(get(pages::apps::apps)))

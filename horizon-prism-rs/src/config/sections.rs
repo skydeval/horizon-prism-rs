@@ -170,7 +170,8 @@ pub struct FullConfig {
     pub labels: FullLabels,
     /// The labelers subscribed to under `labels = "subscribe"`.
     pub label_sources: Vec<String>,
-    /// Replay each subscribed labeler from its first label; off, the
+    /// Replay each subscribed labeler from its first label (a large
+    /// labeler's history is hours and several GB); off (the default), the
     /// subscription starts at the tip and older subjects' labels are read
     /// from the labeler.
     pub label_backfill: bool,
@@ -234,7 +235,7 @@ impl Default for FullConfig {
             counts: FullCounts::Auto,
             labels: FullLabels::Subscribe,
             label_sources: vec![BLUESKY_MODERATION_LABELER.to_string()],
-            label_backfill: true,
+            label_backfill: false,
             label_cache_secs: 60,
         }
     }
@@ -635,6 +636,12 @@ pub struct IdentityConfig {
     /// The time limit of one lodestar call, capped by the request's
     /// deadline; 100 to 10 000.
     pub lodestar_timeout_ms: u64,
+    /// Accounts the identity refresher looks at side by side.
+    pub refresher_concurrency: u32,
+    /// The most accounts waiting for the refresher. Past it, waiting
+    /// handle and identity checks of accounts that are not members are
+    /// dropped; account-status and deletion checks never are.
+    pub refresher_queue_max: u64,
 }
 
 impl IdentityConfig {
@@ -666,6 +673,8 @@ impl Default for IdentityConfig {
             resolve_handle_cache_max: 100_000,
             resolve_handle_ttl_secs: 300,
             resolve_handle_negative_ttl_secs: 60,
+            refresher_concurrency: 4,
+            refresher_queue_max: 100_000,
         }
     }
 }

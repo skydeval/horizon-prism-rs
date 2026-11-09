@@ -151,6 +151,12 @@ const U32: i64 = 4_294_967_295;
 const ACCESS: &[(&str, &str)] = &[("members", "Members"), ("signed_in", "Anyone signed in")];
 const BOOKMARK_COUNTS: &[(&str, &str)] = &[("never", "Never"), ("above_floor", "Only from a number up"), ("always", "Always")];
 const PLAYBACK: &[(&str, &str)] = &[("bsky_cdn", "Bluesky's video service"), ("pds_blob", "The author's own server")];
+const BLOCKS_SOURCE: &[(&str, &str)] = &[("local", "Every account's stored blocks"), ("farsight", "Farsight")];
+const FULL_COUNTS: &[(&str, &str)] = &[("auto", "Stored counts once complete"), ("constellation", "Always Constellation")];
+const SUSPENDED: &[(&str, &str)] = &[("refract_only", "Hidden unless Refract keeps them"), ("all", "Served")];
+const FULL_LABELS: &[(&str, &str)] = &[("subscribe", "Subscribe and store them"), ("upstream", "Ask each labeler per request")];
+const AT_BUDGET: &[(&str, &str)] = &[("pause_crawl", "Pause the history crawl"), ("none", "Nothing")];
+const IDENTITY_SOURCE: &[(&str, &str)] = &[("per_did", "The directory, one account at a time"), ("plc_export", "The directory's export, in bulk")];
 
 /// The twelve private reads with a timing floor, and their names on the form.
 const FLOORS: [(&str, &str); 12] = [
@@ -201,6 +207,55 @@ pub fn sections(networks: &[String]) -> Vec<Section> {
         one(PageId::ThreadLens, "threadlens.access", "Who may use Thread Lens", "Who may use Thread Lens. 'Members' is only your members. 'Anyone signed in' also lets any account signed in to a Horizon app use it; their lookups use the part of Farsight's rate set aside for non-members.", Kind::Choice(ACCESS)),
         // Indexing and Storage (`indexing.public_scope` has its own form and command).
         one(PageId::Indexing, "indexing.fill_max_wait_hours", "Longest wait for a refill", "When public data is turned back on, how long Prism waits for the last accounts to refill before answering public requests anyway.", whole(0, 8760, "hours")),
+        // Full network (the record groups it stores stay in the file).
+        many(
+            PageId::Indexing,
+            "Full network: blocks, counts and suspended accounts",
+            "How the full network is served. Blocks: every account's stored blocks, or Farsight's answers with only blocks involving a member stored. Counts: the stored counts once a group's history is complete, or always Constellation's. Accounts a takedown relay reports suspended: hidden unless Refract keeps them, or served.",
+            vec![
+                field("full.blocks_source", "Blocks from", Kind::Choice(BLOCKS_SOURCE)),
+                field("full.counts", "Counts from", Kind::Choice(FULL_COUNTS)),
+                field("full.suspended_accounts", "Suspended accounts", Kind::Choice(SUSPENDED)),
+                field("full.suspended_purge_days", "Remove a suspended account's records after", whole(0, 3650, "days (0 never)")),
+            ],
+        ),
+        many(
+            PageId::Indexing,
+            "Full network: labels from other labelers",
+            "How labels from other labelers reach posts and accounts. Subscribing stores them as they are issued. Replaying a labeler's history first takes hours and several GB for a large labeler; without it, labels of older posts and of accounts are asked of the labeler.",
+            vec![field("full.labels", "Labels", Kind::Choice(FULL_LABELS)), field("full.label_backfill", "Replay each labeler's history", Kind::Switch)],
+        ),
+        many(
+            PageId::Indexing,
+            "Full network: when the disk fills",
+            "What happens when the database volume's free space falls under the floor. Live ingest never stops.",
+            vec![field("full.at_budget", "Then", Kind::Choice(AT_BUDGET)), field("full.pause_free_percent", "Free-space floor", whole(0, 98, "percent"))],
+        ),
+        many(
+            PageId::Indexing,
+            "Full network: history crawl",
+            "Whether the full network's history is crawled, account by account, and how fast. Off, the network is stored as it happens from now on.",
+            vec![
+                field("full_crawl.enabled", "Crawl history", Kind::Switch),
+                field("full_crawl.repos_per_sec", "Accounts a second", whole(1, U32, "accounts")),
+                field("full_crawl.concurrency", "At once", whole(1, 1000, "accounts")),
+                field("full_crawl.per_pds_rate_per_sec", "Requests a second to one server", whole(1, U32, "requests")),
+                field("full_crawl.identity_source", "Account details from", Kind::Choice(IDENTITY_SOURCE)),
+                field("full_crawl.skip_older_than_days", "Skip records older than", whole(0, 36_500, "days (0 keeps all)")),
+            ],
+        )
+        .advanced(),
+        many(
+            PageId::Indexing,
+            "Full network trial",
+            "The limits of a new trial: it ends after this long, when the database has grown this much, or when the volume's free space falls under the floor, whichever comes first. With history on, the trial also crawls accounts' history.",
+            vec![
+                field("full_trial.hours", "Ends after", Kind::Decimal { max: 87_600.0, unit: "hours" }),
+                field("full_trial.max_added_gb", "Or when the database has grown by", Kind::Decimal { max: 1_000_000.0, unit: "GB" }),
+                field("full_trial.end_below_free_percent", "Or when free space falls under", whole(0, 100, "percent")),
+                field("full_trial.history", "Crawl history too", Kind::Switch),
+            ],
+        ),
         one(PageId::Storage, "retention.notification_days", "Keep notifications for", "Notifications older than this are deleted.", whole(1, 36_500, "days")),
         one(PageId::Storage, "retention.tombstone_days", "Remember deleted records for", "How long Prism remembers deleted records, so a late copy of one is not stored again.", whole(1, 3650, "days")).advanced(),
         one(PageId::Storage, "retention.max_age_days", "Delete public records older than", "Public records older than this are deleted, except those kept for members. 0 keeps them.", whole(0, 36_500, "days")),
@@ -847,7 +902,37 @@ mod tests {
         add(PageId::Blocks, true, &["farsight.rate_per_sec", "farsight.burst"]);
         add(PageId::Communities, false, &["refract.enabled", "refract.communities", "refract.visitor_viewer_state"]);
         add(PageId::Communities, true, &["rate_limits.refract.per_sec", "rate_limits.refract.burst"]);
-        add(PageId::Indexing, false, &["indexing.fill_max_wait_hours"]);
+        add(
+            PageId::Indexing,
+            false,
+            &[
+                "indexing.fill_max_wait_hours",
+                "full.blocks_source",
+                "full.counts",
+                "full.suspended_accounts",
+                "full.suspended_purge_days",
+                "full.labels",
+                "full.label_backfill",
+                "full.at_budget",
+                "full.pause_free_percent",
+                "full_trial.hours",
+                "full_trial.max_added_gb",
+                "full_trial.end_below_free_percent",
+                "full_trial.history",
+            ],
+        );
+        add(
+            PageId::Indexing,
+            true,
+            &[
+                "full_crawl.enabled",
+                "full_crawl.repos_per_sec",
+                "full_crawl.concurrency",
+                "full_crawl.per_pds_rate_per_sec",
+                "full_crawl.identity_source",
+                "full_crawl.skip_older_than_days",
+            ],
+        );
         add(
             PageId::Storage,
             false,
@@ -897,7 +982,7 @@ mod tests {
         let fixed = sections(&[]);
         let mut found: Vec<(String, PageId, bool)> = fixed.iter().flat_map(|s| s.fields.iter().map(|f| (f.key.clone(), s.home, s.advanced))).collect();
         let mut want = expected_homes();
-        assert_eq!(want.len(), 97);
+        assert_eq!(want.len(), 115);
         found.sort_by(|a, b| a.0.cmp(&b.0));
         want.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(found, want);

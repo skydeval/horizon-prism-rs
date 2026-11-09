@@ -85,7 +85,7 @@ impl Crawler {
             state::settle(&self.pool, c, "done", None).await?;
             return Ok(Outcome::Done { records: 0, deleted: 0, marks: 0, whole: false, car_bytes: 0 });
         }
-        let identity = match self.source.identity(&c.did, false).await {
+        let identity = match self.identity(&c.did, false).await {
             Ok(i) => i,
             Err(IdentityMiss::Gone(reason)) => {
                 state::settle(&self.pool, c, "gone", Some("identity")).await?;
@@ -123,7 +123,7 @@ impl Crawler {
             Err(proto_blue::repo::RepoError::InvalidSignature) => {
                 // A key may have rotated since it was read: read the
                 // document once more before it counts.
-                let again = match self.source.identity(&c.did, true).await {
+                let again = match self.identity(&c.did, true).await {
                     Ok(i) => i.key,
                     Err(_) => None,
                 };

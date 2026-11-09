@@ -108,6 +108,7 @@ struct ScopeRetentionInputs {
     scope: ScopeState,
     pool: sqlx::PgPool,
     full_kinds: Vec<crate::config::FullGroup>,
+    schema: crate::db::schema_backfill::SchemaStatus,
 }
 
 #[async_trait]
@@ -122,6 +123,10 @@ impl RetentionInputs for ScopeRetentionInputs {
 
     async fn full_groups(&self) -> Vec<crate::config::FullGroup> {
         if self.scope.public_breadth() == crate::indexing::Breadth::Full { self.full_kinds.clone() } else { Vec::new() }
+    }
+
+    fn age_indexes_ready(&self) -> bool {
+        self.schema.indexes_ready()
     }
 }
 
@@ -556,7 +561,11 @@ pub async fn run() -> Result<Stopped, StartupError> {
     tasks.push(crate::aggregations::expiry::NeverReadyExpiry::new(pool.clone(), purger.clone(), live.clone()).spawn());
 
     // Identity refresher, with the account_deleted purge hook.
-    tasks.push(IdentityRefresher::new(pool.clone(), resolver.clone(), Arc::new(PurgeLifecycle::new(purger.clone()))).spawn());
+    tasks.push(
+        IdentityRefresher::new(pool.clone(), resolver.clone(), Arc::new(PurgeLifecycle::new(purger.clone())))
+            .with_bounds(cfg.file.identity.refresher_concurrency, cfg.file.identity.refresher_queue_max)
+            .spawn(),
+    );
 
     // Firehose: watermarks, coverage, consumer, lag sampler.
     let fh = cfg.file.firehose.clone();
@@ -610,6 +619,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
         ),
         Err(error) => tracing::warn!(event = "thread_outline", enabled = to.enabled, %error, "thread outline: progress unreadable"),
     }
+    // A takedown relay back on its primary URL after a fallback: the
+    // consumer names it, and the crawl reads its account statuses again.
+    let back_on_primary = Arc::new(crate::indexing::crawl::DidQueue::new(64));
     let consumer = Consumer::new(
         fh.clone(),
         consumer_redis,
@@ -621,7 +633,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     .with_sync_min_interval_secs(cfg.file.lists.sync_min_interval_secs)
     .with_system_accounts(system_accounts.clone())
     .with_full_kinds(&cfg.file.full.kinds)
-    .with_tier_board(public.tier_board());
+    .with_tier_board(public.tier_board())
+    .with_back_on_primary(Arc::clone(&back_on_primary));
     let consumer = match outline_sender {
         Some(sender) => consumer.with_outline(sender),
         None => consumer,
@@ -640,7 +653,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
             resolver.clone(),
             cfg.file.full_crawl.plc_rate_per_sec,
             cfg.file.full_crawl.per_pds_rate_per_sec,
-        );
+        )
+        .with_plc_url(&cfg.file.identity.plc_url);
         let crawler = crate::indexing::crawl::task::Crawler::new(
             writer.clone(),
             Arc::new(source),
@@ -654,7 +668,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
         .with_clocks(consumer.low_water(), consumer.covered_clock())
         .with_stream(redis.clone(), &fh.stream_key)
         .with_data_dir(&cfg.env.data_dir)
-        .with_queues(Arc::clone(&first_sight), Arc::clone(&on_demand));
+        .with_queues(Arc::clone(&first_sight), Arc::clone(&on_demand))
+        .with_back_on_primary(Arc::clone(&back_on_primary));
+        public.attach_crawl(crawler.board());
+        public.set_full_options_aside(crate::indexing::full::set_aside(&cfg.file));
         tasks.push(crawler.spawn());
     }
     // Full indexing's third-party labels: the subscriptions and the views'
@@ -678,6 +695,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
 
+    // The post-migration task, made here so retention's age cap can wait
+    // for its indexes; it is spawned once ingest runs (below).
+    let schema_backfill = SchemaBackfill::new(pool.clone(), schema_backfill::Settings::from_config(&cfg.file));
+    let schema_status = schema_backfill.status();
     // Retention and the storage sampler.
     // Private retention runs first (§3.2), so the public `actors` step sees
     // the private row authors that remain.
@@ -687,6 +708,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             scope: scope.clone(),
             pool: pool.clone(),
             full_kinds: cfg.file.full.kinds.clone(),
+            schema: schema_status.clone(),
         }))),
         // In full, long-suspended accounts' public rows.
         Arc::new(crate::indexing::full::SuspendedPurge::new(scope.clone(), cfg.file.full.suspended_purge_days)),
@@ -1107,8 +1129,6 @@ pub async fn run() -> Result<Stopped, StartupError> {
     // The post-migration task (design-v3 §12.2): every migration is applied
     // and ingest is running, so old rows can be filled and the large
     // indexes built while the app serves.
-    let schema_backfill = SchemaBackfill::new(pool.clone(), schema_backfill::Settings::from_config(&cfg.file));
-    let schema_status = schema_backfill.status();
     tasks.push(schema_backfill.spawn());
     // Starter-pack joined counts (design-v3 §5.5).
     tasks.push(
@@ -1117,6 +1137,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
             Some(constellation.clone()),
             Duration::from_secs(cfg.file.starter_packs.counts_refresh_secs),
         )
+        .with_scope(scope.clone())
         .spawn(),
     );
     // The one-time re-sync that fetches the new collections of DIDs known
@@ -1191,6 +1212,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         audit: Some(AuditLatch::from_flag(glue.audit_latched())),
         schema: Some(schema_status.clone()),
         farsight: health_farsight,
+        public: Some(public.clone()),
     };
     // Pronouns and plural systems (plural-pronouns design §2.4, §2.8): the
     // listings run through the internal transport, with the background loop

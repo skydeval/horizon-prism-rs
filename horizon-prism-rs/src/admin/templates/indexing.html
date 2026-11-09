@@ -6,7 +6,10 @@
 <p>What Prism indexes. 'Kryphocron only' keeps only what kryphocron posts and Horizon features need (blocks, follows
 involving members, profiles, members' own records), and Prism stops answering public Bluesky requests. Switching to it
 deletes the stored public data in the background. 'Community' keeps public posts and interactions of your members and
-the accounts around them; switching to it refills them, and public requests come back when the refill is done.</p>
+the accounts around them; switching to it refills them, and public requests come back when the refill is done.
+'Full network' stores the public network as well, for the record groups set below, and crawls each account's history;
+the page that confirms it says how fast the database grows and how long the disk lasts. Leaving it deletes what it
+added.</p>
 <div class="fact"><span class="l">Now</span><span class="v">{{ public.phase }}</span></div>
 {% for f in refill %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
 {% endfor %}
@@ -15,12 +18,59 @@ the accounts around them; switching to it refills them, and public requests come
 <input type="hidden" name="csrf" value="{{ csrf }}">
 <label for="public-scope">Public data</label>
 <select id="public-scope" name="value">
-<option value="community"{% if public.on %} selected{% endif %}>Community</option>
-<option value="kryphocron_only"{% if !public.on %} selected{% endif %}>Kryphocron only</option>
+<option value="community"{% if public.chosen == "community" %} selected{% endif %}>Community</option>
+<option value="kryphocron_only"{% if public.chosen == "kryphocron_only" %} selected{% endif %}>Kryphocron only</option>
+<option value="full"{% if public.chosen == "full" %} selected{% endif %}>Full network</option>
 </select>
 <div class="row"><button type="submit">Save public data</button></div>
 </form>
 <p class="muted tech">technical name: indexing.public_scope</p>
+</div>
+
+{% if full.shown %}
+<h2>Full network</h2>
+<div class="card">
+{% for w in full.warnings %}<div class="banner">{{ w }}</div>
+{% endfor %}
+{% for f in full.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% for f in full.crawl %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% for f in full.labels %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% for f in full.suspended %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+</div>
+{% endif %}
+
+<h2>Full network trial</h2>
+<div class="card">
+<p>A trial indexes the full network for a while, then goes back to the mode it started from, removes what it added
+and checks that nothing is left. Its limits (how long, how much the database may grow, the free-space floor, and
+whether history is crawled) are the trial settings below.</p>
+{% for w in trial.warnings %}<div class="banner">{{ w }}</div>
+{% endfor %}
+{% for f in trial.figures %}<div class="fact"><span class="l">{{ f.label }}</span><span class="v">{{ f.value }}</span></div>
+{% endfor %}
+{% if let Some(last) = trial.last %}<p><strong>Last trial:</strong> {{ last }}</p>{% endif %}
+{% if trial.can_start %}
+<form class="stack" method="post" action="/admin/indexing/trial">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button type="submit">Try full network…</button></div>
+</form>
+{% endif %}
+{% if trial.can_end %}
+<form class="stack" method="post" action="/admin/indexing/trial-end">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button class="secondary" type="submit">End trial…</button></div>
+</form>
+{% endif %}
+{% if trial.can_dismiss %}
+<form class="stack" method="post" action="/admin/indexing/trial-dismiss">
+<input type="hidden" name="csrf" value="{{ csrf }}">
+<div class="row"><button class="secondary" type="submit">Dismiss the result…</button></div>
+</form>
+{% endif %}
 </div>
 
 <h2>Settings</h2>

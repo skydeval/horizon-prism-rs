@@ -2,6 +2,7 @@
 
 pub mod full;
 pub mod full_check;
+pub mod full_status;
 pub mod labels;
 pub mod narrowing;
 pub mod public_fill;

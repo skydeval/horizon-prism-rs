@@ -9,8 +9,10 @@ pub mod continuity;
 pub mod groups;
 pub mod groups_change;
 pub mod marks;
+pub mod plc_export;
 pub mod relist;
 pub mod state;
+pub mod status;
 pub mod task;
 #[cfg(test)]
 mod tests;
@@ -32,6 +34,9 @@ pub const METRIC_PAUSED: &str = "full_crawl_paused";
 pub const METRIC_CAR_BYTES: &str = "full_crawl_car_bytes";
 /// Metric: directory reads of the crawl, by source.
 pub const METRIC_IDENTITY_READS: &str = "full_crawl_identity_reads_total";
+/// Metric: 1 for each group's current history state (`crawling`, `paused`,
+/// `complete`, `removed`), 0 for the others.
+pub const METRIC_GROUP_HISTORY: &str = "full_group_history";
 
 /// A bounded, deduplicated queue of DIDs, shared without a lock on any
 /// writer's path beyond its own mutex.

@@ -495,6 +495,12 @@ pub struct Consumer {
     low_water: Arc<LowWater>,
     /// The stream-id milliseconds of the last Whole or Covered copy read.
     covered: Arc<std::sync::atomic::AtomicI64>,
+    /// Relay labels whose last entries came through a fallback URL
+    /// (`firehose.relay_aliases`).
+    via_alias: std::collections::HashSet<String>,
+    /// Where a relay whose entries come from its primary URL again is
+    /// named, so its account statuses are read again (full indexing).
+    back_on_primary: Option<Arc<crate::indexing::crawl::DidQueue>>,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -548,7 +554,17 @@ impl Consumer {
             dedupe: Dedupe::new(Duration::from_secs(dedupe_window), dedupe_repos),
             low_water: Arc::default(),
             covered: Arc::default(),
+            via_alias: std::collections::HashSet::new(),
+            back_on_primary: None,
         }
+    }
+
+    /// Name each relay whose entries come from its primary URL again after
+    /// a fallback on `queue`.
+    #[must_use]
+    pub fn with_back_on_primary(mut self, queue: Arc<crate::indexing::crawl::DidQueue>) -> Self {
+        self.back_on_primary = Some(queue);
+        self
     }
 
     /// The stream-id milliseconds of the last Whole or Covered copy read:
@@ -1350,6 +1366,18 @@ impl Consumer {
         };
         // The relay reader's stamp, remembered per relay label.
         let label = self.watermarks.label_for(event.relay()).to_string();
+        if let Some(queue) = &self.back_on_primary {
+            match self.watermarks.via(event.relay()) {
+                super::watermark::Via::Alias => {
+                    self.via_alias.insert(label.clone());
+                }
+                super::watermark::Via::Primary if self.via_alias.remove(&label) => {
+                    tracing::info!(event = "firehose_relay_back_on_primary", relay = %label, "a relay's entries come from its primary URL again");
+                    queue.push(&label);
+                }
+                _ => {}
+            }
+        }
         let forgot = self.tiers.take_forgets();
         let seen_before = self.tiers.seen(&label);
         let tier = self.tiers.tier(&label, event.cap());

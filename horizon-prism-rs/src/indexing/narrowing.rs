@@ -151,13 +151,14 @@ fn full_only_steps() -> Vec<Step> {
             "key",
             "w",
             &format!(
-                "w.key IN ('{}', '{}', '{}', '{}', '{}', '{}')",
+                "w.key IN ('{}', '{}', '{}', '{}', '{}', '{}', '{}')",
                 super::full::GROUPS_KEY,
                 super::full::SINCE_KEY,
                 super::crawl::LIST_KEY,
                 super::crawl::RELIST_KEY,
                 super::crawl::groups_change::CHANGES_KEY,
-                super::labels::STATE_KEY
+                super::labels::STATE_KEY,
+                super::crawl::plc_export::EXPORT_KEY
             ),
             Bind::None,
         ),

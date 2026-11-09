@@ -132,6 +132,28 @@ const INBOUND_LIST_BLOCKS_SQL: &str = "SELECT DISTINCT ON (ba.did) ba.did, at_ur
      WHERE i.subject = (SELECT id FROM dids WHERE did = $1) AND ba.did = ANY($2) AND ba.did <> $1 \
      ORDER BY ba.did, b.created_at, b.rkey";
 
+/// The interaction rule for this moment, for a caller with no hydrator
+/// (a background job). Outside breadth Full (or not On) everything reads
+/// today's sources and nothing is queried.
+pub(crate) async fn current(scope: &crate::aggregations::ScopeState, pool: &sqlx::PgPool) -> Interactions {
+    let (kinds, generation, counts_auto, blocks_local) = {
+        let sets = scope.read_guard().await;
+        let full = sets.public.breadth == crate::indexing::Breadth::Full && sets.public.mode.is_on();
+        if !full || sets.full.history_cutoff {
+            return Interactions::default();
+        }
+        (sets.full.kinds.clone(), sets.public.crawl_generation, sets.full.counts_auto, sets.full.blocks_local)
+    };
+    match sqlx::query_as::<_, (Option<Value>, bool)>(STATE_SQL).fetch_one(pool).await {
+        Ok((Some(v), gap_open)) => Interactions::decide(&kinds, &Groups::parse(&v), generation, gap_open, counts_auto, blocks_local),
+        Ok((None, _)) => Interactions::default(),
+        Err(error) => {
+            tracing::warn!(event = "full_interactions_read_failed", %error, "reading full's group histories failed; interaction data reads today's sources");
+            Interactions::default()
+        }
+    }
+}
+
 impl super::Hydrator {
     /// The interaction rule for this moment. Outside breadth Full (or not
     /// On) everything reads today's sources and nothing is queried.
@@ -210,6 +232,58 @@ impl super::Hydrator {
             .await?;
         Ok(rows.into_iter().collect())
     }
+}
+
+/// Between `$1` and each of `$2`, from stored rows: direct blocks and blocks
+/// through a moderation list, each way (`in`: the other blocks `$1`; `out`:
+/// `$1` blocks the other), with the list for a list block.
+const PAIR_BLOCKS_SQL: &str = "WITH me AS (SELECT id FROM dids WHERE did = $1), \
+       them AS (SELECT d.id, d.did FROM dids d WHERE d.did = ANY($2) AND d.did <> $1) \
+     SELECT t.did, true, NULL::text FROM them t JOIN blocks b ON b.author = t.id AND b.subject = (SELECT id FROM me) \
+     UNION ALL SELECT t.did, false, NULL::text FROM them t JOIN blocks b ON b.author = (SELECT id FROM me) AND b.subject = t.id \
+     UNION ALL SELECT t.did, true, at_uri(l.author, $3::smallint, l.rkey) FROM them t \
+       JOIN list_blocks lb ON lb.author = t.id AND lb.subj_coll = $3 \
+       JOIN lists l ON l.author = lb.subj_author AND l.rkey = lb.subj_rkey AND l.purpose = $4 \
+       JOIN list_items i ON i.author = l.author AND i.list_rkey = l.rkey AND i.subject = (SELECT id FROM me) \
+     UNION ALL SELECT t.did, false, at_uri(l.author, $3::smallint, l.rkey) FROM them t \
+       JOIN list_items i ON i.subject = t.id \
+       JOIN lists l ON l.author = i.author AND l.rkey = i.list_rkey AND l.purpose = $4 \
+       JOIN list_blocks lb ON lb.author = (SELECT id FROM me) AND lb.subj_coll = $3 AND lb.subj_author = l.author AND lb.subj_rkey = l.rkey";
+
+/// The blocks between `of` and each of `others`, from stored rows, as the
+/// pair answers Farsight gives: every one of `others` is answered (a clean
+/// answer means no block either way), and a list block names its list, the
+/// smallest URI when there are several. Only sound once the interaction
+/// rule reads blocks and lists locally ([`Interactions::list_blocks`]).
+///
+/// # Errors
+///
+/// Database errors.
+pub(crate) async fn local_pair_blocks(pool: &sqlx::PgPool, of: &str, others: &[String]) -> Result<HashMap<String, crate::farsight::PairAnswer>, sqlx::Error> {
+    let mut out: HashMap<String, crate::farsight::PairAnswer> = others.iter().filter(|d| d.as_str() != of).map(|d| (d.clone(), crate::farsight::PairAnswer::clean(true))).collect();
+    if out.is_empty() {
+        return Ok(out);
+    }
+    let rows: Vec<(String, bool, Option<String>)> = sqlx::query_as(PAIR_BLOCKS_SQL)
+        .bind(of)
+        .bind(others)
+        .bind(crate::db::ids::COLL_LIST)
+        .bind(MODLIST)
+        .fetch_all(pool)
+        .await?;
+    for (did, inbound, list) in rows {
+        let Some(a) = out.get_mut(&did) else { continue };
+        let r = if inbound { &mut a.inbound } else { &mut a.outbound };
+        match list {
+            None => r.direct = true,
+            Some(l) => {
+                if r.list.as_ref().is_none_or(|have| l < *have) {
+                    r.list = Some(l);
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// A post's stored counts: likes, reposts, replies, quotes.

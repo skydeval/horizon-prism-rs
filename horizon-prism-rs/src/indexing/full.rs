@@ -187,6 +187,40 @@ pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, ac
     }
 }
 
+/// A takedown relay's `deactivated` or `deleted` for an account with an
+/// identity row: its `actors.account_status` is set at once, so reads hide
+/// it, and the identity refresher, which reads the account's own server,
+/// confirms or undoes it; a deletion's purge waits for that. `takendown` and
+/// `suspended` never write it: they stay per relay. The caller leaves out
+/// accounts Refract lists. Returns whether a row changed.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn provisional_status(pool: &sqlx::PgPool, did: &str, status: Option<&str>) -> Result<bool, sqlx::Error> {
+    let Some(status) = status.filter(|s| matches!(*s, "deactivated" | "deleted")) else {
+        return Ok(false);
+    };
+    let n = sqlx::query(
+        "UPDATE actors a SET account_status = $2 FROM dids d \
+         WHERE d.did = $1 AND a.id = d.id AND a.account_status IS DISTINCT FROM $2 AND a.account_status IS DISTINCT FROM 'deleted'",
+    )
+    .bind(did)
+    .bind(status)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if n > 0 {
+        metrics::counter!(METRIC_PROVISIONAL, "status" => status.to_string()).increment(1);
+        tracing::info!(event = "account_status_provisional", did, status, "a takedown relay reported the account inactive; hidden until its server is asked");
+    }
+    Ok(n > 0)
+}
+
+/// Metric: account statuses set at once from a takedown relay's
+/// `deactivated` or `deleted`, by status.
+pub const METRIC_PROVISIONAL: &str = "account_status_provisional_total";
+
 /// The accounts whose takedown-relay suspension has lasted `days`: outside
 /// S, not members and not listed by Refract.
 const LONG_SUSPENDED_SQL: &str = "SELECT DISTINCT d.did FROM relay_account_status r JOIN dids d ON d.id = r.account \
@@ -261,6 +295,51 @@ impl crate::db::retention::RetentionTask for SuspendedPurge {
 /// Metric: non-active `#account` statuses recorded, by relay.
 pub const METRIC_SUSPENDED: &str = "account_suspended_total";
 
+/// Metric: options of full indexing set aside at startup because they need
+/// something the configuration does not give (a gauge).
+pub const METRIC_SET_ASIDE: &str = "full_options_set_aside";
+
+/// The combinations of full indexing's options that cannot hold as written,
+/// each with the fallback that applies instead, in words. None of them stops
+/// the start; each is logged once and shown on Health. The directory
+/// export's check (`[full_crawl] identity_source = "plc_export"` with a
+/// directory that serves none) needs the directory, so the crawl makes it.
+#[must_use]
+pub fn set_aside(file: &crate::config::FileConfig) -> Vec<String> {
+    let (full, crawl) = (&file.full, &file.full_crawl);
+    let on = |g: FullGroup| full.kinds.contains(&g);
+    let mut out = Vec::new();
+    if full.blocks_source == crate::config::BlocksSource::Local && !(on(FullGroup::Blocks) && on(FullGroup::Lists)) {
+        out.push(if file.farsight.url.is_some() {
+            "full.blocks_source = \"local\" needs the blocks and lists groups: blocks keep a member side, and other accounts' blocks are read from Farsight.".to_string()
+        } else {
+            "full.blocks_source = \"local\" needs the blocks and lists groups: blocks keep a member side, and with no Farsight set up only those apply.".to_string()
+        });
+    }
+    let cutoff = crawl.skip_older_than_days > 0 || file.retention.max_age_days > 0;
+    if cutoff {
+        out.push("A history cutoff is set (full_crawl.skip_older_than_days or retention.max_age_days): counts and other interaction data keep coming from Constellation and today's sources.".to_string());
+    } else if full.counts == crate::config::FullCounts::Auto {
+        for (g, what) in [(FullGroup::Likes, "Like counts"), (FullGroup::Reposts, "Repost counts"), (FullGroup::Posts, "Reply and quote counts"), (FullGroup::Follows, "Follower counts")] {
+            if !on(g) {
+                out.push(format!("{what} come from Constellation: the {} group is not in full.kinds.", g.as_str()));
+            }
+        }
+    }
+    if full.labels == crate::config::FullLabels::Subscribe && full.label_sources.is_empty() {
+        out.push("full.labels = \"subscribe\" with no label_sources: each labeler's labels are read per request instead.".to_string());
+    }
+    let labels: std::collections::BTreeSet<&String> = file.firehose.relay_labels.values().collect();
+    let unknown: Vec<&String> = full.takedown_relays.iter().filter(|r| !labels.contains(r)).collect();
+    for r in &unknown {
+        out.push(format!("full.takedown_relays names {r}, which is not a label in firehose.relay_labels: set aside."));
+    }
+    if full.takedown_relays.len() == unknown.len() {
+        out.push("full.takedown_relays names no configured relay: suspended_accounts has no effect, and no relay's account statuses are recorded.".to_string());
+    }
+    out
+}
+
 /// Measured growth of live ingest with every group on, in compact storage,
 /// in bytes a day.
 pub const GROWTH_BYTES_PER_DAY: u64 = 12 * 1_000_000_000;
@@ -330,6 +409,39 @@ pub fn warnings(kinds: &[FullGroup], database_bytes: Option<u64>, free_bytes: Op
     out
 }
 
+/// The confirm page's lines beyond the disk and the writer: how labels
+/// arrive, the last `full-check`, and the options set aside.
+#[must_use]
+pub fn more_warnings(file: &crate::config::FileConfig, last_check: Option<String>) -> Vec<String> {
+    let full = &file.full;
+    let mut out = Vec::new();
+    if full.labels == crate::config::FullLabels::Subscribe && !full.label_sources.is_empty() {
+        out.push(if full.label_backfill {
+            "Each subscribed labeler's history is replayed from its first label ([full] label_backfill). For Bluesky's moderation labeler that takes hours, at about 700 labels a second, and several GB, at about 770 bytes a label; until it ends, that labeler's labels are read from it per request.".to_string()
+        } else {
+            "Labelers are subscribed from now on ([full] label_backfill is off): labels of older posts and of accounts are read from each labeler per request, cached.".to_string()
+        });
+    }
+    out.push(last_check.unwrap_or_else(|| "No full-check has been run on this database: `admin indexing full-check` advises how many writer lanes this machine needs.".to_string()));
+    out.extend(set_aside(file));
+    out
+}
+
+/// The live writer against the relays, over the last minutes, in words:
+/// entries the relays added a second and entries Prism applied a second.
+#[must_use]
+pub fn rate_words(applied_per_sec: Option<f64>, added_per_sec: Option<f64>) -> Option<String> {
+    let (applied, added) = (applied_per_sec?, added_per_sec?);
+    let verdict = if added <= 0.0 {
+        "the relays sent nothing"
+    } else if applied >= added * 0.98 {
+        "it keeps up"
+    } else {
+        "it falls behind"
+    };
+    Some(format!("Over the last 10 minutes the relays added about {added:.0} entries a second and Prism applied about {applied:.0} a second: {verdict}. Full indexing adds work to every entry."))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +470,55 @@ mod tests {
         let posts_only = full_set(&[FullGroup::Posts]);
         assert!(posts_only.contains(NSID_POST) && posts_only.contains(PLURAL_COLLECTIONS[0]));
         assert!(!posts_only.contains(NSID_LIKE));
+    }
+
+    /// Impossible combinations of full's options are set aside, each with
+    /// its fallback in words, and the defaults set nothing aside.
+    #[test]
+    fn options_that_cannot_hold_are_set_aside_with_their_fallback() {
+        use crate::config::{BlocksSource, FileConfig, FullLabels};
+        let mut file = FileConfig::default();
+        file.firehose.relay_labels.insert("wss://relay.example".into(), "bsky".into());
+        assert!(set_aside(&file).is_empty(), "{:?}", set_aside(&file));
+        let mut f = file.clone();
+        f.full.kinds = vec![FullGroup::Posts, FullGroup::Blocks];
+        f.full.blocks_source = BlocksSource::Local;
+        f.full.labels = FullLabels::Subscribe;
+        f.full.label_sources.clear();
+        f.full.takedown_relays = vec!["nowhere".into()];
+        let words = set_aside(&f).join(" | ");
+        for needle in [
+            "needs the blocks and lists groups",
+            "with no Farsight set up only those apply",
+            "Like counts come from Constellation: the likes group",
+            "Follower counts come from Constellation",
+            "read per request instead",
+            "names nowhere, which is not a label",
+            "names no configured relay",
+        ] {
+            assert!(words.contains(needle), "{needle}: {words}");
+        }
+        assert!(!words.contains("Reply and quote counts"), "posts is on");
+        f.farsight.url = Some("https://farsight.example".into());
+        f.retention.max_age_days = 30;
+        let words = set_aside(&f).join(" | ");
+        assert!(words.contains("read from Farsight") && words.contains("A history cutoff is set") && !words.contains("Like counts"), "{words}");
+    }
+
+    /// The confirm page's further lines: labels by `label_backfill`, the
+    /// last full-check or its absence, and the writer against the relays.
+    #[test]
+    fn more_warnings_name_labels_the_last_check_and_the_rate() {
+        let mut file = crate::config::FileConfig::default();
+        file.firehose.relay_labels.insert("wss://relay.example".into(), "bsky".into());
+        let w = more_warnings(&file, None).join(" | ");
+        assert!(w.contains("subscribed from now on") && w.contains("No full-check has been run"), "{w}");
+        file.full.label_backfill = true;
+        let w = more_warnings(&file, Some("Last full-check x.".into())).join(" | ");
+        assert!(w.contains("replayed from its first label") && w.contains("Last full-check x."), "{w}");
+        assert!(rate_words(Some(400.0), Some(480.0)).is_some_and(|r| r.contains("about 480 entries a second") && r.contains("falls behind")));
+        assert!(rate_words(Some(480.0), Some(480.0)).is_some_and(|r| r.contains("keeps up")));
+        assert_eq!(rate_words(None, Some(1.0)), None);
     }
 
     /// The warnings never refuse; they name the days left and a budget

@@ -76,6 +76,15 @@ pub struct Crawler {
     progress: Arc<std::sync::Mutex<Progress>>,
     /// A counts repair after a group turned complete is running.
     repairing: Arc<AtomicBool>,
+    /// The directory export's follower (`identity_source = "plc_export"`).
+    pub(super) export: Arc<super::plc_export::ExportState>,
+    pub(super) export_pace: Arc<Pace>,
+    /// Takedown relays whose entries came back to their primary URL: their
+    /// account statuses are read again.
+    back_on_primary: Arc<DidQueue>,
+    /// The figures status shows, and when they were last read.
+    figures: Arc<std::sync::Mutex<Value>>,
+    figures_at: Arc<std::sync::Mutex<Option<Instant>>>,
 }
 
 impl Crawler {
@@ -91,6 +100,8 @@ impl Crawler {
         old_filtered: Vec<String>,
         window_secs: u64,
     ) -> Self {
+        let export = Arc::new(super::plc_export::ExportState::new(crawl.identity_source == crate::config::IdentitySource::PlcExport));
+        let export_pace = Arc::new(Pace::per_sec(crawl.plc_rate_per_sec));
         Self {
             pool: writer.pool().clone(),
             scope: writer.scope().clone(),
@@ -118,7 +129,94 @@ impl Crawler {
             fixed_tail: None,
             progress: Arc::default(),
             repairing: Arc::default(),
+            export,
+            export_pace,
+            figures: Arc::new(std::sync::Mutex::new(Value::Null)),
+            figures_at: Arc::default(),
+            back_on_primary: Arc::new(DidQueue::new(64)),
         }
+    }
+
+    /// With the queue the consumer names a relay on when its entries come
+    /// from its primary URL again.
+    #[must_use]
+    pub fn with_back_on_primary(mut self, queue: Arc<DidQueue>) -> Self {
+        self.back_on_primary = queue;
+        self
+    }
+
+    /// A takedown relay back on its primary URL: account events inside the
+    /// fallback may be lost, so its listing's statuses are read again, a
+    /// status-only pass at the status pace, resumed after a restart.
+    pub(super) async fn status_again_step(&self, generation: i64) -> Result<(), sqlx::Error> {
+        let mut st = self.list_state(generation).await?;
+        if !st["again"].is_object() {
+            st["again"] = json!({});
+        }
+        for label in self.back_on_primary.take(64) {
+            if self.status_relay(&label) {
+                tracing::info!(event = "full_status_pass_again", relay = %label, "a takedown relay is back on its primary URL; its account statuses are read again");
+                st["again"][&label] = Value::Null;
+            }
+        }
+        let pending: Vec<String> = st["again"].as_object().map(|m| m.keys().cloned().collect()).unwrap_or_default();
+        if pending.is_empty() {
+            return Ok(());
+        }
+        for label in pending {
+            let Some(relay) = self.relays.iter().find(|r| r.label == label).cloned() else {
+                if let Some(m) = st["again"].as_object_mut() {
+                    m.remove(&label);
+                }
+                continue;
+            };
+            let cursor = st["again"][&label].as_str().map(str::to_string);
+            self.status_pace.wait().await;
+            match self.source.list_repos(&relay.base, cursor.as_deref()).await {
+                Ok(page) => {
+                    record_statuses(&self.pool, &relay.label, &page.repos).await?;
+                    match page.cursor {
+                        Some(c) if !page.repos.is_empty() => st["again"][&label] = Value::String(c),
+                        _ => {
+                            if let Some(m) = st["again"].as_object_mut() {
+                                m.remove(&label);
+                            }
+                            tracing::info!(event = "full_status_pass_again_done", relay = %label, "a takedown relay's account statuses were read again");
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(event = "full_status_pass_waiting", relay = %label, %error, "the status pass is waiting on a relay"),
+            }
+        }
+        self.save_list_state(&st).await
+    }
+
+    /// What status and Health show of the crawl.
+    #[must_use]
+    pub fn board(&self) -> super::status::CrawlBoard {
+        super::status::CrawlBoard { progress: Arc::clone(&self.progress), export: Arc::clone(&self.export), figures: Arc::clone(&self.figures) }
+    }
+
+    /// Read the figures again when they are older than
+    /// [`super::status::FIGURES_EVERY`], and show each group's history.
+    async fn refresh_figures(&self, generation: i64, groups: &super::groups::Groups) -> Result<(), sqlx::Error> {
+        for (name, g) in &groups.groups {
+            for state in [super::groups::CRAWLING, super::groups::PAUSED, super::groups::COMPLETE, super::groups::REMOVED] {
+                metrics::gauge!(super::METRIC_GROUP_HISTORY, "group" => name.clone(), "state" => state).set(if g.state == state { 1.0 } else { 0.0 });
+            }
+        }
+        let due = self.figures_at.lock().map(|at| at.is_none_or(|t| t.elapsed() >= super::status::FIGURES_EVERY)).unwrap_or(true);
+        if !due {
+            return Ok(());
+        }
+        let f = super::status::figures(&self.pool, generation).await?;
+        if let Ok(mut slot) = self.figures.lock() {
+            *slot = f;
+        }
+        if let Ok(mut at) = self.figures_at.lock() {
+            *at = Some(Instant::now());
+        }
+        Ok(())
     }
 
     /// With a fixed stream tail for re-list pages, where no stream is read.
@@ -205,6 +303,8 @@ impl Crawler {
     }
 
     async fn run(self) {
+        // The export follower runs beside the task, for the process's life.
+        let _export = self.spawn_export();
         let mut entered: Option<i64> = None;
         let mut s_seeded = false;
         let mut last_complete = Instant::now() - Duration::from_secs(3600);
@@ -248,6 +348,7 @@ impl Crawler {
             return Ok(());
         };
         let enabled = groups.enabled();
+        self.refresh_figures(generation, &groups).await?;
         if *entered != Some(generation) {
             self.running.store(0, Ordering::SeqCst);
             let reverted = state::revert_fetching(&self.pool).await?;
@@ -277,6 +378,7 @@ impl Crawler {
         // The takedown relays' status pass at entry, whether the crawl runs
         // or not, then the entry step.
         self.status_step(generation, &enabled_now).await?;
+        self.status_again_step(generation).await?;
         self.first_sight_step().await?;
         // The sweeper and the re-list run with the crawl on or off.
         self.sweep(generation, &enabled_now).await?;

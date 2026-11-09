@@ -38,6 +38,8 @@ pub const TRANSITION_KEY: &str = "public_transition";
 
 /// `public_indexing_phase{phase}`: 1 for the current mode, 0 otherwise.
 pub const METRIC_PHASE: &str = "public_indexing_phase";
+/// `public_indexing_breadth{breadth}`: 1 for the running breadth.
+pub const METRIC_BREADTH: &str = "public_indexing_breadth";
 /// `public_task_superseded_total{task}` (§3.4).
 pub const METRIC_SUPERSEDED: &str = "public_task_superseded_total";
 /// `public_sweep_state_reset_total` (§3.5 step 2).
@@ -882,6 +884,9 @@ pub struct PublicIndexing {
     pub(super) data_dir: std::path::PathBuf,
     /// `[full_trial]`: a new trial's bounds when the command gives none.
     trial_defaults: super::trial::Bounds,
+    /// What full indexing shows beyond the switch: its options set aside at
+    /// startup, and the crawl's board.
+    pub(super) full_board: Arc<Mutex<super::full_status::FullBoard>>,
     #[cfg(test)]
     pub(super) hooks: Arc<hooks::Hooks>,
 }
@@ -898,6 +903,7 @@ impl PublicIndexing {
             tier_board: Arc::default(),
             data_dir: std::path::PathBuf::from("."),
             trial_defaults: super::trial::Bounds::from_config(&crate::config::FullTrialConfig::default()),
+            full_board: Arc::default(),
             #[cfg(test)]
             hooks: Arc::default(),
         }
@@ -960,6 +966,9 @@ impl PublicIndexing {
         self.scope.set_public(sets, state);
         for mode in PublicMode::ALL {
             metrics::gauge!(METRIC_PHASE, "phase" => mode.as_str()).set(if mode == state.mode { 1.0 } else { 0.0 });
+        }
+        for breadth in Breadth::ALL {
+            metrics::gauge!(METRIC_BREADTH, "breadth" => breadth.as_str()).set(if breadth == state.breadth { 1.0 } else { 0.0 });
         }
     }
 
@@ -1506,7 +1515,7 @@ impl PublicIndexing {
             .tier_board
             .relays()
             .into_iter()
-            .map(|(label, t)| (label, json!({ "tier": t.tier.as_str(), "left_out": t.left_out })))
+            .map(|(label, t)| (label, json!({ "tier": t.tier.as_str(), "left_out": t.left_out, "stamped": t.stamped })))
             .collect();
         let (excluded, excluded_bytes) = {
             let sets = self.scope.read_guard().await;
@@ -1517,9 +1526,11 @@ impl PublicIndexing {
         let dedupe_rate = if w.entries == 0 { 0.0 } else { w.deduped as f64 / w.entries as f64 };
         let writer = json!({ "lanes": w.lanes, "dedupe": w.dedupe, "entries": w.entries, "deduped": w.deduped, "dedupe_rate": dedupe_rate });
         let trial = self.trial_status().await?;
+        let full = self.full_status().await?;
         Ok(json!({
             "value": value,
             "trial": trial,
+            "full": full,
             "file_note": p.file_note,
             "mode": mode.as_str(),
             "breadth": self.breadth().as_str(),

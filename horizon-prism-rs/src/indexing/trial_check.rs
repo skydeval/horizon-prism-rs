@@ -271,10 +271,11 @@ impl PublicIndexing {
                 full_left.push(format!("{table} {n}"));
             }
         }
-        let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM worker_state WHERE key IN ($1, $2, $3)")
+        let keys: i64 = sqlx::query_scalar("SELECT count(*) FROM worker_state WHERE key IN ($1, $2, $3, $4)")
             .bind(super::full::GROUPS_KEY)
             .bind(super::full::SINCE_KEY)
             .bind(super::labels::STATE_KEY)
+            .bind(super::crawl::plc_export::EXPORT_KEY)
             .fetch_one(&self.pool)
             .await?;
         if keys > 0 {

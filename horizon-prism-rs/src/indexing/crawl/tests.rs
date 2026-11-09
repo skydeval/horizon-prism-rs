@@ -111,6 +111,8 @@ struct Fake {
     statuses: Mutex<HashMap<String, RepoStatus>>,
     identity_reads: AtomicUsize,
     list_calls: AtomicUsize,
+    /// The directory's export, by page; `None` serves none.
+    export: Mutex<Option<VecDeque<Vec<super::plc_export::ExportOp>>>>,
 }
 
 impl Fake {
@@ -174,6 +176,14 @@ impl CrawlSource for Fake {
     async fn list_records(&self, _pds: &str, did: &str, collection: &str, _cursor: Option<&str>) -> Result<ListPage, String> {
         let records = self.records.lock().expect("records").get(&(did.to_string(), collection.to_string())).cloned().unwrap_or_default();
         Ok(ListPage { records, cursor: None })
+    }
+
+    async fn plc_export(&self, after: Option<i64>) -> Result<Vec<super::plc_export::ExportOp>, super::plc_export::ExportError> {
+        let mut export = self.export.lock().expect("export");
+        let Some(pages) = export.as_mut() else {
+            return Err(super::plc_export::ExportError::NotServed("HTTP 404".into()));
+        };
+        Ok(pages.pop_front().unwrap_or_default().into_iter().filter(|o| after.is_none_or(|a| o.seq > a)).collect())
     }
 }
 
@@ -797,5 +807,90 @@ async fn a_suspension_skips_and_a_return_queues() {
     let (mut e, mut sd, mut l) = (None, false, std::time::Instant::now());
     s.crawler.tick(&mut e, &mut sd, &mut l).await.expect("tick");
     assert_eq!(count(&s.pool, &format!("SELECT count(*) FROM relay_account_status r JOIN dids d ON d.id = r.account WHERE d.did = '{OTHER}'")).await, 1);
+    db.drop_db().await;
+}
+
+/// `identity_source = "plc_export"`: the follower stores each account's
+/// latest operation from the directory's export, in sequence order, and a
+/// crawl reads the account's PDS and key from it with no directory read; a
+/// tombstone is gone; an account the export has not reached, and a re-read
+/// after a bad signature, read the directory; nothing of it enters
+/// `did_cache`. A directory that serves no export sets the option aside.
+#[tokio::test]
+async fn the_directory_export_feeds_the_crawls_identity() {
+    use super::plc_export::ExportOp;
+    let Some(db) = fresh_db("crawl_plc_export").await else {
+        return;
+    };
+    let crawl = FullCrawlConfig { identity_source: crate::config::IdentitySource::PlcExport, ..crawl_config() };
+    let s = stack(&db.pool, FullConfig::default(), crawl, &[("bsky", RELAY_A)]).await;
+    let p = &s.pool;
+    let op = |did: &str, seq: i64, pds: Option<&str>, key: Option<&str>| ExportOp { did: did.into(), seq, pds: pds.map(str::to_string), key: key.map(str::to_string) };
+    *s.fake.export.lock().expect("export") = Some(VecDeque::from([
+        vec![op(STRANGER, 1, Some("https://old.example"), Some("did:key:zOld")), op(OTHER, 2, Some(PDS), Some("did:key:zOther"))],
+        vec![op(STRANGER, 3, Some(PDS), Some("did:key:zNew")), op(OTHER, 4, None, None)],
+    ]));
+    assert!(s.crawler.export_state().active());
+    s.crawler.export_step().await.expect("page 1");
+    s.crawler.export_step().await.expect("page 2");
+    let rows = count(p, "SELECT count(*) FROM crawl_identity").await;
+    assert_eq!(rows, 2);
+    let after: Value = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'full_plc_export'").fetch_one(p).await.expect("cursor");
+    assert_eq!(after["after"], json!(4));
+    assert!(after.get("reached_end_at").is_some(), "a short page is the end of the export");
+    let reads = || s.fake.identity_reads.load(Ordering::SeqCst);
+    let got = s.crawler.identity(STRANGER, false).await.expect("identity");
+    assert_eq!((got.pds.as_str(), got.key.as_deref()), (PDS, Some("did:key:zNew")), "the latest operation wins");
+    assert_eq!(reads(), 0, "no directory read");
+    assert!(matches!(s.crawler.identity(OTHER, false).await, Err(IdentityMiss::Gone(_))), "a tombstone is gone");
+    // Not in the export yet, or a re-read: the directory.
+    let mut a = Account::new(S_AUTHOR);
+    a.put(&[("app.bsky.feed.post", "3kpostkept222", post("x"))]);
+    s.fake.serve(&a);
+    assert!(s.crawler.identity(S_AUTHOR, false).await.is_ok());
+    assert_eq!(reads(), 1);
+    s.fake.serve(&Account::new(STRANGER));
+    assert!(s.crawler.identity(STRANGER, true).await.is_ok());
+    assert_eq!(reads(), 2);
+    assert_eq!(count(p, "SELECT count(*) FROM did_cache").await, 0, "the export's keys never reach did_cache");
+    // A directory with no export: set aside, every read goes to it.
+    *s.fake.export.lock().expect("export") = None;
+    s.crawler.export_step().await.expect("no export");
+    assert!(!s.crawler.export_state().active());
+    assert!(s.crawler.export_state().set_aside().is_some_and(|w| w.contains("404")));
+    s.fake.serve(&Account::new(STRANGER));
+    assert!(s.crawler.identity(STRANGER, false).await.is_ok());
+    assert_eq!(reads(), 3);
+    db.drop_db().await;
+}
+
+/// A takedown relay whose entries came back to its primary URL after a
+/// fallback has its listing's statuses read again: a suspension the
+/// fallback's stream did not carry is recorded; another relay named on the
+/// queue is not a takedown relay and is not read.
+#[tokio::test]
+async fn a_takedown_relay_back_on_its_primary_url_is_read_again() {
+    let Some(db) = fresh_db("crawl_status_again").await else {
+        return;
+    };
+    let s = default_stack(&db.pool).await;
+    let p = &s.pool;
+    let queue = Arc::new(super::DidQueue::new(8));
+    let crawler = s.crawler.clone().with_back_on_primary(Arc::clone(&queue));
+    let mut entries: Vec<ListedRepo> = (0..3).map(|i| ListedRepo { did: format!("did:plc:examplelisted{i}"), head: None, rev: None, active: Some(true), status: None }).collect();
+    entries.push(ListedRepo { did: STRANGER.into(), head: None, rev: None, active: Some(false), status: Some("takendown".into()) });
+    s.fake.listings.lock().expect("listings").insert(RELAY_A.to_string(), entries);
+    let generation = s.generation().await;
+    crawler.status_again_step(generation).await.expect("nothing queued");
+    assert_eq!(s.fake.list_calls.load(Ordering::SeqCst), 0, "nothing read until a relay comes back");
+    queue.push("bsky");
+    queue.push("microcosm");
+    for _ in 0..4 {
+        crawler.status_again_step(generation).await.expect("step");
+    }
+    assert_eq!(s.fake.list_calls.load(Ordering::SeqCst), 2, "the relay's two pages, once");
+    assert_eq!(count(p, "SELECT count(*) FROM relay_account_status WHERE status = 'takendown'").await, 1);
+    let st: Value = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'full_crawl_list'").fetch_one(p).await.expect("list state");
+    assert_eq!(st["again"], json!({}), "the pass ended");
     db.drop_db().await;
 }

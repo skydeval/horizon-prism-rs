@@ -5,8 +5,9 @@
 //!   directions, so local rows answer. `blockingByList` is the actor's
 //!   `listblock` record whose list names the other account. It is computed
 //!   only for a moderation list whose owner is a ready member (a list this
-//!   AppView serves from its own rows), from the public `list_blocks` and
-//!   `list_items` rows. It never reads the subscription tables, so it cannot
+//!   AppView serves from its own rows), or any moderation list once full
+//!   indexing holds every block and list, from the public `list_blocks`
+//!   and `list_items` rows. It never reads the subscription tables, so it cannot
 //!   depend on anyone's private list mutes.
 //! - **Any other actor** is asked of an upstream AppView. When none
 //!   answers, local rows answer what they can and
@@ -107,14 +108,18 @@ impl Hydrator {
                 }
             }
         }
-        // The actor's list blocks, for moderation lists served locally.
+        // Once full indexing holds every block and list (the interaction
+        // rule), every stored moderation list is complete.
+        let local_lists = member && self.interactions().await.list_blocks();
+        // The actor's list blocks, for moderation lists served locally: a
+        // ready member's, or any once every list is held.
+        let owner = if local_lists { "" } else { "JOIN dids ld ON ld.id = l.author JOIN members m ON m.did = ld.did AND m.ready_at IS NOT NULL" };
         let by_list: Pairs = if member {
             sqlx::query_as::<_, (String, String)>(&format!(
                 "SELECT DISTINCT ON (i.subject) sd.did, at_uri(b.author, {}::smallint, b.rkey) \
                  FROM list_blocks b \
                  JOIN lists l ON b.subj_coll = {} AND l.author = b.subj_author AND l.rkey = b.subj_rkey AND l.purpose = $3 \
-                 JOIN dids ld ON ld.id = l.author \
-                 JOIN members m ON m.did = ld.did AND m.ready_at IS NOT NULL \
+                 {owner} \
                  JOIN list_items i ON i.author = l.author AND i.list_rkey = l.rkey \
                  JOIN dids sd ON sd.id = i.subject \
                  WHERE b.author = (SELECT id FROM dids WHERE did = $1) \
@@ -139,7 +144,6 @@ impl Hydrator {
         // answer the field is left out and the response still goes out.
         // Once full indexing holds every block and list (the interaction
         // rule), from stored rows.
-        let local_lists = member && self.interactions().await.list_blocks();
         let blocked_by_list: Pairs = match self.farsight().filter(|_| member) {
             _ if local_lists => self.local_inbound_list_blocks(&actor, &dids).await?,
             Some(farsight) => {

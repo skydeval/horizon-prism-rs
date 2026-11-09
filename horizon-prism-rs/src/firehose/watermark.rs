@@ -24,6 +24,17 @@ pub const PERSIST_INTERVAL: Duration = Duration::from_secs(10);
 pub const GAUGE_INTERVAL: Duration = Duration::from_secs(1);
 /// Label for a `_relay` URL absent from `firehose.relay_labels`.
 pub const UNKNOWN_RELAY: &str = "other";
+
+/// How an entry's `_relay` URL names its relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Via {
+    /// The relay's own URL in `firehose.relay_labels`.
+    Primary,
+    /// A fallback URL of `firehose.relay_aliases`.
+    Alias,
+    /// Neither.
+    Unknown,
+}
 /// How often the private relays are checked for silence, the first time
 /// this long after the start.
 pub const PRIVATE_RELAY_CHECK_INTERVAL: Duration = Duration::from_secs(300);
@@ -140,6 +151,17 @@ impl Watermarks {
         }
         self.aliases = Arc::new(kept);
         self
+    }
+
+    /// Whether a `_relay` URL is a relay's own (primary) URL, a fallback
+    /// standing in for one, or neither.
+    #[must_use]
+    pub fn via(&self, relay: Option<&str>) -> Via {
+        match relay {
+            Some(r) if self.labels.contains_key(r) => Via::Primary,
+            Some(r) if self.aliases.contains_key(r) => Via::Alias,
+            _ => Via::Unknown,
+        }
     }
 
     /// The label of a `_relay` URL, aliases resolved.

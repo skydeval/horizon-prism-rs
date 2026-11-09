@@ -226,6 +226,54 @@ fn figures(state: &AdminState, now: Option<&Snapshot>) -> Vec<FigureGroup> {
     groups
 }
 
+/// Full indexing's figures, while it runs or is being left: the network
+/// (relays, histories, labelers, suspensions), the crawl, the writer
+/// against the relays and the last full-check; and a trial's block while
+/// one exists.
+async fn full_groups(state: &AdminState) -> Vec<FigureGroup> {
+    let public = state.public();
+    let breadth = public.breadth();
+    let mut out = Vec::new();
+    if breadth != crate::indexing::Breadth::Community
+        && let Ok(full) = public.full_status().await
+    {
+        let v = super::indexing::full_view(&full, breadth);
+        out.push(FigureGroup { title: "Full network", figures: v.figures, note: "Its warnings are under Checks.".to_string() });
+        if !v.crawl.is_empty() {
+            out.push(FigureGroup { title: "Full crawl", figures: v.crawl, note: String::new() });
+        }
+        if !v.labels.is_empty() {
+            out.push(FigureGroup { title: "Labels", figures: v.labels, note: "Labels from other labelers, as full indexing stores or reads them.".to_string() });
+        }
+        out.push(FigureGroup {
+            title: "Suspensions",
+            figures: if v.suspended.is_empty() { vec![fig("Accounts a takedown relay reports inactive", "none")] } else { v.suspended },
+            note: "Accounts a takedown relay reports suspended are hidden unless Refract lists them, or every one is served under full.suspended_accounts = \"all\"."
+                .to_string(),
+        });
+        let mut writer = Vec::new();
+        if let Some(w) = super::indexing::writer_words(state).await {
+            writer.push(fig("Against the relays", w));
+        }
+        writer.push(fig(
+            "Last full-check",
+            crate::indexing::full_check::last_words(&state.pool).await.ok().flatten().unwrap_or_else(|| "none run on this database".to_string()),
+        ));
+        out.push(FigureGroup { title: "Writer", figures: writer, note: String::new() });
+    }
+    if let Ok(trial) = public.trial_status().await {
+        let t = super::indexing::trial_view(&trial);
+        if !t.figures.is_empty() || t.last.is_some() {
+            let mut figures = t.figures;
+            if let Some(last) = t.last {
+                figures.push(fig("Last result", last));
+            }
+            out.push(FigureGroup { title: "Full network trial", figures, note: String::new() });
+        }
+    }
+    out
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct ResyncForm {
     #[serde(default)]
@@ -255,6 +303,8 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
     let checks = gather(&state, b).await;
     let now = state.health.now();
     let started = state.settings.started_at;
+    let mut groups = figures(&state, now.as_ref());
+    groups.extend(full_groups(&state).await);
     render(
         StatusCode::OK,
         &HealthPage {
@@ -265,7 +315,7 @@ pub async fn page(State(state): State<AdminState>, ConnectInfo(peer): ConnectInf
             started: format!("{} ({})", when(started), ago(started)),
             young: chrono::Utc::now() - started < chrono::TimeDelta::minutes(5),
             checks: checks.into_iter().map(CheckView::from).collect(),
-            groups: figures(&state, now.as_ref()),
+            groups,
         },
     )
 }

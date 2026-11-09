@@ -1709,6 +1709,36 @@ fn the_own_repo_rule_by_breadth() {
     }
 }
 
+/// A takedown relay's deactivation or deletion sets the account's status
+/// at once, so reads hide it before the refresher asks its server; a
+/// takedown or a suspension does not; a stored deletion is never turned
+/// back into a deactivation; an account with no identity row gets none.
+#[tokio::test]
+async fn a_relay_deactivation_hides_the_account_at_once() {
+    let Some(db) = fresh_db("full_provisional_status").await else {
+        return;
+    };
+    let p = &db.pool;
+    crate::test_support::actors::put(p, STRANGER, &[]).await;
+    let status = || async { sqlx::query_scalar::<_, Option<String>>(&format!("SELECT account_status FROM actors WHERE {}", crate::test_support::actors::is("", STRANGER))).fetch_one(p).await.expect("status") };
+    let before = status().await;
+    use crate::indexing::full::provisional_status;
+    assert!(!provisional_status(p, STRANGER, Some("takendown")).await.expect("takendown"));
+    assert!(!provisional_status(p, STRANGER, Some("suspended")).await.expect("suspended"));
+    assert!(!provisional_status(p, STRANGER, None).await.expect("no status"));
+    assert_eq!(status().await, before, "only a deactivation or a deletion is written");
+    assert!(provisional_status(p, STRANGER, Some("deactivated")).await.expect("deactivated"));
+    assert_eq!(status().await.as_deref(), Some("deactivated"));
+    let gates = crate::moderation::gate_many(p, &[STRANGER.to_string()], crate::refract::RefractView::empty()).await.expect("gate");
+    assert!(gates[STRANGER].is_hidden(), "hidden at once");
+    assert!(provisional_status(p, STRANGER, Some("deleted")).await.expect("deleted"));
+    assert!(!provisional_status(p, STRANGER, Some("deactivated")).await.expect("after deletion"));
+    assert_eq!(status().await.as_deref(), Some("deleted"));
+    assert!(!provisional_status(p, D, Some("deleted")).await.expect("no row"));
+    assert_eq!(count(p, &format!("SELECT count(*) FROM actors WHERE {}", crate::test_support::actors::is("", D))).await, 0);
+    db.drop_db().await;
+}
+
 /// A takedown relay's statuses: non-active is kept per relay and hides the
 /// account in the gate, stored or not, unless it is exempt (a member, or
 /// Refract lists it); active deletes the row; an event without a flag

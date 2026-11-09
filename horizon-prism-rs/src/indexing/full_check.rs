@@ -108,7 +108,19 @@ pub async fn run(cfg: &AppConfig, params: &Params) -> Result<String, String> {
     if !params.keep {
         let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS {scratch} WITH (FORCE)")).execute(&admin).await;
     }
-    let report = result?;
+    let (report, last) = result?;
+    // The last result, for Health and full's confirm page.
+    if let Err(e) = sqlx::query(
+        "INSERT INTO worker_state (key, value, updated_at) VALUES ($1, $2, now()) \
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()",
+    )
+    .bind(LAST_KEY)
+    .bind(&last)
+    .execute(&admin)
+    .await
+    {
+        let _ = writeln!(out, "The result could not be kept for Health ({e}).");
+    }
     out.push_str(&report);
     if params.keep {
         let _ = writeln!(out, "The scratch database {scratch} was kept.");
@@ -116,7 +128,7 @@ pub async fn run(cfg: &AppConfig, params: &Params) -> Result<String, String> {
     Ok(out)
 }
 
-async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option<Input>) -> Result<String, String> {
+async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option<Input>) -> Result<(String, serde_json::Value), String> {
     let options = crate::db::pool::connect_options(cfg.env.database_url.expose(), cfg.file.db.lock_timeout_secs)
         .map_err(|e| e.to_string())?
         .database(scratch);
@@ -136,7 +148,46 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
         .map_err(|e| format!("counts repair range: {e}"))?;
     let size: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(&pool).await.map_err(|e| e.to_string())?;
     pool.close().await;
-    Ok(words(params, input, &runs, seed_secs, size, range.slowest))
+    let last = last_result(input.as_ref(), &runs);
+    Ok((words(params, input, &runs, seed_secs, size, range.slowest), last))
+}
+
+/// The `worker_state` key of the last full-check's result.
+pub const LAST_KEY: &str = "full_check_last";
+
+/// The last result as kept: when, the rate the relays need applied, and
+/// each lane count's rate.
+fn last_result(input: Option<&Input>, runs: &[LaneRun]) -> serde_json::Value {
+    let need = input.map(|i| i.per_sec * i.unique_share);
+    let lanes: Vec<serde_json::Value> = runs.iter().map(|r| serde_json::json!({ "lanes": r.lanes, "per_sec": r.per_sec })).collect();
+    let advice = need.and_then(|n| runs.iter().filter(|r| r.per_sec >= n * 1.25).map(|r| r.lanes).min());
+    serde_json::json!({ "at": chrono::Utc::now().to_rfc3339(), "needed_per_sec": need, "lanes": lanes, "advised_lanes": advice })
+}
+
+/// The last full-check's result in a sentence, if one was kept.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn last_words(pool: &sqlx::PgPool) -> Result<Option<String>, sqlx::Error> {
+    let v: Option<serde_json::Value> = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = $1").bind(LAST_KEY).fetch_optional(pool).await?;
+    Ok(v.map(|v| last_sentence(&v)))
+}
+
+/// A kept result in a sentence.
+#[must_use]
+pub fn last_sentence(v: &serde_json::Value) -> String {
+    let at = v.get("at").and_then(serde_json::Value::as_str).and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok()).map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string());
+    let lanes: Vec<String> = v
+        .get("lanes")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|r| Some(format!("{} lanes {:.0}/s", r.get("lanes")?.as_u64()?, r.get("per_sec")?.as_f64()?)))
+        .collect();
+    let need = v.get("needed_per_sec").and_then(serde_json::Value::as_f64).map_or_else(|| "the relays' rate was not read".to_string(), |n| format!("about {n:.0} a second needed"));
+    let advice = v.get("advised_lanes").and_then(serde_json::Value::as_u64).map_or_else(|| "no lane count tried kept up with headroom".to_string(), |l| format!("advice: {l} lanes or more"));
+    format!("Last full-check {}: {}; {need}; {advice}.", at.unwrap_or_else(|| "at an unknown time".to_string()), if lanes.is_empty() { "no runs".to_string() } else { lanes.join(", ") })
 }
 
 /// The relays' summed rate over `secs`, and the share of the newest commit
@@ -451,6 +502,10 @@ mod tests {
         assert!(viral >= 2 * 56, "the viral post took its share of likes: {viral}");
         let text = words(&p, Some(Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0 }], 1.0, 1_000_000, Duration::from_millis(5));
         assert!(text.contains("about 50 a second need applying") && text.contains("writer_lanes = 4 or more"), "{text}");
+        // The kept result reads back as a sentence.
+        let last = last_result(Some(&Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 1, commits: 400, secs: 10.0, per_sec: 40.0, retries: 0 }, LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0 }]);
+        let sentence = last_sentence(&last);
+        assert!(sentence.contains("1 lanes 40/s, 4 lanes 400/s") && sentence.contains("about 50 a second needed") && sentence.contains("advice: 4 lanes or more"), "{sentence}");
         db.drop_db().await;
     }
 }

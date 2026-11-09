@@ -392,6 +392,7 @@ pub fn describe(command: &str, args: &Value) -> String {
             match arg(args, "value") {
                 "kryphocron_only" => "Kryphocron only",
                 "community" => "Community",
+                "full" => "Full network",
                 other => other,
             }
         ),
@@ -403,6 +404,10 @@ pub fn describe(command: &str, args: &Value) -> String {
         "indexing full-trial check" => "Check the full network trial again".to_string(),
         "indexing full-trial dismiss" => "Dismiss the full network trial's result".to_string(),
         "indexing full-trial status" => "Read the full network trial's status".to_string(),
+        "indexing full-complete" => match args.get("group").and_then(Value::as_str) {
+            Some(g) => format!("Mark the full network's {g} history complete by hand"),
+            None => "Mark the full network's histories complete by hand".to_string(),
+        },
         "firehose forget-cap" => format!("Forget the remembered capability of relay {}", arg(args, "label")),
         "settings set" => {
             let names: Vec<String> = args

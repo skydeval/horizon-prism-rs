@@ -355,8 +355,36 @@ async fn data_pages_hold_their_settings() {
     let body = &indexing.body;
     assert!(body.contains("<form class=\"stack\" method=\"post\" action=\"/admin/indexing/switch\">") && body.contains("technical name: indexing.public_scope"), "{body}");
     assert!(body.contains("<span class=\"l\">Now</span><span class=\"v\">on</span>") && !folded(body, "indexing.fill_max_wait_hours"), "{body}");
-    assert!(!body.contains("<details class=\"advanced\"") && !body.contains("Accounts left to refill"), "{body}");
+    assert!(!body.contains("Accounts left to refill"), "{body}");
+    // The full network's settings: the crawl's folded, the rest not.
+    assert!(folded(body, "full_crawl.enabled") && folded(body, "full_crawl.identity_source"), "{body}");
+    for key in ["full.blocks_source", "full.label_backfill", "full.pause_free_percent", "full_trial.hours", "full_trial.history"] {
+        assert!(!folded(body, key), "{key} is folded");
+    }
+    // The switch offers the full network; a trial may be tried, not ended.
+    assert!(body.contains("<option value=\"full\">Full network</option>"), "{body}");
+    assert!(body.contains("action=\"/admin/indexing/trial\"") && !body.contains("action=\"/admin/indexing/trial-end\""), "{body}");
     let csrf = csrf_of(&indexing);
+
+    // The switch to the full network is asked with its warnings, the last
+    // full-check among them; a trial is asked with its limits, typed FULL,
+    // then queued with the trial settings' history choice.
+    let full = post(&alice, &url("/admin/indexing/switch"), &[("csrf", &csrf), ("value", "full")]).await;
+    assert_eq!(full.status, 200, "{}", full.body);
+    assert!(full.body.contains("<code>FULL</code>") && full.body.contains("No full-check has been run on this database"), "{}", full.body);
+    let ask = post(&alice, &url("/admin/indexing/trial"), &[("csrf", &csrf)]).await;
+    assert_eq!(ask.status, 200, "{}", ask.body);
+    assert!(ask.body.contains("<code>FULL</code>") && ask.body.contains("A full trial from community") && ask.body.contains("subscribed from now on"), "{}", ask.body);
+    let before = queued(p).await.len();
+    let wrong = post(&alice, &url("/admin/indexing/trial"), &[("csrf", &csrf), ("confirm", "yes"), ("typed", "nope")]).await;
+    assert_eq!(wrong.status, 400, "{}", wrong.body);
+    assert_eq!(queued(p).await.len(), before);
+    let start = post(&alice, &url("/admin/indexing/trial"), &[("csrf", &csrf), ("confirm", "yes"), ("typed", "FULL")]).await;
+    assert_eq!(start.status, 303, "{}", start.body);
+    assert_eq!(queued(p).await.last().map(|q| q.0.clone()), Some("indexing full-trial start".to_string()));
+    let end = post(&alice, &url("/admin/indexing/trial-end"), &[("csrf", &csrf), ("confirm", "yes"), ("typed", "END")]).await;
+    assert_eq!(end.status, 303, "{}", end.body);
+    assert_eq!(queued(p).await.last().map(|q| q.0.clone()), Some("indexing full-trial end".to_string()));
 
     // The switch to Kryphocron only: asked, Cancel back to Indexing, then
     // queued; the old address takes it too.
@@ -844,7 +872,7 @@ async fn all_settings_searches_every_setting() {
     let floors = get(&alice, &url("?q=FLOOR")).await;
     assert!(floors.body.contains("<h2 id=\"found\">Settings that match</h2>") && floors.body.contains("value=\"FLOOR\""), "{}", floors.body);
     let floors = found(&floors.body);
-    assert!(floors.iter().filter(|r| r.1.starts_with("private_read.floor_ms.")).count() == 12 && floors.iter().all(|r| r.2 || r.1.starts_with("bookmarks.")), "{floors:?}");
+    assert!(floors.iter().filter(|r| r.1.starts_with("private_read.floor_ms.")).count() == 12 && floors.iter().all(|r| r.2 || r.1.starts_with("bookmarks.") || r.1.starts_with("full")), "{floors:?}");
     let only = found(&get(&alice, &url("?q=floor_ms")).await.body);
     assert!(only.len() == 12 && only.iter().all(|r| r.1.starts_with("private_read.floor_ms.")), "{only:?}");
     // Nothing found: where everything Prism runs with is.

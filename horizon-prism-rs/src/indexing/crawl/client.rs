@@ -89,6 +89,12 @@ pub trait CrawlSource: Send + Sync {
     async fn get_repo(&self, pds: &str, did: &str, max_bytes: u64) -> Result<RepoFetch, String>;
     async fn latest_rev(&self, pds: &str, did: &str) -> Result<String, String>;
     async fn list_records(&self, pds: &str, did: &str, collection: &str, cursor: Option<&str>) -> Result<ListPage, String>;
+    /// One page of the PLC directory's export after the time `after`
+    /// (milliseconds).
+    async fn plc_export(&self, after: Option<i64>) -> Result<Vec<super::plc_export::ExportOp>, super::plc_export::ExportError> {
+        let _ = after;
+        Err(super::plc_export::ExportError::NotServed("no directory export is configured".into()))
+    }
 }
 
 /// A relay URL of `firehose.relay_labels` as the HTTPS base its XRPC
@@ -176,6 +182,9 @@ pub struct NetCrawlSource {
     /// `per_pds_rate_per_sec` per PDS host; relays use the pacing of the
     /// pass that reads them.
     pds: HostPace,
+    /// `identity.plc_url`, whose export `identity_source = "plc_export"`
+    /// reads.
+    plc_url: Option<String>,
 }
 
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -183,7 +192,15 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 impl NetCrawlSource {
     #[must_use]
     pub fn new(net: NetClient, resolver: IdentityResolver, plc_rate_per_sec: u32, per_pds_rate_per_sec: u32) -> Self {
-        Self { net, resolver, plc: Pace::per_sec(plc_rate_per_sec), pds: HostPace::per_sec(per_pds_rate_per_sec) }
+        Self { net, resolver, plc: Pace::per_sec(plc_rate_per_sec), pds: HostPace::per_sec(per_pds_rate_per_sec), plc_url: None }
+    }
+
+    /// With the directory whose export `identity_source = "plc_export"`
+    /// reads: `identity.plc_url`, never a mirror.
+    #[must_use]
+    pub fn with_plc_url(mut self, url: &str) -> Self {
+        self.plc_url = Some(url.trim_end_matches('/').to_string());
+        self
     }
 
     async fn get(&self, base: &str, method: &str, params: &[(&str, &str)], cap: BodyCap, timeout: Duration) -> Result<crate::net::NetResponse, NetError> {
@@ -299,6 +316,43 @@ impl CrawlSource for NetCrawlSource {
             Some(rev) if proto_blue::syntax::Tid::is_valid(rev) => Ok(rev.to_string()),
             other => Err(format!("getLatestCommit: invalid rev {other:?}")),
         }
+    }
+
+    async fn plc_export(&self, after: Option<i64>) -> Result<Vec<super::plc_export::ExportOp>, super::plc_export::ExportError> {
+        use super::plc_export::{ExportError, PAGE, parse_line};
+        let Some(base) = &self.plc_url else {
+            return Err(ExportError::NotServed("no directory export is configured".into()));
+        };
+        let count = PAGE.to_string();
+        // The export's cursor is a time.
+        let after_text = after.and_then(chrono::DateTime::from_timestamp_millis).map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+        let mut params = vec![("count", count.as_str())];
+        if let Some(a) = &after_text {
+            params.push(("after", a.as_str()));
+        }
+        let url = Url::parse_with_params(&format!("{base}/export"), &params).map_err(|e| ExportError::NotServed(format!("export URL: {e}")))?;
+        let r = self
+            .net
+            .get(url.as_str(), &RequestOptions::new(BodyCap::LIST_RECORDS).timeout(TIMEOUT))
+            .await
+            .map_err(|e| ExportError::Failed(format!("export: {e}")))?;
+        match r.status.as_u16() {
+            200 => {}
+            429 => {
+                self.plc.hold(Duration::from_secs(60));
+                return Err(ExportError::Failed("export: 429".into()));
+            }
+            404 | 405 | 501 => return Err(ExportError::NotServed(format!("export: HTTP {}", r.status.as_u16()))),
+            s => return Err(ExportError::Failed(format!("export: HTTP {s}"))),
+        }
+        let text = String::from_utf8_lossy(&r.body);
+        let mut out = Vec::new();
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            if let Some(op) = parse_line(line)? {
+                out.push(op);
+            }
+        }
+        Ok(out)
     }
 
     async fn list_records(&self, pds: &str, did: &str, collection: &str, cursor: Option<&str>) -> Result<ListPage, String> {

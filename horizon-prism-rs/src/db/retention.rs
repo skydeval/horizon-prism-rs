@@ -170,6 +170,12 @@ pub trait RetentionInputs: Send + Sync {
     async fn full_groups(&self) -> Vec<crate::config::FullGroup> {
         Vec::new()
     }
+
+    /// Whether the indexes the age cap reads are built: until then the age
+    /// cap does not run.
+    fn age_indexes_ready(&self) -> bool {
+        true
+    }
 }
 
 /// A bind parameter for one retention statement.
@@ -760,7 +766,11 @@ impl RetentionTask for PublicRetention {
         let full = self.inputs.full_groups().await;
         let mut steps = scope_steps(private_authors);
         steps.retain(|s| !crate::indexing::full::retention_skips(s.table, &full));
-        steps.extend(age_cap_steps(settings.max_age_days));
+        if self.inputs.age_indexes_ready() {
+            steps.extend(age_cap_steps(settings.max_age_days));
+        } else if settings.max_age_days > 0 {
+            tracing::info!(event = "retention_age_cap_waiting", "the age cap waits for its indexes, which are still being built");
+        }
         steps.extend(time_steps(settings));
         let mut report = run_steps(pool, scope, &steps).await?;
         self.inputs.subscription_tombstones_aged().await?;
@@ -1184,6 +1194,34 @@ mod tests {
                 .run(pool, &lock_scope(), &settings)
                 .await
                 .expect("retention run")
+        }
+
+        /// The age cap waits for the indexes it reads: an old post of an
+        /// account in S stays while they are being built, and goes once
+        /// they are ready.
+        #[tokio::test]
+        async fn the_age_cap_waits_for_its_indexes() {
+            struct Building(bool);
+            #[async_trait]
+            impl RetentionInputs for Building {
+                async fn private_row_authors(&self) -> Result<Vec<String>, sqlx::Error> {
+                    Ok(Vec::new())
+                }
+                fn age_indexes_ready(&self) -> bool {
+                    self.0
+                }
+            }
+            let Some(db) = fresh_db().await else { return };
+            let p = &db.pool;
+            let uri = insert_post(p).await;
+            sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 2)").bind(DID).execute(p).await.expect("scope");
+            sqlx::query("UPDATE posts SET created_at = now() - interval '400 days'").execute(p).await.expect("old");
+            let settings = RetentionSettings { tombstone_days: 7, notification_days: 90, max_age_days: 30, trend_aggregate_hours: 72 };
+            PublicRetention::new(Arc::new(Building(false))).run(p, &lock_scope(), &settings).await.expect("run");
+            assert!(post_exists(p, &uri).await, "kept while the indexes are built");
+            PublicRetention::new(Arc::new(Building(true))).run(p, &lock_scope(), &settings).await.expect("run");
+            assert!(!post_exists(p, &uri).await, "aged out once they are ready");
+            db.drop_db().await;
         }
 
         #[tokio::test]

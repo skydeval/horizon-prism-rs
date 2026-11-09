@@ -223,14 +223,21 @@ impl Lane {
     ) -> Result<Done, ConsumerError> {
         // In full, a takedown relay's account statuses are recorded.
         if kind == IdentityKind::Account && active.is_some() {
-            let (full, relays, hides, groups) = {
+            let (full, relays, hides, groups, restored) = {
                 let sets = self.writer.scope().read_guard().await;
-                let hides = sets.full.takedown_relays.iter().any(|r| r.as_str() == label) && !sets.is_restored(did) && !sets.is_member(did);
+                let restored = sets.is_restored(did);
+                let hides = sets.full.takedown_relays.iter().any(|r| r.as_str() == label) && !restored && !sets.is_member(did);
                 let groups: Vec<String> = sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
-                (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone(), hides, groups)
+                (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone(), hides, groups, restored)
             };
             if full && relays.iter().any(|r| r.as_str() == label) {
                 crate::indexing::full::record_relay_status(&self.pool, did, label, active, status).await?;
+                // A deactivation or a deletion hides the account at once,
+                // until the refresher confirms or undoes it; never for an
+                // account Refract lists.
+                if active == Some(false) && !restored {
+                    crate::indexing::full::provisional_status(&self.pool, did, status).await?;
+                }
                 // The crawl follows the account: a deletion or a suspension
                 // refuses an in-flight crawl, a return to active queues one.
                 crate::indexing::crawl::state::account_status(&self.pool, did, active, status, hides, &groups).await?;

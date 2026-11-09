@@ -605,7 +605,7 @@ fn with_leave(_cfg: &FileConfig, _value: &str, _intents: &[Intent], checked: Res
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 38] = [
+    let nonzero: [(&str, u64); 40] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.writer_lanes", u64::from(cfg.firehose.writer_lanes)),
         ("firehose.lane_queue", u64::from(cfg.firehose.lane_queue)),
@@ -614,6 +614,8 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("firehose.deterministic_attempts", u64::from(cfg.firehose.deterministic_attempts)),
         ("identity.did_fresh_secs", cfg.identity.did_fresh_secs),
         ("identity.jwt_issuer_tracker_max", cfg.identity.jwt_issuer_tracker_max),
+        ("identity.refresher_concurrency", u64::from(cfg.identity.refresher_concurrency)),
+        ("identity.refresher_queue_max", cfg.identity.refresher_queue_max),
         ("kryphocron.oracle_freshness_bound_secs", cfg.kryphocron.oracle_freshness_bound_secs),
         ("private_read.bind_concurrency", u64::from(cfg.private_read.bind_concurrency)),
         ("private_read.membership_retry_after_secs", cfg.private_read.membership_retry_after_secs),

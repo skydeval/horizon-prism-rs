@@ -32,8 +32,9 @@
 //! or a purge in between makes it a no-op and nothing deleted comes back.
 //! Progress is kept in `worker_state` (`records:recompress_<table>`).
 //!
-//! Until the task finishes, search runs without its indexes, and trends
-//! wait for the tag index.
+//! Until the task finishes, search runs without its indexes, trends
+//! wait for the tag index, and the age cap of `retention.max_age_days`
+//! waits for every index.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,8 +158,9 @@ pub const PROFILES: RecordFamily = RecordFamily {
 pub const METRIC_POSTS_DEAD_ROWS: &str = "posts_dead_rows";
 
 /// The large-table indexes, by name, with the one statement that builds
-/// each: the search indexes of `post_search`.
-pub const INDEXES: [(&str, &str); 7] = [
+/// each: the search indexes of `post_search`, and the creation-time indexes
+/// of likes and reposts that the age cap of `retention.max_age_days` reads.
+pub const INDEXES: [(&str, &str); 9] = [
     ("post_search_tsv", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_tsv ON post_search USING gin (search_tsv)"),
     ("post_search_tags", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_tags ON post_search USING gin (tags)"),
     ("post_search_domains", "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_domains ON post_search USING gin (link_domains)"),
@@ -169,6 +171,8 @@ pub const INDEXES: [(&str, &str); 7] = [
         "post_search_created",
         "CREATE INDEX CONCURRENTLY IF NOT EXISTS post_search_created ON post_search (created_at DESC, author DESC, rkey DESC)",
     ),
+    ("likes_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS likes_created ON likes (created_at)"),
+    ("reposts_created", "CREATE INDEX CONCURRENTLY IF NOT EXISTS reposts_created ON reposts (created_at)"),
 ];
 
 /// The task's settings.
@@ -1011,7 +1015,7 @@ mod tests {
             .fetch_one(p)
             .await
             .expect("recorded");
-        assert_eq!(recorded, 7);
+        assert_eq!(recorded, i64::try_from(INDEXES.len()).expect("n"));
         // A second pass finds every index valid and builds nothing.
         t.run_index_builds().await.expect("again");
         db.drop_db().await;

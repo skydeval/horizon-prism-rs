@@ -26,13 +26,28 @@ pub struct Upstream {
     net: NetClient,
     labelers: Labelers,
     cache: moka::future::Cache<(String, String), Arc<Vec<Value>>>,
+    /// Subjects whose last read failed, for as long as their empty answer
+    /// is cached: not an answer to compare with.
+    failed: moka::future::Cache<(String, String), ()>,
 }
 
 impl Upstream {
     #[must_use]
     pub fn new(net: NetClient, labelers: Labelers, cache_secs: u32) -> Self {
-        let cache = moka::future::Cache::builder().max_capacity(CACHE_ENTRIES).time_to_live(Duration::from_secs(u64::from(cache_secs.max(1)))).build();
-        Self { net, labelers, cache }
+        let ttl = Duration::from_secs(u64::from(cache_secs.max(1)));
+        let cache = moka::future::Cache::builder().max_capacity(CACHE_ENTRIES).time_to_live(ttl).build();
+        let failed = moka::future::Cache::builder().max_capacity(CACHE_ENTRIES).time_to_live(ttl).build();
+        Self { net, labelers, cache, failed }
+    }
+
+    /// The labeler's cached answer for `subject`, when the last read was
+    /// answered (a failed read is no answer).
+    pub async fn answered(&self, labeler: &str, subject: &str) -> Option<Arc<Vec<Value>>> {
+        let key = (labeler.to_string(), subject.to_string());
+        if self.failed.contains_key(&key) {
+            return None;
+        }
+        self.cache.get(&key).await
     }
 
     /// `labeler`'s current labels of `subjects`, by subject: its negations
@@ -64,9 +79,16 @@ impl Upstream {
             };
             let result = if read.is_some() { "read" } else { "failed" };
             metrics::counter!(METRIC_UPSTREAM, "src" => labeler.to_string(), "result" => result).increment(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            let failed_read = read.is_none();
             let mut found = read.unwrap_or_default();
+            let failed = failed_read;
             for s in chunk {
                 let labels = found.remove(s).unwrap_or_default();
+                if failed {
+                    self.failed.insert((labeler.to_string(), s.clone()), ()).await;
+                } else {
+                    self.failed.invalidate(&(labeler.to_string(), s.clone())).await;
+                }
                 self.cache.insert((labeler.to_string(), s.clone()), Arc::new(labels.clone())).await;
                 if !labels.is_empty() {
                     out.insert(s.clone(), labels);

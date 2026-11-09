@@ -3,9 +3,12 @@
 //! For the viewer and an author, a **verdict** says what the server knows
 //! about blocks between them. Thread Lens adds content to the ordinary
 //! thread view ("bridging") only for authors that are [`Verdict::Clear`]:
-//! known to have no block with the viewer in either direction. Only
-//! Farsight can vouch for that; this AppView's own rows are never used to
-//! conclude that an author has no list block against the viewer.
+//! known to have no block with the viewer in either direction. Farsight
+//! vouches for that; this AppView's own rows are used to conclude that an
+//! author has no list block against the viewer only when full indexing
+//! holds every account's blocks and lists, complete (the interaction rule's
+//! inbound list blocks read locally): then the rounds read stored rows and
+//! Farsight is not asked.
 //!
 //! **The switch.** Bridging is on for a request when Farsight is
 //! configured and answered every call of the request's first round, at any
@@ -95,6 +98,8 @@ pub struct Judge {
     in_local: HashSet<String>,
     pairs: HashMap<String, PairAnswer>,
     judged: HashSet<String>,
+    /// The rounds read stored blocks and lists instead of Farsight.
+    local_blocks: bool,
 }
 
 impl Judge {
@@ -115,7 +120,16 @@ impl Judge {
             in_local: HashSet::new(),
             pairs: HashMap::new(),
             judged: HashSet::new(),
+            local_blocks: false,
         }
+    }
+
+    /// The rounds answer from stored blocks and lists, each author answered
+    /// and vouched for, when full indexing holds every account's, complete.
+    #[must_use]
+    pub fn with_local_blocks(mut self, on: bool) -> Self {
+        self.local_blocks = on;
+        self
     }
 
     /// A judge that has already judged: the viewer blocks `by_viewer`,
@@ -267,6 +281,15 @@ impl Judge {
     }
 
     async fn ask(&self, others: &[String], max_calls: u32, force: Option<&str>) -> PairAnswers {
+        if self.local_blocks {
+            return match crate::hydration::interactions::local_pair_blocks(&self.pool, &self.viewer, others).await {
+                Ok(answers) => PairAnswers { answers, levels: Vec::new(), calls: 1, vouches: true, unanswered: false },
+                Err(error) => {
+                    tracing::warn!(event = "threadlens_local_blocks_failed", %error, "reading stored blocks for Thread Lens failed; nobody is vouched for");
+                    PairAnswers { calls: 1, unanswered: true, ..PairAnswers::default() }
+                }
+            };
+        }
         let budget = PairBudget { max_calls, timeout: self.round_timeout };
         match &self.lookup {
             Some(lookup) => lookup.pair_answers(&self.viewer, others, budget, force).await,
@@ -292,7 +315,7 @@ impl Judge {
         let authors = self.fresh(authors);
         self.local(&authors).await?;
         let mut got = self.ask(&authors, u32::MAX, None).await;
-        if got.calls == 0 && self.lookup.is_some() {
+        if got.calls == 0 && self.lookup.is_some() && !self.local_blocks {
             let one = authors.iter().find(|did| crate::farsight::did::canonical(did).is_some()).cloned();
             let forced = match &one {
                 Some(did) => self.ask(std::slice::from_ref(did), 1, Some(did)).await,
@@ -308,10 +331,12 @@ impl Judge {
         // coverage level: only Farsight unreachable,
         // refusing or overloaded switches it off. A flagged pair still
         // stays undetermined, author by author.
-        self.bridging = self.lookup.is_some() && got.calls > 0 && !got.unanswered;
+        self.bridging = (self.lookup.is_some() || self.local_blocks) && got.calls > 0 && !got.unanswered;
         // Why bridging is on or off for this request, so a client's "can't
         // see around blocks" notice can be traced to its cause.
-        let reason = if self.lookup.is_none() {
+        let reason = if self.local_blocks {
+            if self.bridging { "local" } else { "local_failed" }
+        } else if self.lookup.is_none() {
             "no_farsight"
         } else if self.bridging && got.vouches {
             "vouched"

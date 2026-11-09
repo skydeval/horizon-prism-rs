@@ -167,15 +167,22 @@ impl Hydrator {
     /// `suggestions.refresh_secs`. Stored values only.
     pub(super) async fn suggestion_pool(&self, ordering: Ordering) -> Result<Ranked, sqlx::Error> {
         let cfg = &self.inner.cfg.suggestions;
+        // Follower counts from Constellation's cached answers, unless full
+        // indexing holds every follow (the interaction rule): then the
+        // stored counts alone.
+        let followers = if ordering == Ordering::Popular && self.interactions().await.counts(crate::config::FullGroup::Follows) {
+            "COALESCE((SELECT c.followers_count FROM actor_counts c WHERE c.id = a.id), 0)"
+        } else {
+            "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = ad.did), \
+                      (SELECT c.followers_count FROM actor_counts c WHERE c.id = a.id), 0)"
+        };
         let (slot, label, order) = match ordering {
             // A profile dated in the future cannot hold the top.
-            Ordering::Newest => (&self.suggestions().newest, "newest", "LEAST(COALESCE(a.profile_created_at, a.indexed_at), now()) DESC, ad.did"),
+            Ordering::Newest => (&self.suggestions().newest, "newest", "LEAST(COALESCE(a.profile_created_at, a.indexed_at), now()) DESC, ad.did".to_string()),
             Ordering::Popular => (
                 &self.suggestions().popular,
                 "popular",
-                "COALESCE((SELECT cc.followers FROM constellation_counts cc WHERE cc.target = ad.did), \
-                          (SELECT c.followers_count FROM actor_counts c WHERE c.id = a.id), 0) DESC, \
-                 (SELECT max(p.created_at) FROM posts p WHERE p.author = a.id) DESC NULLS LAST, ad.did",
+                format!("{followers} DESC, (SELECT max(p.created_at) FROM posts p WHERE p.author = a.id) DESC NULLS LAST, ad.did"),
             ),
         };
         let mut slot = slot.lock().await;

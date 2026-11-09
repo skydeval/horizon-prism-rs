@@ -1,8 +1,16 @@
 //! The identity refresher (design-v2 §5.6).
 //!
 //! It consumes `identity_refresh` rows written by the firehose worker for
-//! identity, account, handle and tombstone events, with concurrency 4. Its
-//! outbound calls go through `net`; the firehose loop never waits on it.
+//! identity, account, handle and tombstone events, `identity.refresher_concurrency`
+//! at a time (default 4). Its outbound calls go through `net`; the firehose
+//! loop never waits on it.
+//!
+//! **The queue's bound.** `identity_refresh` holds at most
+//! `identity.refresher_queue_max` rows, give or take one claim's worth: each
+//! batch first drops the excess, taking only rows whose reasons are handle
+//! or identity alone, of accounts that are neither members nor in S. Rows
+//! with an account or tombstone reason are never dropped, so a deletion or
+//! a status change always reaches the account.
 //!
 //! Per DID, in order:
 //! 1. **Always:** re-resolve the DID document bypassing the cache, then update
@@ -52,8 +60,10 @@ impl RefreshReason {
     pub const STALE: i16 = 16;
 }
 
-/// Concurrent refreshes (§5.6).
+/// Concurrent refreshes by default (`identity.refresher_concurrency`).
 pub const CONCURRENCY: usize = 4;
+/// The queue's bound by default (`identity.refresher_queue_max`).
+pub const QUEUE_MAX: u64 = 100_000;
 /// Attempts before a row is dropped (§5.6).
 pub const MAX_ATTEMPTS: i32 = 8;
 /// Deletion suspicion window (§5.6).
@@ -69,6 +79,9 @@ pub const CLAIM_BATCH: i64 = 32;
 /// `deletion_suspect_pds` marker for did:web documents (§5.6).
 pub const DID_WEB_SUSPECT: &str = "did:web";
 
+/// Metric: waiting handle and identity checks dropped because the queue was
+/// over its bound.
+pub const METRIC_DROPPED: &str = "identity_refresher_dropped_total";
 /// Metric: refresh outcomes, labelled by outcome.
 pub const METRIC_OUTCOMES: &str = "identity_refresh_total";
 /// Metric: applied `actors.account_status` changes, labelled by the new
@@ -199,6 +212,8 @@ pub struct IdentityRefresher {
     pool: PgPool,
     resolver: IdentityResolver,
     lifecycle: Arc<dyn AccountLifecycle>,
+    concurrency: usize,
+    queue_max: u64,
 }
 
 fn secs(d: Duration) -> f64 {
@@ -217,7 +232,52 @@ impl IdentityRefresher {
             // (lodestar-reads design §2.2).
             resolver: resolver.with_intent(crate::net::Intent::Internal).directory_only(),
             lifecycle,
+            concurrency: CONCURRENCY,
+            queue_max: QUEUE_MAX,
         }
+    }
+
+    /// With `identity.refresher_concurrency` and `identity.refresher_queue_max`.
+    #[must_use]
+    pub fn with_bounds(mut self, concurrency: u32, queue_max: u64) -> Self {
+        self.concurrency = usize::try_from(concurrency.max(1)).unwrap_or(CONCURRENCY);
+        self.queue_max = queue_max.max(1);
+        self
+    }
+
+    /// Bring the queue back to its bound: drop the excess from the rows that
+    /// carry only a handle or identity reason, of accounts that are neither
+    /// members nor in S, latest due first. Rows with an account or
+    /// tombstone reason are never dropped. Returns how many were dropped.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn trim(&self) -> Result<u64, sqlx::Error> {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_refresh").fetch_one(&self.pool).await?;
+        let excess = u64::try_from(rows).unwrap_or(0).saturating_sub(self.queue_max);
+        if excess == 0 {
+            return Ok(0);
+        }
+        let dropped = sqlx::query(
+            "DELETE FROM identity_refresh r WHERE r.did IN ( \
+               SELECT q.did FROM identity_refresh q \
+               WHERE q.reasons & $2 = 0 \
+                 AND NOT EXISTS (SELECT 1 FROM members m WHERE m.did = q.did) \
+                 AND NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = q.did) \
+               ORDER BY q.not_before DESC LIMIT $1 FOR UPDATE SKIP LOCKED) \
+             AND r.reasons & $2 = 0",
+        )
+        .bind(i64::try_from(excess).unwrap_or(i64::MAX))
+        .bind(RefreshReason::ACCOUNT | RefreshReason::TOMBSTONE)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if dropped > 0 {
+            metrics::counter!(METRIC_DROPPED).increment(dropped);
+            tracing::warn!(event = "identity_refresh_dropped", dropped, rows, max = self.queue_max, "the identity refresher's queue was over its bound; waiting handle checks were dropped");
+        }
+        Ok(dropped)
     }
 
     /// Spawn the worker loop. Abort the handle to stop it.
@@ -239,12 +299,16 @@ impl IdentityRefresher {
         })
     }
 
-    /// Claim due rows and process them with concurrency 4.
+    /// Bring the queue to its bound, then claim due rows and process them,
+    /// `identity.refresher_concurrency` at a time.
     ///
     /// # Errors
     ///
     /// Only claim failures; per-row failures are recorded on the row.
     pub async fn run_batch(&self) -> Result<usize, sqlx::Error> {
+        if let Err(error) = self.trim().await {
+            tracing::warn!(event = "identity_refresh_trim_failed", %error, "bringing the identity refresher's queue to its bound failed");
+        }
         let claimed = sqlx::query_as::<_, Claimed>(
             "UPDATE identity_refresh r SET not_before = now() + make_interval(secs => $2) \
              FROM (SELECT did FROM identity_refresh WHERE not_before <= now() \
@@ -258,7 +322,7 @@ impl IdentityRefresher {
         .await?;
         let n = claimed.len();
         futures::stream::iter(claimed)
-            .for_each_concurrent(CONCURRENCY, |row| async move { self.handle(row).await })
+            .for_each_concurrent(self.concurrency, |row| async move { self.handle(row).await })
             .await;
         Ok(n)
     }
@@ -739,6 +803,58 @@ mod tests {
         assert_eq!(*lifecycle.0.lock().expect("recorded"), vec![did.to_string()]);
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM identity_refresh").fetch_one(&db.pool).await.expect("count");
         assert_eq!(left, 0, "the row is done");
+        db.drop_db().await;
+    }
+
+    /// Over its bound, the queue drops waiting handle and identity checks of
+    /// strangers, latest due first, and never a row with an account or
+    /// tombstone reason, nor a member's or an S account's row.
+    #[tokio::test]
+    async fn the_queue_bound_drops_only_strangers_handle_checks() {
+        let Some(db) = crate::test_support::fresh_db("refresher_queue_bound").await else {
+            return;
+        };
+        let p = &db.pool;
+        let did = |n: usize| format!("did:plc:example{n:017}");
+        // Six strangers' handle checks, due one after another.
+        for n in 0..6 {
+            sqlx::query("INSERT INTO identity_refresh (did, reasons, not_before) VALUES ($1, $2, now() + make_interval(secs => $3))")
+                .bind(did(n))
+                .bind(RefreshReason::HANDLE)
+                .bind(f64::from(u32::try_from(n).expect("n")))
+                .execute(p)
+                .await
+                .expect("queue");
+        }
+        // An account and a tombstone check, a member's and an S account's
+        // handle checks: never dropped.
+        for (n, reasons) in [(6, RefreshReason::ACCOUNT | RefreshReason::HANDLE), (7, RefreshReason::TOMBSTONE), (8, RefreshReason::IDENTITY), (9, RefreshReason::HANDLE)] {
+            sqlx::query("INSERT INTO identity_refresh (did, reasons, not_before) VALUES ($1, $2, now() + interval '1 hour')")
+                .bind(did(n))
+                .bind(reasons)
+                .execute(p)
+                .await
+                .expect("queue");
+        }
+        sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(did(8)).execute(p).await.expect("member");
+        sqlx::query("INSERT INTO scope_dids (did, reasons) VALUES ($1, 1)").bind(did(9)).execute(p).await.expect("scope");
+        let resolver = IdentityResolver::new(
+            crate::net::Transports::loopback_for_tests(),
+            p.clone(),
+            crate::identity::IdentitySettings { plc_url: "http://127.0.0.1:1".into(), fresh: Duration::from_secs(3600), stale_max: Duration::from_secs(86_400) },
+            Arc::new(NeverPersist),
+            crate::net::Intent::Internal,
+        );
+        let refresher = IdentityRefresher::new(p.clone(), resolver, Arc::new(Recorded(std::sync::Mutex::new(Vec::new()))) as Arc<dyn AccountLifecycle>).with_bounds(4, 7);
+        assert_eq!(refresher.trim().await.expect("trim"), 3);
+        let left: Vec<String> = sqlx::query_scalar("SELECT did FROM identity_refresh ORDER BY did").fetch_all(p).await.expect("left");
+        assert_eq!(left, vec![did(0), did(1), did(2), did(6), did(7), did(8), did(9)], "the latest-due strangers' handle checks went");
+        // Past what can be dropped, the rest stay.
+        let tight = refresher.clone().with_bounds(4, 1);
+        assert_eq!(tight.trim().await.expect("trim"), 3);
+        let left: Vec<String> = sqlx::query_scalar("SELECT did FROM identity_refresh ORDER BY did").fetch_all(p).await.expect("left");
+        assert_eq!(left, vec![did(6), did(7), did(8), did(9)]);
+        assert_eq!(tight.trim().await.expect("trim"), 0);
         db.drop_db().await;
     }
 

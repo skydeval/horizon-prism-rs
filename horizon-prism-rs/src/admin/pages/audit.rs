@@ -56,7 +56,7 @@ pub struct Filters {
 }
 
 /// The command names the "what" filter offers.
-pub const COMMAND_NAMES: [&str; 31] = [
+pub const COMMAND_NAMES: [&str; 32] = [
     "member add",
     "member remove",
     "member deny",
@@ -87,6 +87,7 @@ pub const COMMAND_NAMES: [&str; 31] = [
     "indexing full-trial check",
     "indexing full-trial dismiss",
     "indexing full-trial status",
+    "indexing full-complete",
     "firehose forget-cap",
 ];
 

@@ -89,6 +89,10 @@ pub enum AdminCommand {
     FullTrialDismiss,
     /// `indexing full-trial status`: the trial and the last result.
     FullTrialStatus,
+    /// `indexing full-complete --incomplete [group]`: mark a group (or
+    /// every one) Complete by hand; the accounts not crawled stay on today's
+    /// sources.
+    FullComplete { group: Option<String> },
     /// `firehose forget-cap <label>`: forget a relay's remembered
     /// capability, so a downgraded unfiltered relay reader counts as whole
     /// again.
@@ -174,6 +178,7 @@ impl AdminCommand {
             Self::FullTrialCheck => ("indexing full-trial check", json!({})),
             Self::FullTrialDismiss => ("indexing full-trial dismiss", json!({})),
             Self::FullTrialStatus => ("indexing full-trial status", json!({})),
+            Self::FullComplete { group } => ("indexing full-complete", json!({ "group": group })),
             Self::FirehoseForgetCap { label } => ("firehose forget-cap", json!({ "label": label })),
             Self::OperatorAdd { input, note, add_host } => {
                 ("operator add", json!({ "input": input, "note": note, "add_host": add_host }))
@@ -319,6 +324,11 @@ impl AdminCommand {
             "indexing full-trial check" => Self::FullTrialCheck,
             "indexing full-trial dismiss" => Self::FullTrialDismiss,
             "indexing full-trial status" => Self::FullTrialStatus,
+            "indexing full-complete" => match args.get("group") {
+                None | Some(Value::Null) => Self::FullComplete { group: None },
+                Some(Value::String(g)) if crate::config::FullGroup::parse(g).is_some() => Self::FullComplete { group: Some(g.clone()) },
+                Some(_) => return Err(InvalidCommand(format!("{command}: group must be a record group of full indexing"))),
+            },
             "firehose forget-cap" => match args.get("label").and_then(Value::as_str) {
                 Some(l) if !l.is_empty() && l.len() <= 200 && !l.chars().any(char::is_whitespace) => Self::FirehoseForgetCap { label: l.to_string() },
                 _ => return Err(InvalidCommand(format!("{command}: label must be a relay label"))),
@@ -404,6 +414,7 @@ impl AdminCommand {
             | Self::FullTrialCheck
             | Self::FullTrialDismiss
             | Self::FullTrialStatus
+            | Self::FullComplete { .. }
             | Self::FirehoseForgetCap { .. }
             | Self::OperatorAdd { .. }
             | Self::OperatorRemove { .. }
@@ -595,6 +606,7 @@ impl Handlers {
             AdminCommand::FullTrialCheck => self.public.recheck_trial().await.map(Outcome::Done).map_err(|e| e.to_string()),
             AdminCommand::FullTrialDismiss => self.public.dismiss_trial().await.map(Outcome::Done).map_err(|e| e.to_string()),
             AdminCommand::FullTrialStatus => self.public.trial_status().await.map(Outcome::Done).map_err(|e| e.to_string()),
+            AdminCommand::FullComplete { group } => self.public.complete_by_hand(group.as_deref()).await.map(Outcome::Done),
             AdminCommand::FirehoseForgetCap { label } => self.firehose_forget_cap(label).await,
             AdminCommand::OperatorAdd { input, note, add_host } => self.operator_add(input, note.as_deref(), *add_host, actor).await,
             AdminCommand::OperatorRemove { did } => settled(operators::remove(&self.pool, did).await),
@@ -1267,6 +1279,8 @@ mod tests {
             AdminCommand::FullTrialCheck,
             AdminCommand::FullTrialDismiss,
             AdminCommand::FullTrialStatus,
+            AdminCommand::FullComplete { group: None },
+            AdminCommand::FullComplete { group: Some("likes".into()) },
         ] {
             let (name, args) = cmd.to_row();
             assert_eq!(AdminCommand::parse(name, &args), Ok(cmd.clone()));
@@ -1274,6 +1288,7 @@ mod tests {
         }
         assert!(AdminCommand::parse("indexing full-trial start", &json!({"hours": 0})).is_err());
         assert!(AdminCommand::parse("indexing full-trial bounds", &json!({"end_below_free_percent": 101})).is_err());
+        assert!(AdminCommand::parse("indexing full-complete", &json!({"group": "everything"})).is_err());
         assert!(AdminCommand::parse("indexing public-scope", &json!({"value": "everything"})).is_err());
         // The operator commands (admin-ui design §11) round-trip and wait
         // on no purge; arguments are checked as the design says.

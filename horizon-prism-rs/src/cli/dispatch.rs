@@ -230,6 +230,18 @@ pub enum IndexingAction {
         #[command(subcommand)]
         action: FullTrialAction,
     },
+    /// Mark a record group's history (or every group's) complete by hand,
+    /// before every account was crawled: the accounts not crawled yet stay
+    /// on the group's incomplete list and keep reading today's sources.
+    FullComplete {
+        /// Required: the group is marked complete although accounts are
+        /// left.
+        #[arg(long)]
+        incomplete: bool,
+        /// One group (posts, likes, reposts, follows, blocks, lists,
+        /// profiles, starter_packs, polls); every group when left out.
+        group: Option<String>,
+    },
     /// Advice only: whether this machine applies the full network as fast
     /// as the relays send it. Builds a scratch database beside this one
     /// (dropped after), seeds it, applies commits like the network's at
@@ -521,6 +533,17 @@ impl AdminCmd {
                 value: ScopeValue::parse(value).ok_or_else(|| format!("public-scope takes kryphocron_only, community or full, not {value:?}"))?,
             },
             Self::Indexing { action: IndexingAction::Status } => AdminCommand::IndexingStatus,
+            Self::Indexing { action: IndexingAction::FullComplete { incomplete, group } } => {
+                if !incomplete {
+                    return Err("full-complete marks a group complete with accounts left; pass --incomplete to say so".to_string());
+                }
+                if let Some(g) = group
+                    && crate::config::FullGroup::parse(g).is_none()
+                {
+                    return Err(format!("{g} is not a record group of full indexing"));
+                }
+                AdminCommand::FullComplete { group: group.clone() }
+            }
             Self::Indexing { action: IndexingAction::FullTrial { action } } => match action {
                 FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, .. } => AdminCommand::FullTrialStart {
                     hours: hours.map(crate::config::Float),
@@ -585,6 +608,8 @@ async fn confirm_scope(pool: &PgPool, cfg: &crate::config::AppConfig, value: Sco
             cfg.file.storage.budget_bytes,
             cfg.file.firehose.writer_lanes,
         ));
+        let last = crate::indexing::full_check::last_words(pool).await.map_err(|e| e.to_string())?;
+        text.extend(crate::indexing::full::more_warnings(&cfg.file, last));
     } else {
         text.push(
             "Leaving full for community: the rows full added are deleted in the background, then S is refilled; public requests answer 501 during that refill."
@@ -625,7 +650,12 @@ async fn confirm_trial(pool: &PgPool, cfg: &crate::config::AppConfig, action: &F
             let from = if phase.as_deref() == Some("off") { ScopeValue::KryphocronOnly } else { ScopeValue::Community };
             let used: Option<i64> = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(pool).await.ok();
             let free = crate::indexing::trial::volume(&cfg.env.data_dir);
-            let warnings = crate::indexing::full::warnings(&cfg.file.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free.map(|f| f.0), cfg.file.storage.budget_bytes, cfg.file.firehose.writer_lanes);
+            let mut warnings = crate::indexing::full::warnings(&cfg.file.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free.map(|f| f.0), cfg.file.storage.budget_bytes, cfg.file.firehose.writer_lanes);
+            let last = crate::indexing::full_check::last_words(pool).await.map_err(|e| e.to_string())?;
+            // A live-only trial subscribes from the tip whatever the option.
+            let mut file = cfg.file.clone();
+            file.full.label_backfill &= bounds.history;
+            warnings.extend(crate::indexing::full::more_warnings(&file, last));
             // How long the last fill took: its last finished job after its start.
             let last_fill: Option<i64> = sqlx::query_scalar(
                 "SELECT EXTRACT(EPOCH FROM (max(updated_at) - min(not_before)))::bigint FROM backfill_jobs WHERE depth = 'resync' AND state = 'done'",

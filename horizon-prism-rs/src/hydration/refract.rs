@@ -755,8 +755,10 @@ impl Hydrator {
         Ok(Some(!page.linking_records.is_empty()))
     }
 
-    /// Whether `replier` is on `list` (refract design §7.1 `listRule`).
-    async fn refract_on_list(&self, req: &Requester, list: &str, replier: &str) -> Result<Option<bool>, sqlx::Error> {
+    /// Whether `replier` is on `list` (a threadgate's `listRule`):
+    /// from the stored items for a member's list, or any list once full
+    /// indexing holds the lists group, complete (`local`).
+    async fn refract_on_list(&self, req: &Requester, list: &str, replier: &str, local: bool) -> Result<Option<bool>, sqlx::Error> {
         let Some(owner) = uri_author(list) else {
             return Ok(None);
         };
@@ -764,7 +766,7 @@ impl Hydrator {
             .bind(owner)
             .fetch_one(self.pool())
             .await?;
-        if member {
+        if member || local {
             let found = crate::db::lists::on_list(self.pool(), list, replier).await?;
             return Ok(Some(found));
         }
@@ -806,7 +808,11 @@ impl Hydrator {
             .bind(vec![root_author.to_string(), replier.to_string()])
             .fetch_all(self.pool())
             .await?;
-        let local = !members.is_empty();
+        let ix = self.interactions().await;
+        // A member's follows are stored in every mode; every account's once
+        // full indexing holds the follows group, complete.
+        let local = !members.is_empty() || ix.local(crate::config::FullGroup::Follows);
+        let lists_local = ix.local(crate::config::FullGroup::Lists);
         let mut complete = true;
         for rule in rules {
             let allowed = match rule.get("$type").and_then(Value::as_str).unwrap_or_default() {
@@ -814,7 +820,7 @@ impl Hydrator {
                 "app.bsky.feed.threadgate#followingRule" => self.refract_follows(req, root_author, replier, local).await?,
                 "app.bsky.feed.threadgate#followerRule" => self.refract_follows(req, replier, root_author, local).await?,
                 "app.bsky.feed.threadgate#listRule" => match rule.get("list").and_then(Value::as_str) {
-                    Some(list) => self.refract_on_list(req, list, replier).await?,
+                    Some(list) => self.refract_on_list(req, list, replier, lists_local).await?,
                     None => None,
                 },
                 _ => None,
@@ -1004,6 +1010,17 @@ impl Hydrator {
         if others.is_empty() {
             return out;
         }
+        // Full indexing holding every account's blocks and lists: stored
+        // rows answer; a failed read leaves everyone unanswered (dropped).
+        if self.interactions().await.list_blocks() {
+            let answers = super::interactions::local_pair_blocks(self.pool(), of, others).await.unwrap_or_default();
+            for did in others {
+                if answers.get(did).is_none_or(crate::farsight::PairAnswer::any_block) {
+                    out.insert(did.clone());
+                }
+            }
+            return out;
+        }
         let Some(farsight) = self.farsight() else {
             return out;
         };
@@ -1042,9 +1059,13 @@ impl Hydrator {
         mut blocks: Option<&mut crate::refract::handlers::Blocks>,
         admitted: &mut HashMap<String, bool>,
     ) -> Result<Vec<Value>, sqlx::Error> {
-        let Some(client) = self.backlinks() else {
+        // Full indexing holding every post (the interaction rule): the
+        // stored replies are all of them, and Constellation is not asked.
+        let local = self.interactions().await.local(crate::config::FullGroup::Posts);
+        let client = self.backlinks();
+        if !local && client.is_none() {
             return Ok(Vec::new());
-        };
+        }
         let returned: HashSet<&str> = posts.iter().filter_map(|p| p.get("uri").and_then(Value::as_str)).collect();
         let parents: Vec<&str> = posts
             .iter()
@@ -1059,19 +1080,39 @@ impl Hydrator {
             if room == 0 {
                 break;
             }
-            if self.constellation_bucket().is_some_and(|b| b.draw(req.key()).is_err()) {
+            let listed: Vec<(String, String)> = if local {
+                sqlx::query_as(&format!(
+                    "SELECT {}, d.did FROM ref_of($1::text) k \
+                     JOIN posts c ON c.parent_author = k.author AND c.parent_rkey = k.rkey AND c.parent_coll = 1 \
+                     JOIN dids d ON d.id = c.author \
+                     WHERE k.coll = 1 ORDER BY c.created_at, c.author, c.rkey LIMIT $2",
+                    crate::db::posts::uri_sql("c")
+                ))
+                .bind(parent)
+                .bind(i64::try_from(room).unwrap_or(i64::MAX))
+                .fetch_all(self.pool())
+                .await?
+            } else if let Some(client) = &client {
+                if self.constellation_bucket().is_some_and(|b| b.draw(req.key()).is_err()) {
+                    break;
+                }
+                let Ok(page) = client.links(parent, NSID_POST, ".reply.parent.uri", u32::try_from(room).unwrap_or(u32::MAX), None).await else {
+                    continue;
+                };
+                page.linking_records
+                    .into_iter()
+                    .filter(|r| r.collection == NSID_POST)
+                    .map(|r| (format!("at://{}/{}/{}", r.did, r.collection, r.rkey), r.did))
+                    .collect()
+            } else {
                 break;
-            }
-            let Ok(page) = client.links(parent, NSID_POST, ".reply.parent.uri", u32::try_from(room).unwrap_or(u32::MAX), None).await else {
-                continue;
             };
-            for r in page.linking_records {
-                let uri = format!("at://{}/{}/{}", r.did, r.collection, r.rkey);
-                if r.collection != NSID_POST || returned.contains(uri.as_str()) || is_private_uri(&uri) || parent_of.contains_key(&uri) || children.len() >= CHILDREN_MAX {
+            for (uri, did) in listed {
+                if returned.contains(uri.as_str()) || is_private_uri(&uri) || parent_of.contains_key(&uri) || children.len() >= CHILDREN_MAX {
                     continue;
                 }
                 parent_of.insert(uri.clone(), parent.to_string());
-                children.push((uri, r.did));
+                children.push((uri, did));
             }
         }
         if children.is_empty() {
@@ -1190,6 +1231,35 @@ impl OwnField {
             Self::Like => super::thread::NSID_LIKE,
             Self::Repost => super::feed::NSID_REPOST,
             Self::Following => super::graph::NSID_FOLLOW,
+        }
+    }
+
+    /// The record group whose stored rows hold the field once full
+    /// indexing has its whole history.
+    fn group(self) -> crate::config::FullGroup {
+        match self {
+            Self::Like => crate::config::FullGroup::Likes,
+            Self::Repost => crate::config::FullGroup::Reposts,
+            Self::Following => crate::config::FullGroup::Follows,
+        }
+    }
+
+    /// The stored record of `$1` (the visitor) naming `$2` (a post's URI,
+    /// or an account's DID), as its URI.
+    fn local_sql(self) -> String {
+        match self {
+            Self::Like | Self::Repost => {
+                let (table, coll) = if matches!(self, Self::Like) { ("likes", crate::db::ids::COLL_LIKE) } else { ("reposts", crate::db::ids::COLL_REPOST) };
+                format!(
+                    "SELECT at_uri(t.author, {coll}::smallint, t.rkey) FROM ref_of($2::text) k \
+                     JOIN {table} t ON t.subj_author = k.author AND t.subj_rkey = k.rkey AND t.subj_coll = k.coll \
+                     WHERE t.author = (SELECT id FROM dids WHERE did = $1) ORDER BY t.created_at, t.rkey LIMIT 1"
+                )
+            }
+            Self::Following => "SELECT at_uri(f.author, 4::smallint, f.rkey) FROM follows f \
+                 WHERE f.author = (SELECT id FROM dids WHERE did = $1) AND f.subject = (SELECT id FROM dids WHERE did = $2) \
+                 ORDER BY f.created_at, f.rkey LIMIT 1"
+                .to_string(),
         }
     }
 
@@ -1365,9 +1435,20 @@ impl Hydrator {
         for d in &t.accounts {
             asks.push((OwnField::Following, d.clone()));
         }
+        // Full indexing holding a group's whole history (the interaction
+        // rule): the visitor's own records of it are read from stored rows,
+        // and the visitor's DID is not sent out.
+        let ix = self.interactions().await;
+        let ix = &ix;
         let answers: Vec<(OwnField, String, Option<Option<String>>)> = futures::stream::iter(asks)
             .map(|(field, target)| async move {
-                let got = if started.elapsed() >= VISITOR_BUDGET { None } else { self.refract_own_link(req, me, &target, field.collection(), field.path()).await };
+                let got = if ix.local(field.group()) {
+                    sqlx::query_scalar::<_, String>(&field.local_sql()).bind(me).bind(&target).fetch_optional(self.pool()).await.ok()
+                } else if started.elapsed() >= VISITOR_BUDGET {
+                    None
+                } else {
+                    self.refract_own_link(req, me, &target, field.collection(), field.path()).await
+                };
                 (field, target, got)
             })
             .buffer_unordered(VISITOR_CONCURRENCY)

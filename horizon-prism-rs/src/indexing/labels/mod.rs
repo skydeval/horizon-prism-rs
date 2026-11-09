@@ -54,6 +54,10 @@ pub const METRIC_STORED: &str = "external_labels_stored_total";
 /// labeler's `queryLabels` (`cached`, `read`, `failed`).
 pub const METRIC_UPSTREAM: &str = "external_labels_upstream_total";
 
+/// `external_labels_unverified_settled_total{src}`: unverified labels
+/// settled by the labeler's own current answer for their subject.
+pub const METRIC_UNVERIFIED_SETTLED: &str = "external_labels_unverified_settled_total";
+
 /// `[full]`'s label options as they apply: `subscribe` with no source is
 /// `upstream`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,9 +183,11 @@ impl ExternalLabels {
                 _ => asks.entry(labeler.clone()).or_default().extend(subjects.iter().cloned()),
             }
         }
+        let mut unverified: Vec<(String, String)> = Vec::new();
         if !stored_srcs.is_empty() {
-            for (src, uri) in store::unverified_subjects(pool, &subjects, &stored_srcs).await? {
-                asks.entry(src).or_default().insert(uri);
+            unverified = store::unverified_subjects(pool, &subjects, &stored_srcs).await?;
+            for (src, uri) in &unverified {
+                asks.entry(src.clone()).or_default().insert(uri.clone());
             }
             let rows = store::applied(pool, &subjects, &stored_srcs).await?;
             let versions = store::stored_post_cids(pool, &rows).await?;
@@ -204,6 +210,16 @@ impl ExternalLabels {
             for (uri, labels) in answer {
                 let have = out.entry(uri).or_default();
                 crate::hydration::normalize::add_missing_labels(have, labels);
+            }
+        }
+        // A subject's unverified labels, once the labeler's own answer for
+        // it is in: settled by it, so they stop counting as unverified.
+        for (src, uri) in &unverified {
+            if let Some(current) = self.upstream.answered(src, uri).await {
+                let n = store::settle_unverified(pool, src, uri, &current).await?;
+                if n > 0 {
+                    metrics::counter!(METRIC_UNVERIFIED_SETTLED, "src" => src.clone()).increment(n);
+                }
             }
         }
         out.retain(|_, v| !v.is_empty());

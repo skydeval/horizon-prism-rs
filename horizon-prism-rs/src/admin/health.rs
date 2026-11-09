@@ -342,6 +342,9 @@ pub struct HealthInputs {
     pub audit: Option<AuditLatch>,
     pub schema: Option<SchemaStatus>,
     pub farsight: Option<Farsight>,
+    /// The public-indexing switch serve runs: full indexing's status, its
+    /// trial, the relays' tiers and the crawl.
+    pub public: Option<crate::indexing::PublicIndexing>,
 }
 
 impl HealthInputs {
@@ -981,7 +984,39 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         disks: Some(super::stats::read_disks(&state.disks)),
         ..base
     };
-    checks(&inputs, &state.health.ring)
+    let mut out = checks(&inputs, &state.health.ring);
+    out.extend(full_checks(state).await);
+    out
+}
+
+/// Full indexing's checks: the full network's warnings while it runs (or
+/// a note that it does not), and a trial's warnings while one has any.
+async fn full_checks(state: &AdminState) -> Vec<Check> {
+    let public = state.public();
+    let breadth = public.breadth();
+    let mut out = Vec::new();
+    match public.full_status().await {
+        Ok(full) => {
+            let warnings: Vec<String> = full["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
+            let text = match breadth {
+                crate::indexing::Breadth::Full if warnings.is_empty() => Check::new("Full network", Level::Ok, "Prism is indexing the full network, with nothing set aside."),
+                crate::indexing::Breadth::Full => Check::new("Full network", Level::Amber, warnings.join(" ")),
+                crate::indexing::Breadth::Narrowing => Check::new("Full network", Level::Info, "Prism is leaving the full network: the rows it added are being deleted, then S is refilled."),
+                crate::indexing::Breadth::Community => Check::new("Full network", Level::Ok, "Prism is not indexing the full network."),
+            };
+            out.push(text.link("/admin/indexing", "Indexing"));
+        }
+        Err(e) => out.push(Check::no_data("Full network", &format!("its status could not be read ({e})")).link("/admin/indexing", "Indexing")),
+    }
+    if let Ok(trial) = public.trial_status().await {
+        let warnings: Vec<String> = trial["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
+        if !warnings.is_empty() {
+            out.push(Check::new("Full network trial", Level::Amber, warnings.join(" ")).link("/admin/indexing", "Indexing"));
+        } else if let Some(state) = trial.pointer("/trial/state").and_then(serde_json::Value::as_str) {
+            out.push(Check::new("Full network trial", Level::Info, format!("A full network trial is {state}.")).link("/admin/indexing", "Indexing"));
+        }
+    }
+    out
 }
 
 impl super::AdminState {

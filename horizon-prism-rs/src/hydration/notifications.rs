@@ -570,7 +570,11 @@ impl Hydrator {
         if total > 0 {
             // The unread rows' authors, newest first, as many as one
             // request may ask Farsight about.
-            let ready_lookup = if viewer.hydrate { crate::xrpc::backstop::farsight() } else { None };
+            // Once full indexing holds every block and list (the
+            // interaction rule), a ready member's inbound list blocks come
+            // from stored rows instead of Farsight.
+            let local_lists = viewer.hydrate && self.interactions().await.list_blocks();
+            let ready_lookup = if viewer.hydrate && !local_lists { crate::xrpc::backstop::farsight() } else { None };
             let cap = ready_lookup.as_ref().map_or(FARSIGHT_AUTHORS, |l| l.capacity().min(FARSIGHT_AUTHORS));
             let authors: Vec<String> = sqlx::query_scalar(
                 "SELECT n.author_did FROM refract_notifications n WHERE n.recipient_did = $1 \
@@ -583,7 +587,9 @@ impl Hydrator {
             .bind(i64::try_from(cap).unwrap_or(i64::MAX))
             .fetch_all(self.pool())
             .await?;
-            let blockers: Vec<String> = if let Some(lookup) = ready_lookup {
+            let blockers: Vec<String> = if local_lists {
+                self.local_inbound_list_blocks(me, &authors).await?.into_keys().collect()
+            } else if let Some(lookup) = ready_lookup {
                 lookup.set_no_fallback();
                 lookup.inbound_list_blocks(me, &authors, &std::collections::HashSet::new()).await.into_keys().collect()
             } else if let Some(b) = blocks {

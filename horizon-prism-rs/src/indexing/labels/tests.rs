@@ -374,6 +374,13 @@ async fn a_replay_checks_old_keys_and_keeps_unverified_labels_unapplied() {
     assert_eq!(got.get(&p3).cloned().unwrap_or_default(), [pair(LABELER, "fresh")], "caught up, the stored labels answer");
     assert_eq!(got.get(&p2).cloned().unwrap_or_default(), [pair(LABELER, "today")], "the unverified label is not applied; the labeler's answer is");
     assert_eq!(f.queried(), [(LABELER.to_string(), vec![p2.clone()])], "only the subject with an unverified label reads the labeler");
+    // Compared with the labeler's answer, the unverified label it no longer
+    // serves is settled: the subject stops counting, and reads stop asking.
+    assert!(super::store::unverified_counts(&f.pool).await.expect("counts").is_empty());
+    let rows: Vec<String> = sqlx::query_scalar("SELECT val FROM external_labels ORDER BY val").fetch_all(&f.pool).await.expect("rows");
+    assert_eq!(rows, ["fresh", "issued-before"]);
+    f.view(std::slice::from_ref(&p2), Some(LABELER)).await;
+    assert!(f.queried().is_empty(), "nothing unverified is left to ask about");
     db.drop_db().await;
 }
 

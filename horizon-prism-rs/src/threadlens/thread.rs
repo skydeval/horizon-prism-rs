@@ -1851,7 +1851,9 @@ pub async fn get_thread_outlined(
     let h = ladder.hydrator();
     let me = r.viewer.did.clone().unwrap_or_default();
     let lookup = h.farsight().map(|farsight| lens_lookup(farsight, r.viewer, r.req));
-    let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
+    // Full indexing holding every account's blocks and lists: stored rows
+    // answer the rounds.
+    let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg).with_local_blocks(h.interactions().await.list_blocks());
 
     // A request with a cursor evaluates its anchor as any request does,
     // but builds no parent chain and collects no replies again: the
@@ -2198,7 +2200,7 @@ pub async fn resolve(
         return Ok(Thread { nodes, bridging: Bridging::Off, phases: Vec::new(), outline: None, crosscheck: None });
     }
     let lookup = h.farsight().map(|farsight| lens_lookup(farsight, viewer, req));
-    let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg);
+    let mut judge = Judge::new(h.pool().clone(), &me, lookup, cfg).with_local_blocks(h.interactions().await.list_blocks());
     judge.baseline(&judged).await?;
     let bridging = judge.bridging();
     let mut work = Work {

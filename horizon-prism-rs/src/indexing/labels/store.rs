@@ -204,6 +204,48 @@ pub async fn unverified_subjects(pool: &PgPool, subjects: &[String], srcs: &[Str
         .await
 }
 
+/// Settle `src`'s unverified labels of `uri` against the labeler's own
+/// answer for it now (`current`, already checked): a label it still serves
+/// (same value and record version, not negated) is its word today and is
+/// kept as verified; one it no longer serves is removed. Either way the
+/// subject stops counting as unverified. Returns the rows settled.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn settle_unverified(pool: &PgPool, src: &str, uri: &str, current: &[Value]) -> Result<u64, sqlx::Error> {
+    let served: Vec<String> = current
+        .iter()
+        .filter(|l| l.get("src").and_then(Value::as_str) == Some(src) && l.get("neg").and_then(Value::as_bool) != Some(true))
+        .filter_map(|l| Some(format!("{}\u{1f}{}", l.get("cid").and_then(Value::as_str).unwrap_or_default(), l.get("val")?.as_str()?)))
+        .collect();
+    let mut tx = pool.begin().await?;
+    let kept = sqlx::query("UPDATE external_labels SET verified = true WHERE src = $1 AND uri = $2 AND NOT verified AND NOT neg AND (cid || chr(31) || val) = ANY($3)")
+        .bind(src)
+        .bind(uri)
+        .bind(&served)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    let gone = sqlx::query("DELETE FROM external_labels WHERE src = $1 AND uri = $2 AND NOT verified")
+        .bind(src)
+        .bind(uri)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    tx.commit().await?;
+    Ok(kept + gone)
+}
+
+/// How many subjects carry an unverified label, per labeler.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn unverified_counts(pool: &PgPool) -> Result<Vec<(String, i64)>, sqlx::Error> {
+    sqlx::query_as("SELECT src, count(DISTINCT uri) FROM external_labels WHERE NOT verified GROUP BY src ORDER BY src").fetch_all(pool).await
+}
+
 /// The stored CIDs of the posts that `rows` with a record version name.
 ///
 /// # Errors

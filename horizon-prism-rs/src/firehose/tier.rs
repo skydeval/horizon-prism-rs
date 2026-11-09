@@ -48,6 +48,10 @@ pub struct RelayTier {
     pub tier: CopyTier,
     /// The full-set collections its filter leaves out.
     pub left_out: Vec<String>,
+    /// Its last entry carried a capability stamp: its reader is new enough
+    /// to send `#sync`, every commit's `since` and its filter. An older
+    /// reader leaves per-account continuity to the periodic re-list.
+    pub stamped: bool,
 }
 
 #[derive(Debug, Default)]
@@ -123,8 +127,9 @@ pub struct Tiers {
     old_filtered: BTreeSet<String>,
     /// Label → the record filter of its last stamp (`None`: no filter).
     last: BTreeMap<String, Option<BTreeSet<String>>>,
-    /// Label → the tier last logged, so a change is logged once.
-    logged: BTreeMap<String, CopyTier>,
+    /// Label → the tier last logged and whether that entry was stamped, so
+    /// a change is logged once.
+    logged: BTreeMap<String, (CopyTier, bool)>,
     /// Where a tier change is shown.
     board: std::sync::Arc<TierBoard>,
 }
@@ -216,9 +221,13 @@ impl Tiers {
     /// should be persisted). The tier of `label` is logged when it changes.
     pub fn observe(&mut self, label: &str, cap: Option<&Cap>) -> bool {
         let tier = self.tier(label, cap);
-        if self.logged.get(label) != Some(&tier) {
-            self.logged.insert(label.to_string(), tier);
-            self.board.set(label, RelayTier { tier, left_out: self.left_out(cap) });
+        let stamped = cap.is_some();
+        let before = self.logged.get(label).copied();
+        if before != Some((tier, stamped)) {
+            self.logged.insert(label.to_string(), (tier, stamped));
+            self.board.set(label, RelayTier { tier, left_out: self.left_out(cap), stamped });
+        }
+        if before.map(|(t, _)| t) != Some(tier) {
             if tier == CopyTier::Aside {
                 let left_out = self.left_out(cap);
                 tracing::warn!(
@@ -391,13 +400,15 @@ mod tests {
         let board = std::sync::Arc::new(TierBoard::default());
         let mut t = Tiers::new(full_set(&FullGroup::ALL), Vec::new()).with_board(std::sync::Arc::clone(&board));
         t.observe("bsky", Some(&cap(None)));
-        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Whole, left_out: Vec::new() });
+        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Whole, left_out: Vec::new(), stamped: true });
         let no_likes: Vec<&str> = STORED_SET.iter().copied().filter(|c| *c != "app.bsky.feed.like").collect();
         t.observe("bsky", Some(&cap(Some(&no_likes))));
-        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Aside, left_out: vec!["app.bsky.feed.like".to_string()] });
-        // The reader is replaced by one that stamps nothing: still aside.
+        assert_eq!(board.relays()["bsky"], RelayTier { tier: CopyTier::Aside, left_out: vec!["app.bsky.feed.like".to_string()], stamped: true });
+        // The reader is replaced by one that stamps nothing: still aside,
+        // and the board says its reader is older.
         t.observe("bsky", None);
         assert_eq!(t.tier("bsky", None), CopyTier::Aside);
+        assert!(!board.relays()["bsky"].stamped);
         assert!(!t.take_forgets(), "nothing asked");
         board.request_forget("bsky");
         assert!(t.take_forgets());
