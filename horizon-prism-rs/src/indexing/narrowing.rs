@@ -97,18 +97,41 @@ fn bounded(step: Step, trial: bool) -> Step {
     }
 }
 
-/// Whether the subject of a label (a DID or an at-URI, text) is still
-/// stored: an account with an identity row; a post that is stored; another
-/// record whose author has an identity row.
-fn label_subject_stored(col: &str) -> String {
-    let actor = |did: &str| format!("EXISTS (SELECT 1 FROM actors la JOIN dids ld ON ld.id = la.id WHERE ld.did = {did})");
-    format!(
-        "(CASE WHEN {col} LIKE 'did:%' THEN {} \
-          WHEN split_part({col}, '/', 4) = 'app.bsky.feed.post' THEN EXISTS (SELECT 1 FROM ref_of({col}) lr JOIN posts lp ON lp.author = lr.author AND lp.rkey = lr.rkey WHERE lr.coll = 1) \
-          ELSE {} END)",
-        actor(col),
-        actor(&format!("split_part({col}, '/', 3)"))
-    )
+/// Full indexing's own label table.
+pub const FULL_LABELS: &str = "full_labels";
+
+/// The statement of a step that empties its table whole, in one go.
+const TRUNCATE: &str = "TRUNCATE ";
+
+/// A step that empties `table` whole.
+fn truncate(table: &'static str) -> Step {
+    Step { table, sql: format!("{TRUNCATE}{table}"), candidates: None, bind: Bind::None }
+}
+
+/// How a trial's exit empties `full_labels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LabelsExit {
+    /// The table was empty when the trial started: truncated.
+    Truncate,
+    /// It held rows when the trial started (or that is not known): every
+    /// row is deleted in batches.
+    Delete,
+}
+
+impl LabelsExit {
+    /// The exit for a trial whose baseline counted `rows_at_start` rows.
+    #[must_use]
+    pub fn of_start(rows_at_start: Option<i64>) -> Self {
+        if rows_at_start == Some(0) { Self::Truncate } else { Self::Delete }
+    }
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Truncate => "truncate",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 /// The tables only full writes, and the rows of shared tables full adds to
@@ -143,8 +166,8 @@ fn full_only_steps() -> Vec<Step> {
         batched("crawl_identity", "account", "ci", "TRUE", Bind::None),
         batched("full_crawl", "account", "fc", "TRUE", Bind::None),
         batched("refract_excluded", "account", "rx", "TRUE", Bind::None),
-        // After the record tables: a label of a subject no longer stored.
-        batched_composite("external_labels", &["src", "uri", "cid", "val"], "el", &format!("NOT {}", label_subject_stored("el.uri")), Bind::None),
+        // Leaving full empties full's labels whole.
+        truncate(FULL_LABELS),
         // Last: the entry time bounds the steps above until here.
         batched(
             "worker_state",
@@ -202,7 +225,7 @@ pub const STEP_NAMES: [&str; 36] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
-    "external_labels",
+    "full_labels",
     "worker_state",
 ];
 
@@ -228,7 +251,7 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 20] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
-    "external_labels",
+    "full_labels",
     "worker_state",
 ];
 
@@ -272,7 +295,7 @@ pub const TRIAL_STEP_NAMES: [&str; 39] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
-    "external_labels",
+    "full_labels",
     "worker_state",
 ];
 
@@ -298,7 +321,7 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 21] = [
     "crawl_identity",
     "full_crawl",
     "refract_excluded",
-    "external_labels",
+    "full_labels",
     "worker_state",
 ];
 
@@ -328,14 +351,15 @@ fn names(list: SweepList) -> &'static [&'static str] {
 /// no follow or post of anyone names it any more, so the counts community
 /// keeps for accounts S follows stay, and an account's counts the record
 /// names that are all back at zero go whatever else holds the account (a
-/// zero row reads like no row); and the count rows and trend hours
+/// zero row reads like no row); the count rows and trend hours
 /// the trial's removed rows brought back to zero go, as they read like no
-/// row at all.
-fn trial_steps() -> Vec<Step> {
+/// row at all; and full's labels are deleted row by row unless `labels`
+/// says the table may be truncated.
+fn trial_steps(labels: LabelsExit) -> Vec<Step> {
     let tombstones = super::trial::TrialTable::RecordTombstones.code();
     let profiles = super::trial::TrialTable::Actors.code();
     let account = did_of("ac.id");
-    vec![
+    let mut out = vec![
         Step {
             table: "actor_counts",
             sql: format!(
@@ -380,7 +404,6 @@ fn trial_steps() -> Vec<Step> {
             bind: Bind::None,
         },
         batched_composite("relay_account_status", &["account", "relay"], "ras", "TRUE", Bind::None),
-        batched_composite("external_labels", &["src", "uri", "cid", "val"], "el", "TRUE", Bind::None),
         Step {
             table: TRIAL_PROFILES,
             sql: format!(
@@ -394,7 +417,11 @@ fn trial_steps() -> Vec<Step> {
             candidates: None,
             bind: Bind::None,
         },
-    ]
+    ];
+    if labels == LabelsExit::Delete {
+        out.push(batched_composite(FULL_LABELS, &["src", "uri", "cid", "val"], "fla", "TRUE", Bind::None));
+    }
+    out
 }
 
 /// The index of the step `name` in `list`, if `name` is one of its steps.
@@ -404,13 +431,14 @@ pub fn step_index(list: SweepList, name: &str) -> Option<usize> {
 }
 
 /// The steps of `list`, built with the private-tier row authors community
-/// retention keeps.
-pub(super) fn steps(list: SweepList, private_row_authors: Vec<String>) -> Vec<Step> {
+/// retention keeps; `labels` is how a trial's exit empties full's labels
+/// (every other list truncates them).
+pub(super) fn steps(list: SweepList, private_row_authors: Vec<String>, labels: LabelsExit) -> Vec<Step> {
     let mut all: Vec<Step> = Vec::new();
     // The trial's steps first, so they stand in for the ordinary ones.
     let trial = matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull);
     if trial {
-        all.extend(trial_steps());
+        all.extend(trial_steps(labels));
     }
     all.extend(scope_steps(private_row_authors).into_iter().map(|s| bounded(s, trial)));
     all.extend(full_only_steps());
@@ -438,7 +466,8 @@ impl PublicIndexing {
                 }
             }
         };
-        let steps = steps(list, private);
+        let labels = if matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull) { self.trial_labels_exit().await } else { LabelsExit::Truncate };
+        let steps = steps(list, private, labels);
         for i in start..steps.len() {
             let step = &steps[i];
             loop {
@@ -504,6 +533,18 @@ impl PublicIndexing {
     /// One step to completion: the rows it deleted, or `None` when the
     /// generation moved on.
     async fn run_step(&self, generation: u64, step: &Step) -> Result<Option<u64>, sqlx::Error> {
+        if let Some(table) = step.sql.strip_prefix(TRUNCATE) {
+            let guard = self.scope.read_guard().await;
+            if guard.public.generation != generation {
+                return Ok(None);
+            }
+            let mut tx = self.pool.begin().await?;
+            let n: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}")).fetch_one(&mut *tx).await?;
+            sqlx::query(&step.sql).execute(&mut *tx).await?;
+            tx.commit().await?;
+            drop(guard);
+            return Ok(Some(u64::try_from(n).unwrap_or(0)));
+        }
         let mut total = 0;
         let Some(candidates) = &step.candidates else {
             loop {
@@ -579,16 +620,16 @@ mod tests {
     /// step always resumes the step it names.
     #[test]
     fn step_names_are_the_built_steps() {
-        let built: Vec<&str> = steps(SweepList::Narrowing, Vec::new()).iter().map(|s| s.table).collect();
+        let built: Vec<&str> = steps(SweepList::Narrowing, Vec::new(), LabelsExit::Truncate).iter().map(|s| s.table).collect();
         assert_eq!(built, STEP_NAMES);
-        let drain: Vec<&str> = steps(SweepList::Full, Vec::new()).iter().map(|s| s.table).collect();
+        let drain: Vec<&str> = steps(SweepList::Full, Vec::new(), LabelsExit::Truncate).iter().map(|s| s.table).collect();
         assert_eq!(drain, FULL_DRAIN_STEP_NAMES);
-        let trial: Vec<&str> = steps(SweepList::TrialNarrowing, Vec::new()).iter().map(|s| s.table).collect();
+        let trial: Vec<&str> = steps(SweepList::TrialNarrowing, Vec::new(), LabelsExit::Truncate).iter().map(|s| s.table).collect();
         assert_eq!(trial, TRIAL_STEP_NAMES);
-        let trial_drain: Vec<&str> = steps(SweepList::TrialFull, Vec::new()).iter().map(|s| s.table).collect();
+        let trial_drain: Vec<&str> = steps(SweepList::TrialFull, Vec::new(), LabelsExit::Truncate).iter().map(|s| s.table).collect();
         assert_eq!(trial_drain, TRIAL_FULL_DRAIN_STEP_NAMES);
         // A trial's tombstones go by the record, and every relay status goes.
-        let built = steps(SweepList::TrialNarrowing, Vec::new());
+        let built = steps(SweepList::TrialNarrowing, Vec::new(), LabelsExit::Truncate);
         let tomb = built.iter().find(|s| s.table == "record_tombstones").expect("tombstones");
         assert!(tomb.sql.contains("full_trial_rows"), "{}", tomb.sql);
         let ras = built.iter().find(|s| s.table == "relay_account_status").expect("relay statuses");
@@ -599,7 +640,7 @@ mod tests {
             let step = built.iter().find(|s| s.table == table).expect("block step");
             assert!(step.sql.contains("full_trial_rows") && step.sql.contains("rev >="), "{}", step.sql);
         }
-        let ordinary = steps(SweepList::Narrowing, Vec::new());
+        let ordinary = steps(SweepList::Narrowing, Vec::new(), LabelsExit::Truncate);
         assert!(!ordinary.iter().any(|s| s.sql.contains("full_trial_rows")));
         // A drain's own tables are not run again as steps, except the
         // search rows, which no drain table covers.
@@ -608,11 +649,40 @@ mod tests {
         }
     }
 
+    /// Leaving full truncates full's labels; a trial's exit does too when
+    /// the trial started with none, and otherwise deletes every row. No
+    /// step names any other label table.
+    #[test]
+    fn leaving_full_empties_full_labels() {
+        let labels_step = |list, exit| steps(list, Vec::new(), exit).into_iter().find(|s| s.table == FULL_LABELS).expect("labels step");
+        for list in [SweepList::Narrowing, SweepList::Full] {
+            for exit in [LabelsExit::Truncate, LabelsExit::Delete] {
+                assert_eq!(labels_step(list, exit).sql, "TRUNCATE full_labels", "{list:?}");
+            }
+        }
+        for list in [SweepList::TrialNarrowing, SweepList::TrialFull] {
+            assert_eq!(labels_step(list, LabelsExit::Truncate).sql, "TRUNCATE full_labels", "{list:?}");
+            let delete = labels_step(list, LabelsExit::Delete).sql;
+            assert!(delete.starts_with("DELETE FROM full_labels WHERE") && delete.contains("WHERE TRUE LIMIT"), "{delete}");
+        }
+        assert_eq!((LabelsExit::of_start(Some(0)), LabelsExit::of_start(Some(3)), LabelsExit::of_start(None)), (LabelsExit::Truncate, LabelsExit::Delete, LabelsExit::Delete));
+        for list in [SweepList::Narrowing, SweepList::Full, SweepList::TrialNarrowing, SweepList::TrialFull] {
+            for exit in [LabelsExit::Truncate, LabelsExit::Delete] {
+                for s in steps(list, Vec::new(), exit) {
+                    let labels_tables = s.sql.matches("labels").count();
+                    let full_labels = s.sql.matches("full_labels").count();
+                    let self_labels = s.sql.matches("self_labels").count();
+                    assert_eq!(labels_tables, full_labels + self_labels, "{}: {}", s.table, s.sql);
+                }
+            }
+        }
+    }
+
     /// The block and identity steps are bounded by the entry time in the
     /// delete and in the candidate query; retention's own steps are not.
     #[test]
     fn the_shared_identity_and_block_steps_are_bounded_by_the_entry() {
-        let built = steps(SweepList::Narrowing, Vec::new());
+        let built = steps(SweepList::Narrowing, Vec::new(), LabelsExit::Truncate);
         let step = |name: &str| built.iter().find(|s| s.table == name).cloned().unwrap_or_else(|| panic!("{name}"));
         for (name, col) in [("blocks", "b.rev >="), ("list_blocks", "lb.rev >="), ("actors", "a.indexed_at >="), ("did_cache", "dc.fetched_at >=")] {
             let s = step(name);

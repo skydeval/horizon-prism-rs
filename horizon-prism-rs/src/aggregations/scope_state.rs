@@ -415,7 +415,7 @@ impl ScopeState {
     /// The crawl's inputs on the read path: the on-demand queue (none when
     /// `[full] on_demand = "off"`) and whether a history cutoff is set.
     /// Third-party labels for views in breadth Full.
-    pub async fn set_external_labels(&self, labels: Arc<crate::indexing::labels::ExternalLabels>) {
+    pub async fn set_full_labels(&self, labels: Arc<crate::indexing::labels::ExternalLabels>) {
         self.write_guard().await.full.labels = Some(labels);
     }
 

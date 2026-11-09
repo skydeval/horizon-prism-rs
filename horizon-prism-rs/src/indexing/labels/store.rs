@@ -1,4 +1,4 @@
-//! `external_labels` rows: a subscription's writes and the views' reads.
+//! `full_labels` rows: a subscription's writes and the views' reads.
 
 use std::collections::HashMap;
 
@@ -93,10 +93,10 @@ pub fn newest_per_key(rows: Vec<Row>) -> Vec<Row> {
     out
 }
 
-const UPSERT_SQL: &str = "INSERT INTO external_labels (src, uri, cid, val, neg, cts, exp, sig, verified) \
+const UPSERT_SQL: &str = "INSERT INTO full_labels (src, uri, cid, val, neg, cts, exp, sig, verified) \
      SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::bool[], $6::timestamptz[], $7::timestamptz[], $8::bytea[], $9::bool[]) \
      ON CONFLICT (src, uri, cid, val) DO UPDATE SET neg = EXCLUDED.neg, cts = EXCLUDED.cts, exp = EXCLUDED.exp, sig = EXCLUDED.sig, verified = EXCLUDED.verified \
-     WHERE EXCLUDED.cts >= external_labels.cts";
+     WHERE EXCLUDED.cts >= full_labels.cts";
 
 /// Store `rows` (newest `cts` per key wins, against stored rows too).
 ///
@@ -176,7 +176,7 @@ type StoredRow = (String, String, String, String, DateTime<Utc>, Option<DateTime
 /// Database errors.
 pub async fn applied(pool: &PgPool, subjects: &[String], srcs: &[String]) -> Result<Vec<Row>, sqlx::Error> {
     let rows: Vec<StoredRow> = sqlx::query_as(
-        "SELECT src, uri, cid, val, cts, exp, sig FROM external_labels \
+        "SELECT src, uri, cid, val, cts, exp, sig FROM full_labels \
          WHERE uri = ANY($1) AND src = ANY($2) AND verified AND NOT neg AND (exp IS NULL OR exp > now()) \
          ORDER BY uri, src, cts, val",
     )
@@ -197,7 +197,7 @@ pub async fn applied(pool: &PgPool, subjects: &[String], srcs: &[String]) -> Res
 ///
 /// Database errors.
 pub async fn unverified_subjects(pool: &PgPool, subjects: &[String], srcs: &[String]) -> Result<Vec<(String, String)>, sqlx::Error> {
-    sqlx::query_as("SELECT DISTINCT src, uri FROM external_labels WHERE NOT verified AND src = ANY($2) AND uri = ANY($1)")
+    sqlx::query_as("SELECT DISTINCT src, uri FROM full_labels WHERE NOT verified AND src = ANY($2) AND uri = ANY($1)")
         .bind(subjects)
         .bind(srcs)
         .fetch_all(pool)
@@ -220,14 +220,14 @@ pub async fn settle_unverified(pool: &PgPool, src: &str, uri: &str, current: &[V
         .filter_map(|l| Some(format!("{}\u{1f}{}", l.get("cid").and_then(Value::as_str).unwrap_or_default(), l.get("val")?.as_str()?)))
         .collect();
     let mut tx = pool.begin().await?;
-    let kept = sqlx::query("UPDATE external_labels SET verified = true WHERE src = $1 AND uri = $2 AND NOT verified AND NOT neg AND (cid || chr(31) || val) = ANY($3)")
+    let kept = sqlx::query("UPDATE full_labels SET verified = true WHERE src = $1 AND uri = $2 AND NOT verified AND NOT neg AND (cid || chr(31) || val) = ANY($3)")
         .bind(src)
         .bind(uri)
         .bind(&served)
         .execute(&mut *tx)
         .await?
         .rows_affected();
-    let gone = sqlx::query("DELETE FROM external_labels WHERE src = $1 AND uri = $2 AND NOT verified")
+    let gone = sqlx::query("DELETE FROM full_labels WHERE src = $1 AND uri = $2 AND NOT verified")
         .bind(src)
         .bind(uri)
         .execute(&mut *tx)
@@ -243,7 +243,7 @@ pub async fn settle_unverified(pool: &PgPool, src: &str, uri: &str, current: &[V
 ///
 /// Database errors.
 pub async fn unverified_counts(pool: &PgPool) -> Result<Vec<(String, i64)>, sqlx::Error> {
-    sqlx::query_as("SELECT src, count(DISTINCT uri) FROM external_labels WHERE NOT verified GROUP BY src ORDER BY src").fetch_all(pool).await
+    sqlx::query_as("SELECT src, count(DISTINCT uri) FROM full_labels WHERE NOT verified GROUP BY src ORDER BY src").fetch_all(pool).await
 }
 
 /// The stored CIDs of the posts that `rows` with a record version name.

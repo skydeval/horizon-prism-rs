@@ -1038,7 +1038,7 @@ impl Hydrator {
                         normalize::add_missing_labels(out.entry(subject).or_default(), labels);
                     }
                 }
-                Err(error) => tracing::warn!(event = "external_labels_read_failed", %error, "reading third-party labels failed; views carry the operator's labels only"),
+                Err(error) => tracing::warn!(event = "full_labels_read_failed", %error, "reading third-party labels failed; views carry the operator's labels only"),
             }
         }
         Ok(out)

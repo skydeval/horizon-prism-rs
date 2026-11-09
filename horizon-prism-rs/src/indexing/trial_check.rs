@@ -281,6 +281,10 @@ impl PublicIndexing {
         if keys > 0 {
             full_left.push(format!("worker_state {keys} keys"));
         }
+        // How the exit emptied full's labels: the table is checked above
+        // either way.
+        let labels_start = super::trial::labels_at_start(&self.pool, id).await?;
+        let labels_exit = super::narrowing::LabelsExit::of_start(labels_start);
         // 5. Sanity: full admitted ops, yet nothing was recorded.
         let full_decisions = t.counters.get("full_decisions").and_then(Value::as_u64).unwrap_or(0).max(self.trial_counters().full_decisions());
         let sane = !(full_decisions > 0 && recorded_total == 0);
@@ -297,7 +301,7 @@ impl PublicIndexing {
             causes.push(format!("full admitted {full_decisions} ops but the record is empty: the record was not being written"));
         }
         let passed = causes.is_empty();
-        let words = result_words(&t, &counts, (posts, accounts, repaired), &full_left, &report, &causes);
+        let words = result_words(&t, &counts, (posts, accounts, repaired), &full_left, (labels_start, labels_exit), &report, &causes);
         let faults = Counts::total(&counts.missed) + Counts::total(&counts.unexplained);
         for (result, n) in [
             ("removed", counts.removed),
@@ -317,6 +321,7 @@ impl PublicIndexing {
             "full_decisions": full_decisions,
             "counts_checked": { "posts": posts, "accounts": accounts, "repaired": repaired },
             "full_only_left": full_left,
+            "full_labels": { "rows_at_start": labels_start, "emptied_by": labels_exit.as_str() },
             "report": report,
             "faults": faults,
             "warning": faults > 0,
@@ -704,7 +709,15 @@ fn cause_words(c: Option<&str>) -> &'static str {
 }
 
 /// The result in plain words.
-fn result_words(t: &Trial, c: &Counts, counted: (u64, u64, u64), full_left: &[String], report: &Value, causes: &[String]) -> String {
+fn result_words(
+    t: &Trial,
+    c: &Counts,
+    counted: (u64, u64, u64),
+    full_left: &[String],
+    labels: (Option<i64>, super::narrowing::LabelsExit),
+    report: &Value,
+    causes: &[String],
+) -> String {
     let from = t.from.as_str();
     let to = t.to.as_str();
     let recorded_total: u64 = c.recorded.values().sum();
@@ -773,6 +786,11 @@ fn result_words(t: &Trial, c: &Counts, counted: (u64, u64, u64), full_left: &[St
         n_words(accounts),
         if repaired == 0 { "all match".to_string() } else { format!("{repaired} repaired") }
     ));
+    out.push(match labels {
+        (_, super::narrowing::LabelsExit::Truncate) => "Full labels: none when the trial started; the exit truncated the table.".to_string(),
+        (Some(n), super::narrowing::LabelsExit::Delete) => format!("Full labels: {} when the trial started, left by an earlier full; the exit deleted every row.", n_words(u64::try_from(n).unwrap_or(0))),
+        (None, super::narrowing::LabelsExit::Delete) => "Full labels: not in the baseline; the exit deleted every row.".to_string(),
+    });
     out.push(if full_left.is_empty() { "Full-only tables: empty.".to_string() } else { format!("Full-only tables: not empty ({}).", full_left.join(", ")) });
     let dids = report.get("dids_added").and_then(Value::as_u64).unwrap_or(0);
     let dids_bytes = report.get("dids_bytes").and_then(Value::as_u64).unwrap_or(0);

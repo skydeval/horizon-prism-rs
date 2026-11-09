@@ -338,6 +338,81 @@ async fn a_trial_from_kryphocron_only_fills_then_drains() {
 }
 
 // ---------------------------------------------------------------------
+// Full's labels at the exit.
+// ---------------------------------------------------------------------
+
+async fn add_labels(p: &PgPool, vals: &[&str]) {
+    for v in vals {
+        sqlx::query("INSERT INTO full_labels (src, uri, val, cts, verified) VALUES ('did:plc:examplelabeleraaaaaaaaa', $1, $2, now(), true)")
+            .bind(post_uri(STRANGER, "3kaaaaaaaab22"))
+            .bind(v)
+            .execute(p)
+            .await
+            .expect("label");
+    }
+}
+
+/// The table's storage file: a truncate gives it a new one, a delete keeps
+/// it.
+async fn labels_file(p: &PgPool) -> i64 {
+    count(p, "SELECT relfilenode::bigint FROM pg_class WHERE relname = 'full_labels' AND relnamespace = current_schema()::regnamespace").await
+}
+
+/// A trial that started with no full labels: its exit truncates the table
+/// it wrote, and the check passes and says so.
+#[tokio::test]
+async fn a_trial_that_started_without_full_labels_truncates_them() {
+    let Some(db) = fresh_db("trial_labels_truncate").await else {
+        return;
+    };
+    let p = &db.pool;
+    let (pi, scope, _w) = stack(p, ScopeValue::Community, None).await;
+    pi.start_trial(bounds(), "cli").await.expect("start");
+    add_labels(p, &["spam", "rude"]).await;
+    let file = labels_file(p).await;
+    assert_eq!(pi.end_trial("manual").await.expect("end").expect("ended").action, "narrowing");
+    settled(&scope).await;
+    let (state, result) = last_trial(p).await;
+    assert_eq!(state, "passed", "{result}");
+    assert_eq!(count(p, "SELECT count(*) FROM full_labels").await, 0);
+    assert_ne!(labels_file(p).await, file, "truncated, not deleted");
+    assert_eq!(result["full_labels"], json!({"rows_at_start": 0, "emptied_by": "truncate"}), "{result}");
+    let words = result["words"].as_str().unwrap_or_default();
+    assert!(words.contains("Full labels: none when the trial started; the exit truncated the table.") && words.contains("Full-only tables: empty."), "{words}");
+    db.drop_db().await;
+}
+
+/// A trial that started with full labels an earlier full left: its exit
+/// deletes every row instead (a drain from kryphocron_only here), and the
+/// check passes and says so.
+#[tokio::test]
+async fn a_trial_that_started_with_full_labels_deletes_them() {
+    let Some(db) = fresh_db("trial_labels_delete").await else {
+        return;
+    };
+    let p = &db.pool;
+    let (pi, scope, w) = stack(p, ScopeValue::KryphocronOnly, Some(now() - TimeDelta::days(3))).await;
+    add_labels(p, &["old"]).await;
+    pi.start_trial(bounds(), "cli").await.expect("start");
+    let backfill = ApplyOptions { source: WriteSource::Backfill, live: false, ..LIVE };
+    w.apply(B, &tid(1), &[post("3kaaaaaaaab22", "filled")], backfill).await.expect("fill");
+    eventually("on, full", async || scope.public_mode() == PublicMode::On).await;
+    add_labels(p, &["spam", "rude"]).await;
+    let file = labels_file(p).await;
+    assert_eq!(pi.end_trial("manual").await.expect("end").expect("ended").action, "draining");
+    assert_eq!(transition(p).await["sweep"]["list"], "trial_full");
+    settled(&scope).await;
+    let (state, result) = last_trial(p).await;
+    assert_eq!(state, "passed", "{result}");
+    assert_eq!(count(p, "SELECT count(*) FROM full_labels").await, 0);
+    assert_eq!(labels_file(p).await, file, "deleted row by row");
+    assert_eq!(result["full_labels"], json!({"rows_at_start": 1, "emptied_by": "delete"}), "{result}");
+    let words = result["words"].as_str().unwrap_or_default();
+    assert!(words.contains("Full labels: 1 when the trial started, left by an earlier full; the exit deleted every row.") && words.contains("Full-only tables: empty."), "{words}");
+    db.drop_db().await;
+}
+
+// ---------------------------------------------------------------------
 // What is recorded, and quiet.
 // ---------------------------------------------------------------------
 

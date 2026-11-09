@@ -4,7 +4,7 @@
 -- re-issue replaces the row; a negation is kept as a row with `neg` set.
 -- A label whose signature did not verify is kept with `verified` false and
 -- never applied.
-CREATE TABLE external_labels (
+CREATE TABLE full_labels (
   src      text        NOT NULL,
   uri      text        NOT NULL,
   cid      text        NOT NULL DEFAULT '',
@@ -16,5 +16,5 @@ CREATE TABLE external_labels (
   verified boolean     NOT NULL,
   PRIMARY KEY (src, uri, cid, val)
 );
-CREATE INDEX external_labels_uri ON external_labels (uri, src);
-CREATE INDEX external_labels_unverified ON external_labels (src, uri) WHERE NOT verified;
+CREATE INDEX full_labels_uri ON full_labels (uri, src);
+CREATE INDEX full_labels_unverified ON full_labels (src, uri) WHERE NOT verified;

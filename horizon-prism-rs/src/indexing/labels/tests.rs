@@ -271,7 +271,7 @@ async fn labels_from_the_tip_merge_by_accepted_labeler() {
     let old = post_at(started - chrono::TimeDelta::days(400), 2);
     let now = Utc::now();
     f.frame(1, vec![signed(&f.key, label(LABELER, &fresh, "spam", now, false))]);
-    f.until("SELECT count(*) FROM external_labels", 1).await;
+    f.until("SELECT count(*) FROM full_labels", 1).await;
     // A label the labeler issued before the subscription, for an older post.
     f.set(|w| {
         w.held.insert(LABELER.into(), vec![signed(&f.key, label(LABELER, &old, "rude", started - chrono::TimeDelta::days(300), false))]);
@@ -297,8 +297,8 @@ async fn labels_from_the_tip_merge_by_accepted_labeler() {
     let reads = f.world.lock().expect("world").doc_reads.get(LABELER).copied().unwrap_or(0);
     f.frame(2, vec![signed(&f.key, label(OTHER, &fresh, "forged", Utc::now(), false)), signed(&f.other_key, label(LABELER, &fresh, "badsig", Utc::now(), false))]);
     f.frame(3, vec![signed(&f.key, label(LABELER, &fresh, "spam", Utc::now() + chrono::TimeDelta::seconds(1), true))]);
-    f.until("SELECT count(*) FROM external_labels WHERE neg", 1).await;
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM external_labels WHERE val IN ('forged', 'badsig') OR src <> $1").bind(LABELER).fetch_one(&f.pool).await.expect("count"), 0);
+    f.until("SELECT count(*) FROM full_labels WHERE neg", 1).await;
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM full_labels WHERE val IN ('forged', 'badsig') OR src <> $1").bind(LABELER).fetch_one(&f.pool).await.expect("count"), 0);
     assert!(f.world.lock().expect("world").doc_reads.get(LABELER).copied().unwrap_or(0) > reads, "the key was read again");
     // The negation removed the label.
     let got = f.view(std::slice::from_ref(&fresh), Some(LABELER)).await;
@@ -314,7 +314,7 @@ async fn labels_from_the_tip_merge_by_accepted_labeler() {
     f.frame(4, vec![signed(&f.key, label(LABELER, &fresh, "late", Utc::now(), false))]);
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(f.view(std::slice::from_ref(&fresh), Some(&format!("{LABELER}, {OTHER}"))).await.is_empty());
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM external_labels WHERE val = 'late'").fetch_one(&f.pool).await.expect("count"), 0);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM full_labels WHERE val = 'late'").fetch_one(&f.pool).await.expect("count"), 0);
     db.drop_db().await;
 }
 
@@ -358,7 +358,7 @@ async fn a_replay_checks_old_keys_and_keeps_unverified_labels_unapplied() {
     f.start();
     f.connected(1).await;
     assert_eq!(f.world.lock().expect("world").connections, [Some(0)], "a replay starts at the first label");
-    f.until("SELECT count(*) FROM external_labels", 3).await;
+    f.until("SELECT count(*) FROM full_labels", 3).await;
     for _ in 0..100 {
         if f.labels.progress(LABELER).is_some_and(|p| p.caught_up) {
             break;
@@ -366,7 +366,7 @@ async fn a_replay_checks_old_keys_and_keeps_unverified_labels_unapplied() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(f.labels.progress(LABELER).is_some_and(|p| p.caught_up), "a fresh label ends the replay");
-    let verified: Vec<(String, bool)> = sqlx::query_as("SELECT val, verified FROM external_labels ORDER BY val").fetch_all(&f.pool).await.expect("rows");
+    let verified: Vec<(String, bool)> = sqlx::query_as("SELECT val, verified FROM full_labels ORDER BY val").fetch_all(&f.pool).await.expect("rows");
     assert_eq!(verified, [("forgotten".to_string(), false), ("fresh".to_string(), true), ("issued-before".to_string(), true)]);
     f.queried();
     let got = f.view(&[p1.clone(), p2.clone(), p3.clone()], Some(LABELER)).await;
@@ -377,7 +377,7 @@ async fn a_replay_checks_old_keys_and_keeps_unverified_labels_unapplied() {
     // Compared with the labeler's answer, the unverified label it no longer
     // serves is settled: the subject stops counting, and reads stop asking.
     assert!(super::store::unverified_counts(&f.pool).await.expect("counts").is_empty());
-    let rows: Vec<String> = sqlx::query_scalar("SELECT val FROM external_labels ORDER BY val").fetch_all(&f.pool).await.expect("rows");
+    let rows: Vec<String> = sqlx::query_scalar("SELECT val FROM full_labels ORDER BY val").fetch_all(&f.pool).await.expect("rows");
     assert_eq!(rows, ["fresh", "issued-before"]);
     f.view(std::slice::from_ref(&p2), Some(LABELER)).await;
     assert!(f.queried().is_empty(), "nothing unverified is left to ask about");
@@ -411,9 +411,9 @@ async fn the_newest_label_per_key_wins() {
     let mut conn = p.acquire().await.expect("conn");
     super::store::upsert(&mut conn, vec![row("spam", 10, false), row("spam", 5, true), row("rude", 1, false)]).await.expect("upsert");
     super::store::upsert(&mut conn, vec![row("spam", 3, true), row("rude", 2, true)]).await.expect("upsert");
-    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT val, neg FROM external_labels ORDER BY val").fetch_all(p).await.expect("rows");
+    let rows: Vec<(String, bool)> = sqlx::query_as("SELECT val, neg FROM full_labels ORDER BY val").fetch_all(p).await.expect("rows");
     assert_eq!(rows, [("rude".to_string(), true), ("spam".to_string(), false)]);
-    exec(p, "UPDATE external_labels SET exp = now() - interval '1 second' WHERE val = 'spam'").await;
+    exec(p, "UPDATE full_labels SET exp = now() - interval '1 second' WHERE val = 'spam'").await;
     assert!(super::store::applied(p, &[AUTHOR.to_string()], &[LABELER.to_string()]).await.expect("applied").is_empty(), "an expired label is not applied");
     assert!(!super::asked_about(&format!("at://{AUTHOR}/tools.kryphocron.feed.postPrivate/3k")));
     assert!(super::asked_about(&format!("at://{AUTHOR}/app.bsky.feed.post/3k")) && super::asked_about(AUTHOR));
@@ -422,8 +422,7 @@ async fn the_newest_label_per_key_wins() {
 
 /// A label naming a record version applies to that version only, and one
 /// naming a blob of the record applies to the record; leaving
-/// full removes the labels of subjects no longer stored (a narrowing) and
-/// every label (a trial's exit).
+/// full (a narrowing, a drain, a trial's exit) removes every label.
 #[tokio::test]
 async fn versions_and_the_narrowing() {
     let Some(db) = fresh_db("labels_narrowing").await else {
@@ -464,19 +463,31 @@ async fn versions_and_the_narrowing() {
     vals.sort_unstable();
     assert_eq!(vals, ["a", "b", "h"], "a label of another version does not apply; one naming a blob of the record does");
     assert!(f.queried().is_empty());
-    let run = |list: crate::indexing::public_mode::SweepList| async move {
-        let step = crate::indexing::narrowing::steps(list, Vec::new()).into_iter().find(|s| s.table == "external_labels").expect("step");
+    let run = |list: crate::indexing::public_mode::SweepList, exit: crate::indexing::narrowing::LabelsExit| async move {
+        let step = crate::indexing::narrowing::steps(list, Vec::new(), exit).into_iter().find(|s| s.table == "full_labels").expect("step");
         loop {
             if sqlx::query(&step.sql).execute(p).await.expect(&step.sql).rows_affected() == 0 {
                 break;
             }
         }
     };
-    run(crate::indexing::public_mode::SweepList::Narrowing).await;
-    let left: Vec<String> = sqlx::query_scalar("SELECT val FROM external_labels ORDER BY val").fetch_all(p).await.expect("left");
-    assert_eq!(left, ["a", "b", "c", "d", "g", "h"], "the stored post, the stored account and its other records keep theirs");
-    run(crate::indexing::public_mode::SweepList::TrialNarrowing).await;
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM external_labels").fetch_one(p).await.expect("count"), 0);
+    let count = || async { sqlx::query_scalar::<_, i64>("SELECT count(*) FROM full_labels").fetch_one(p).await.expect("count") };
+    let mut conn = p.acquire().await.expect("conn");
+    let all = vec![row(&post, "", "a"), row(AUTHOR, "", "d"), row(&gone, "", "e"), row(STRANGER, "", "f")];
+    // Leaving full empties the table whole, stored subjects or not.
+    for list in [crate::indexing::public_mode::SweepList::Narrowing, crate::indexing::public_mode::SweepList::Full] {
+        super::store::upsert(&mut conn, all.clone()).await.expect("upsert");
+        assert!(count().await > 0);
+        run(list, crate::indexing::narrowing::LabelsExit::Delete).await;
+        assert_eq!(count().await, 0, "{list:?}");
+    }
+    // A trial's exit, row by row and truncated.
+    for exit in [crate::indexing::narrowing::LabelsExit::Delete, crate::indexing::narrowing::LabelsExit::Truncate] {
+        super::store::upsert(&mut conn, all.clone()).await.expect("upsert");
+        run(crate::indexing::public_mode::SweepList::TrialNarrowing, exit).await;
+        assert_eq!(count().await, 0, "{exit:?}");
+    }
+    drop(conn);
     db.drop_db().await;
 }
 

@@ -681,7 +681,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         let settings = crate::indexing::labels::Settings::from_config(&cfg.file.full);
         let upstream = crate::indexing::labels::upstream::Upstream::new(nets.internal().client().clone(), labelers.clone(), settings.cache_secs);
         let labels = crate::indexing::labels::ExternalLabels::new(settings, upstream);
-        scope.set_external_labels(Arc::clone(&labels)).await;
+        scope.set_full_labels(Arc::clone(&labels)).await;
         let subscriber = crate::indexing::labels::subscriber::Subscriber::new(
             pool.clone(),
             scope.clone(),

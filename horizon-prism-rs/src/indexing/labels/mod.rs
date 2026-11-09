@@ -2,7 +2,7 @@
 //!
 //! Under `[full] labels = "subscribe"` every labeler of `label_sources` is
 //! followed through `com.atproto.label.subscribeLabels` and its labels are
-//! stored in `external_labels`; views merge them for the labelers a request
+//! stored in `full_labels`; views merge them for the labelers a request
 //! accepts (`atproto-accept-labelers`). A labeler the request accepts that
 //! is not subscribed, a subscription still replaying its history, the
 //! subjects older than a subscription that started at the tip, and the
@@ -40,23 +40,23 @@ use crate::config::{FullConfig, FullLabels};
 
 /// `worker_state` key: each subscription's progress, by labeler DID.
 pub const STATE_KEY: &str = "full_labels";
-/// `external_labels_lag_seconds{src}`: how far behind now the newest label
+/// `full_labels_lag_seconds{src}`: how far behind now the newest label
 /// a subscription stored was issued.
-pub const METRIC_LAG: &str = "external_labels_lag_seconds";
-/// `external_labels_rejected_total{src,reason}`: labels a subscription
+pub const METRIC_LAG: &str = "full_labels_lag_seconds";
+/// `full_labels_rejected_total{src,reason}`: labels a subscription
 /// dropped (`src`: not its labeler; `signature`: a live label that did not
 /// verify; `malformed`).
-pub const METRIC_REJECTED: &str = "external_labels_rejected_total";
-/// `external_labels_stored_total{src,key}`: labels a subscription stored, by
+pub const METRIC_REJECTED: &str = "full_labels_rejected_total";
+/// `full_labels_stored_total{src,key}`: labels a subscription stored, by
 /// the key that verified them (`current`, `history`) or `unverified`.
-pub const METRIC_STORED: &str = "external_labels_stored_total";
-/// `external_labels_upstream_total{src,result}`: subjects read from a
+pub const METRIC_STORED: &str = "full_labels_stored_total";
+/// `full_labels_upstream_total{src,result}`: subjects read from a
 /// labeler's `queryLabels` (`cached`, `read`, `failed`).
-pub const METRIC_UPSTREAM: &str = "external_labels_upstream_total";
+pub const METRIC_UPSTREAM: &str = "full_labels_upstream_total";
 
-/// `external_labels_unverified_settled_total{src}`: unverified labels
+/// `full_labels_unverified_settled_total{src}`: unverified labels
 /// settled by the labeler's own current answer for their subject.
-pub const METRIC_UNVERIFIED_SETTLED: &str = "external_labels_unverified_settled_total";
+pub const METRIC_UNVERIFIED_SETTLED: &str = "full_labels_unverified_settled_total";
 
 /// `[full]`'s label options as they apply: `subscribe` with no source is
 /// `upstream`.

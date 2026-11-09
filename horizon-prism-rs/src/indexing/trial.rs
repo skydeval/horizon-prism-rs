@@ -484,7 +484,7 @@ pub const FULL_ONLY: [&str; 10] = [
     "full_gaps",
     "full_incomplete",
     "crawl_identity",
-    "external_labels",
+    "full_labels",
 ];
 
 /// The coverage table: every table of the schema in one class. A table in
@@ -593,6 +593,19 @@ pub async fn table_figures(pool: &PgPool) -> Result<BTreeMap<String, Value>, sql
         out.insert(t, json!({ "rows": rows, "bytes": bytes, "at": rfc3339(&now()) }));
     }
     Ok(out)
+}
+
+/// The `full_labels` rows trial `id`'s baseline counted, if it has one.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn labels_at_start(pool: &PgPool, id: i64) -> Result<Option<i64>, sqlx::Error> {
+    let rows: Option<Option<i64>> = sqlx::query_scalar("SELECT (baseline #>> '{tables,full_labels,rows}')::bigint FROM full_trials WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(rows.flatten())
 }
 
 /// `pg_database_size` of the current database.
@@ -884,6 +897,22 @@ impl PublicIndexing {
             drop(self.spawn(task));
         }
         Ok(Some(applied))
+    }
+
+    /// How this trial's exit empties `full_labels`, from the rows its
+    /// baseline counted. Not known (no trial, no baseline, a read error):
+    /// every row is deleted, which empties it all the same.
+    pub(super) async fn trial_labels_exit(&self) -> super::narrowing::LabelsExit {
+        let Some(id) = self.trial().await.map(|t| t.id) else {
+            return super::narrowing::LabelsExit::Delete;
+        };
+        match labels_at_start(&self.pool, id).await {
+            Ok(rows) => super::narrowing::LabelsExit::of_start(rows),
+            Err(error) => {
+                tracing::warn!(event = "full_trial_labels_read_failed", %error, "reading the trial's baseline failed; its labels are deleted row by row");
+                super::narrowing::LabelsExit::Delete
+            }
+        }
     }
 
     /// Write the counters into the stored trial, conditional on the

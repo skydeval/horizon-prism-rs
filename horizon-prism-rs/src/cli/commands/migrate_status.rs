@@ -160,7 +160,7 @@ mod tests {
             // Full trials and their record.
             "0063_full_trials",
             "0064_full_crawl",
-            "0065_external_labels",
+            "0065_full_labels",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));
