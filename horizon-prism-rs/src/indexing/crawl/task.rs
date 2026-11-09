@@ -339,6 +339,12 @@ impl Crawler {
             if entered.take().is_some() {
                 self.running.store(0, Ordering::SeqCst);
                 self.note(|p| p.running = false);
+                // No group has a history outside full.
+                for g in crate::config::FullGroup::ALL {
+                    for state in [super::groups::CRAWLING, super::groups::PAUSED, super::groups::COMPLETE, super::groups::REMOVED] {
+                        metrics::gauge!(super::METRIC_GROUP_HISTORY, "group" => g.as_str(), "state" => state).set(0.0);
+                    }
+                }
                 tracing::info!(event = "full_crawl_stopped", "the crawl stopped: full indexing is off");
             }
             *s_seeded = false;
