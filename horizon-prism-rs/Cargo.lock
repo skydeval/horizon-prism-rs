@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "horizon-prism-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",

@@ -11,6 +11,10 @@ released.
 
 ## [Unreleased]
 
+## [0.2.1] (2026-11-10)
+
+Full indexing throughput and fixes.
+
 ### Added
 
 - `[db] pool_size`: `"auto"` (the default) sizes the database pool from the
