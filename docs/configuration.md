@@ -48,7 +48,7 @@ Only these stop a start (exit 78):
 | `[full]`, `[full_crawl]`, `[full_trial]` | Full network indexing: its record groups, where blocks, counts and labels come from, suspended accounts, the history crawl, and a trial's limits. See [indexing-and-scope.md](design/indexing-and-scope.md#full-network). |
 | `[scope]` | Which accounts beyond members are indexed, and for how long. |
 | `[community]` | Auto-enroll, member cap, readiness retry hints. |
-| `[firehose]` | Stream names, batch size, dead letters, which relays are private relays; for full indexing, writer lanes, dedupe of relay copies, relays whose old reader runs a filter, and fallback URLs of relays. |
+| `[firehose]` | Stream names, batch size, dead letters, which relays are private relays; for full indexing, writer lanes and the commits they apply in one transaction, dedupe of relay copies, relays whose old reader runs a filter, and fallback URLs of relays. |
 | `[identity]` | PLC directory, caches, optional Lodestar, the identity refresher's concurrency and queue bound. |
 | `[private_read]`, `[private_notify]`, `[private_push]`, `[private_search]`, `[private_any_pds]` | [kryphocron](design/kryphocron.md) reads, notifications, push and search. |
 | `[sync]`, `[backfill]`, `[index_request]` | Load on PDSes: head checks, backfill rate, catch-up. |

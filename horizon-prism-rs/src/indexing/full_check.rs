@@ -26,7 +26,7 @@ use crate::config::{AppConfig, FullGroup, ScopePolicy};
 use crate::firehose::consumer::{CONFLICT_RETRIES, lane_of};
 use crate::firehose::stream::{Event, decode, parse_entry};
 use crate::firehose::tier::CopyTier;
-use crate::firehose::writer::{Action, ApplyOptions, RawOp, WriteSource, Writer};
+use crate::firehose::writer::{Action, ApplyOptions, LiveCommit, RawOp, WriteSource, Writer};
 use crate::indexing::{Breadth, PublicMode, PublicState};
 
 /// What to seed and apply.
@@ -39,6 +39,8 @@ pub struct Params {
     /// Commits applied per lane count.
     pub commits: u32,
     pub lanes: Vec<u32>,
+    /// Commits per writer transaction.
+    pub lane_batch: u32,
     /// How long the relays' rate is sampled for.
     pub sample_secs: u32,
     /// Keep the scratch database for a look afterwards.
@@ -47,18 +49,47 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { accounts: 200_000, posts: 500_000, likes: 2_000_000, follows: 500_000, commits: 20_000, lanes: vec![1, 2, 4, 8], sample_secs: 10, keep: false }
+        Self { accounts: 200_000, posts: 500_000, likes: 2_000_000, follows: 500_000, commits: 20_000, lanes: vec![1, 2, 4, 8], lane_batch: 64, sample_secs: 10, keep: false }
     }
 }
 
 /// One lane count's run.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LaneRun {
     pub lanes: u32,
     pub commits: u32,
     pub secs: f64,
     pub per_sec: f64,
     pub retries: u64,
+    /// Lane time per commit in each writer phase, in seconds.
+    pub phases: Vec<(String, f64)>,
+    /// What the scratch database's sessions waited on, sampled.
+    pub waits: Vec<(crate::db::waits::WaitClass, u64)>,
+}
+
+/// The CLI process's metrics, read back for the profile; none is installed
+/// before the check, so it installs its own.
+fn recorder() -> Option<metrics_exporter_prometheus::PrometheusHandle> {
+    static HANDLE: std::sync::OnceLock<Option<metrics_exporter_prometheus::PrometheusHandle>> = std::sync::OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+            let handle = recorder.handle();
+            metrics::set_global_recorder(recorder).ok().map(|()| handle)
+        })
+        .clone()
+}
+
+/// Each writer phase's seconds so far.
+fn phase_sums(handle: Option<&metrics_exporter_prometheus::PrometheusHandle>) -> std::collections::BTreeMap<String, f64> {
+    let Some(h) = handle else {
+        return std::collections::BTreeMap::new();
+    };
+    let name = format!("{}_sum", crate::firehose::writer::METRIC_PHASE);
+    crate::admin::health::parse(&h.render(), |n| n == name)
+        .into_iter()
+        .filter_map(|s| Some((s.label("phase")?.to_string(), s.value)))
+        .collect()
 }
 
 /// The relays' input, from the stream.
@@ -142,9 +173,36 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
     let seed_secs = seeded.elapsed().as_secs_f64();
     let writer = full_writer(&pool).await;
     let mut runs = Vec::new();
+    let handle = recorder();
     for (i, lanes) in params.lanes.iter().copied().filter(|l| *l > 0).enumerate() {
         let commits = workload(params, u64::try_from(i).unwrap_or(0));
-        runs.push(apply(&writer, commits, lanes).await?);
+        let before = phase_sums(handle.as_ref());
+        // What the database waits on, sampled while the run goes.
+        let tally = std::sync::Arc::new(crate::db::waits::WaitTally::default());
+        let sampling = {
+            let (pool, tally) = (pool.clone(), std::sync::Arc::clone(&tally));
+            tokio::spawn(async move {
+                loop {
+                    let _ = crate::db::waits::sample(&pool, &tally).await;
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+        };
+        let mut run = apply(&writer, commits, lanes, params.lane_batch).await;
+        sampling.abort();
+        if let Ok(run) = &mut run {
+            let after = phase_sums(handle.as_ref());
+            let n = f64::from(run.commits.max(1));
+            run.phases = crate::firehose::writer::Phase::ALL
+                .iter()
+                .map(|p| {
+                    let k = p.as_str();
+                    (k.to_string(), (after.get(k).copied().unwrap_or(0.0) - before.get(k).copied().unwrap_or(0.0)).max(0.0) / n)
+                })
+                .collect();
+            run.waits = tally.snapshot().into_iter().collect();
+        }
+        runs.push(run?);
     }
     let range = crate::aggregations::rebuild::repair_range(&pool, 1, 1 + crate::aggregations::rebuild::KEYSET_RANGE)
         .await
@@ -361,9 +419,11 @@ pub fn workload(p: &Params, round: u64) -> Vec<Synthetic> {
         .collect()
 }
 
-/// Apply `commits` with `lanes` lanes, each repo always on one lane; the
-/// rate is commits over wall time.
-async fn apply(writer: &Writer, commits: Vec<Synthetic>, lanes: u32) -> Result<LaneRun, String> {
+/// Apply `commits` with `lanes` lanes, each repo always on one lane, in
+/// writer transactions of at most `batch` commits; the rate is commits over
+/// wall time.
+async fn apply(writer: &Writer, commits: Vec<Synthetic>, lanes: u32, batch: u32) -> Result<LaneRun, String> {
+    let batch = usize::try_from(batch).unwrap_or(1).max(1);
     let n = usize::try_from(lanes).unwrap_or(1).max(1);
     let total = u32::try_from(commits.len()).unwrap_or(u32::MAX);
     let mut queues: Vec<Vec<Synthetic>> = (0..n).map(|_| Vec::new()).collect();
@@ -377,17 +437,26 @@ async fn apply(writer: &Writer, commits: Vec<Synthetic>, lanes: u32) -> Result<L
         let writer = writer.clone();
         tasks.push(tokio::spawn(async move {
             let mut retries = 0u64;
-            for (repo, rev, ops) in queue {
+            let items: Vec<LiveCommit<'_>> = queue
+                .iter()
+                .map(|(repo, rev, ops)| LiveCommit { relay: Some("bsky"), repo, rev, since: None, ops, options, tier: CopyTier::Whole, stream: None })
+                .collect();
+            let mut pos = 0;
+            while pos < items.len() {
+                let end = (pos + batch).min(items.len());
                 let mut tries = 0;
                 loop {
-                    match writer.apply_copy(Some("bsky"), &repo, &rev, None, &ops, options, CopyTier::Whole).await {
+                    match writer.apply_batch(&items[pos..end], batch).await {
                         Err(t) if tries < CONFLICT_RETRIES && t.conflict().is_some() => {
                             tries += 1;
                             retries += 1;
                             tokio::time::sleep(Duration::from_millis(5 * u64::from(tries))).await;
                         }
                         Err(t) => return Err(t.to_string()),
-                        Ok(_) => break,
+                        Ok(reports) => {
+                            pos += reports.len().max(1);
+                            break;
+                        }
                     }
                 }
             }
@@ -399,7 +468,7 @@ async fn apply(writer: &Writer, commits: Vec<Synthetic>, lanes: u32) -> Result<L
         retries += t.await.map_err(|e| e.to_string())??;
     }
     let secs = started.elapsed().as_secs_f64();
-    Ok(LaneRun { lanes, commits: total, secs, per_sec: f64::from(total) / secs.max(1e-9), retries })
+    Ok(LaneRun { lanes, commits: total, secs, per_sec: f64::from(total) / secs.max(1e-9), retries, phases: Vec::new(), waits: Vec::new() })
 }
 
 fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, size: i64, range: Duration) -> String {
@@ -408,8 +477,8 @@ fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, siz
     let mb = size as f64 / 1e6;
     let _ = writeln!(
         out,
-        "Full check, advice only. Seeded {} accounts, {} posts, {} likes and {} follows in {seed_secs:.0} s ({mb:.0} MB), then applied {} commits per run with full admission and triggers on.",
-        p.accounts, p.posts, p.likes, p.follows, p.commits
+        "Full check, advice only. Seeded {} accounts, {} posts, {} likes and {} follows in {seed_secs:.0} s ({mb:.0} MB), then applied {} commits per run with full admission and triggers on, up to {} in one transaction.",
+        p.accounts, p.posts, p.likes, p.follows, p.commits, p.lane_batch
     );
     let need = input.map(|i| i.per_sec * i.unique_share);
     if let Some(i) = input {
@@ -430,6 +499,16 @@ fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, siz
             _ => String::new(),
         };
         let _ = writeln!(out, "  writer_lanes = {}: {:.0} commits a second ({} in {:.1} s, {} retried after a conflict){verdict}", r.lanes, r.per_sec, r.commits, r.secs, r.retries);
+        if r.phases.iter().any(|(_, s)| *s > 0.0) {
+            let phases: Vec<String> = r.phases.iter().filter(|(_, s)| *s > 0.0).map(|(p, s)| format!("{p} {:.2} ms", s * 1000.0)).collect();
+            let _ = writeln!(out, "    lane time per commit: {}", phases.join(", "));
+        }
+        let total: u64 = r.waits.iter().map(|(_, n)| n).sum();
+        if total > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let waits: Vec<String> = r.waits.iter().filter(|(_, n)| *n > 0).map(|(c, n)| format!("{} {:.0} %", c.as_str(), *n as f64 * 100.0 / total as f64)).collect();
+            let _ = writeln!(out, "    database sessions: {}", waits.join(", "));
+        }
     }
     if let Some(n) = need {
         match runs.iter().filter(|r| r.per_sec >= n * 1.25).map(|r| r.lanes).min() {
@@ -483,7 +562,7 @@ mod tests {
         let Some(db) = crate::test_support::fresh_db("full_check_scratch").await else {
             return;
         };
-        let p = Params { accounts: 500, posts: 1000, likes: 3000, follows: 1000, commits: 400, lanes: vec![1, 4], sample_secs: 1, keep: false };
+        let p = Params { accounts: 500, posts: 1000, likes: 3000, follows: 1000, commits: 400, lanes: vec![1, 4], lane_batch: 64, sample_secs: 1, keep: false };
         let writer = {
             seed(&db.pool, &p).await.expect("seed");
             full_writer(&db.pool).await
@@ -493,7 +572,7 @@ mod tests {
         let counted: Option<i64> = sqlx::query_scalar("SELECT sum(like_count)::bigint FROM post_counts").fetch_one(&db.pool).await.expect("counts");
         assert!(counted.unwrap_or(0) > 0, "the triggers counted the seeded likes");
         for (i, lanes) in [1u32, 4].into_iter().enumerate() {
-            let run = apply(&writer, workload(&p, i as u64), lanes).await.expect("apply");
+            let run = apply(&writer, workload(&p, i as u64), lanes, p.lane_batch).await.expect("apply");
             assert_eq!(run.commits, 400);
             assert!(run.per_sec > 0.0);
         }
@@ -503,10 +582,11 @@ mod tests {
             .await
             .expect("viral");
         assert!(viral >= 2 * 56, "the viral post took its share of likes: {viral}");
-        let text = words(&p, Some(Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0 }], 1.0, 1_000_000, Duration::from_millis(5));
+        let text = words(&p, Some(Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: vec![("commit".into(), 0.002)], waits: vec![(crate::db::waits::WaitClass::Wal, 3)] }], 1.0, 1_000_000, Duration::from_millis(5));
         assert!(text.contains("about 50 a second need applying") && text.contains("writer_lanes = 4 or more"), "{text}");
+        assert!(text.contains("lane time per commit: commit 2.00 ms") && text.contains("database sessions: wal 100 %"), "{text}");
         // The kept result reads back as a sentence.
-        let last = last_result(Some(&Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 1, commits: 400, secs: 10.0, per_sec: 40.0, retries: 0 }, LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0 }]);
+        let last = last_result(Some(&Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 1, commits: 400, secs: 10.0, per_sec: 40.0, retries: 0, phases: Vec::new(), waits: Vec::new() }, LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: Vec::new(), waits: Vec::new() }]);
         let sentence = last_sentence(&last);
         assert!(sentence.contains("1 lanes 40/s, 4 lanes 400/s") && sentence.contains("about 50 a second needed") && sentence.contains("advice: 4 lanes or more"), "{sentence}");
         db.drop_db().await;

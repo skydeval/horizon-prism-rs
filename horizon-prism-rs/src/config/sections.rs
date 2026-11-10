@@ -515,6 +515,9 @@ pub struct FirehoseConfig {
     pub writer_lanes: u32,
     /// The most entries one writer is handed at a time.
     pub lane_queue: u32,
+    /// The most commits a writer lane applies in one transaction; 1 is one
+    /// transaction per commit. A lane never waits to fill one.
+    pub lane_batch: u32,
 }
 
 /// `[firehose] dedupe`.
@@ -595,6 +598,7 @@ impl Default for FirehoseConfig {
             dedupe_repos: 2_000_000,
             writer_lanes: 1,
             lane_queue: 2000,
+            lane_batch: 64,
         }
     }
 }

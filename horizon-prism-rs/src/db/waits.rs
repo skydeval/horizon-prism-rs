@@ -14,6 +14,9 @@ use crate::aggregations::ScopeState;
 
 /// Metric: sampled backends by what they waited on.
 pub const METRIC_WAITS: &str = "db_wait_samples_total";
+/// Metric: writer transactions that deferred counts and left them for the
+/// commit to apply (a fault; the counts are still right).
+pub const METRIC_COUNTS_LEFT: &str = "writer_counts_left_total";
 /// How often the sampler looks.
 pub const INTERVAL: Duration = Duration::from_secs(1);
 
@@ -127,7 +130,7 @@ impl WaitTally {
 pub async fn sample(pool: &PgPool, tally: &WaitTally) -> Result<(), sqlx::Error> {
     let rows: Vec<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
         "SELECT state, wait_event_type, wait_event FROM pg_stat_activity \
-         WHERE application_name = $1 AND pid <> pg_backend_pid() AND backend_type = 'client backend'",
+         WHERE application_name = $1 AND datname = current_database() AND pid <> pg_backend_pid() AND backend_type = 'client backend'",
     )
     .bind(super::pool::APPLICATION_NAME)
     .fetch_all(pool)
@@ -167,9 +170,21 @@ pub fn spawn(pool: PgPool, scope: ScopeState) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut n: u64 = 0;
         loop {
             tick.tick().await;
             super::pool::sample_in_use(&pool);
+            // Once a minute: writer transactions whose deferred counts were
+            // applied only at commit.
+            if n.is_multiple_of(60) {
+                let left: Result<Option<i64>, sqlx::Error> =
+                    sqlx::query_scalar("SELECT (value #>> '{}')::bigint FROM worker_state WHERE key = 'writer_counts_left'").fetch_optional(&pool).await.map(Option::flatten);
+                if let Ok(left) = left {
+                    #[allow(clippy::cast_precision_loss)]
+                    metrics::gauge!(METRIC_COUNTS_LEFT).set(left.unwrap_or(0) as f64);
+                }
+            }
+            n += 1;
             let on = scope.public_breadth() == crate::indexing::Breadth::Full || scope.read_guard().await.recording().is_some();
             if on && let Err(error) = sample(&pool, tally()).await {
                 tracing::debug!(event = "db_wait_sample_failed", %error, "sampling the database's waits failed");

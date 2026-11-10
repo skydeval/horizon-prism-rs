@@ -53,7 +53,7 @@ use crate::config::FirehoseConfig;
 mod lanes;
 
 use lanes::{Done, Lane, Work};
-pub use lanes::{CONFLICT_RETRIES, LowWater, METRIC_LANE_BUSY, METRIC_LANE_QUEUE, METRIC_LANE_RETRIES, lane_of};
+pub use lanes::{CONFLICT_RETRIES, LowWater, METRIC_LANE_BATCH_SPLITS, METRIC_LANE_BUSY, METRIC_LANE_QUEUE, METRIC_LANE_RETRIES, lane_of};
 
 /// The span status reports the dedupe share over.
 pub const DEDUPE_WINDOW: Duration = Duration::from_secs(300);
@@ -1157,6 +1157,7 @@ impl Consumer {
             system_accounts: self.system_accounts.clone(),
             sync_min_interval_secs: self.sync_min_interval_secs,
             seen: HashMap::new(),
+            batch: usize::try_from(self.cfg.lane_batch).unwrap_or(1).max(1),
         }
     }
 
@@ -1164,22 +1165,54 @@ impl Consumer {
     /// is read, as a single writer always has. Stops at the first failure.
     async fn run_inline(&mut self, entries: &Arc<Vec<StreamEntry>>, start: usize, dedupe: bool) -> Vec<Option<Result<Done, ConsumerError>>> {
         let mut lane = self.lane(0);
-        let mut out = Vec::with_capacity(entries.len() - start);
+        let mut out: Vec<Option<Result<Done, ConsumerError>>> = (start..entries.len()).map(|_| None).collect();
         let started = Instant::now();
-        for entry in &entries[start..] {
-            let result = match self.dispatch(entry, dedupe).await {
+        // Consecutive commits, read ahead at most a batch, then applied.
+        let mut run: Vec<lanes::CommitWork<'_>> = Vec::new();
+        let mut failed = false;
+        for (at, entry) in entries[start..].iter().enumerate() {
+            let work = self.dispatch(entry, dedupe).await;
+            if let Ok(Work::Commit { commit, label, tier, key }) = work {
+                run.push(lanes::CommitWork { at, entry, commit, label, tier, key });
+                if run.len() >= lane.batch && Self::flush(&mut lane, &mut run, &mut out).await {
+                    failed = true;
+                    break;
+                }
+                continue;
+            }
+            if Self::flush(&mut lane, &mut run, &mut out).await {
+                failed = true;
+                break;
+            }
+            let result = match work {
                 Ok(work) => lane.run(entry, work).await,
                 Err(e) => Err(e),
             };
-            let failed = result.is_err();
-            out.push(Some(result));
-            if failed {
+            let stop = result.is_err();
+            out[at] = Some(result);
+            if stop {
+                failed = true;
                 break;
             }
         }
+        if !failed {
+            Self::flush(&mut lane, &mut run, &mut out).await;
+        }
         lane.book_busy(started.elapsed());
-        out.resize_with(entries.len() - start, || None);
         out
+    }
+
+    /// Apply a lane's pending commits; whether one failed.
+    async fn flush(lane: &mut Lane, run: &mut Vec<lanes::CommitWork<'_>>, out: &mut [Option<Result<Done, ConsumerError>>]) -> bool {
+        if run.is_empty() {
+            return false;
+        }
+        let mut failed = false;
+        for (at, result) in lane.commits(std::mem::take(run), None).await {
+            failed |= result.is_err();
+            out[at] = Some(result);
+        }
+        failed
     }
 
     /// The lanes, each in a task of its own. Entries are read in stream
@@ -1239,9 +1272,28 @@ impl Consumer {
             tasks.push(tokio::spawn(async move {
                 let started = Instant::now();
                 let mut done = Vec::with_capacity(queue.len());
-                for (at, work) in queue {
+                let mut queue = queue.into_iter().peekable();
+                'lane: while let Some((at, work)) = queue.next() {
                     if stop.load(Ordering::Acquire) {
                         break;
+                    }
+                    // Consecutive commits go to the writer together.
+                    if let Work::Commit { commit, label, tier, key } = work {
+                        let mut run = vec![lanes::CommitWork { at, entry: &entries[start + at], commit, label, tier, key }];
+                        while let Some((_, Work::Commit { .. })) = queue.peek() {
+                            if let Some((at, Work::Commit { commit, label, tier, key })) = queue.next() {
+                                run.push(lanes::CommitWork { at, entry: &entries[start + at], commit, label, tier, key });
+                            }
+                        }
+                        for (at, result) in lane.commits(run, Some(&*stop)).await {
+                            let failed = result.is_err();
+                            done.push((at, result));
+                            if failed {
+                                stop.store(true, Ordering::Release);
+                                break 'lane;
+                            }
+                        }
+                        continue;
                     }
                     let result = lane.run(&entries[start + at], work).await;
                     if result.is_err() {

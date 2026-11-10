@@ -873,12 +873,15 @@ struct MemoryEffects {
     list_references: bool,
     /// A full trial's record entries, written before the commit.
     trial: Vec<crate::indexing::trial::Entry>,
+    /// A full trial's start-mode writes, by table, counted after commit.
+    start_writes: Vec<&'static str>,
 }
 
 impl MemoryEffects {
     fn merge(&mut self, other: Self) {
         self.list_references |= other.list_references;
         self.trial.extend(other.trial);
+        self.start_writes.extend(other.start_writes);
         self.growth_added.extend(other.growth_added);
         if other.new_member_follow.is_some() {
             self.new_member_follow = other.new_member_follow;
@@ -1211,7 +1214,7 @@ impl Writer {
     /// # Errors
     ///
     /// [`Transient`] when the call must be retried whole.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn apply_live(
         &self,
         relay: Option<&str>,
@@ -1223,23 +1226,245 @@ impl Writer {
         tier: super::tier::CopyTier,
         stream: Option<LiveStream>,
     ) -> Result<ApplyReport, Transient> {
+        let item = LiveCommit { relay, repo, rev, since, ops, options, tier, stream };
+        let mut reports = self.apply_batch(std::slice::from_ref(&item), 1).await?;
+        Ok(reports.pop().unwrap_or_default())
+    }
+
+    /// Apply commits in one writer transaction: the longest prefix of
+    /// `items`, at most `max`, whose commits may share one, or the first
+    /// alone when it may not. A commit shares a transaction only when it
+    /// cannot change the scope sets or the private tier: its repo is not
+    /// tracked, no owner-side rule applies, no op is a private-tier op, and
+    /// no op grows scope. Each commit's statements and outcomes are those
+    /// it has alone; the transaction defers counts and applies them once,
+    /// then runs continuity for every copy, in account order. One report
+    /// per commit applied, in order; at least one.
+    ///
+    /// # Errors
+    ///
+    /// [`Transient`] when the call must be retried whole: nothing of it
+    /// committed.
+    #[allow(clippy::too_many_lines)]
+    pub async fn apply_batch(&self, items: &[LiveCommit<'_>], max: usize) -> Result<Vec<ApplyReport>, Transient> {
+        let Some(first) = items.first() else {
+            return Ok(Vec::new());
+        };
+        #[cfg(test)]
+        self.test_hooks(first.repo).await?;
+        let now = Utc::now();
+        // 1. The read guard, once, before any connection, held to commit:
+        // a batch is wholly a trial batch or wholly not.
+        let guard = self.scope.read_guard().await;
+        let sets: &ScopeSets = &guard;
+        let mut preps: Vec<Prepped<'_>> = Vec::new();
+        for (i, item) in items.iter().enumerate().take(max.max(1)) {
+            #[cfg(test)]
+            if i > 0 {
+                self.test_hooks(item.repo).await?;
+            }
+            // 2. Admission and prepare, in order, from the guarded sets.
+            let p = self.prep(item, sets, now);
+            if !p.batchable && i > 0 {
+                break;
+            }
+            let alone = !p.batchable;
+            preps.push(p);
+            if alone {
+                break;
+            }
+        }
+        let writing: Vec<usize> = (0..preps.len()).filter(|&i| !preps[i].skip).collect();
+        // A commit with nothing to write is decided here, with no SQL.
+        let mut reports: Vec<ApplyReport> = preps
+            .iter_mut()
+            .map(|p| {
+                let outline = std::mem::take(&mut p.outline);
+                if p.skip {
+                    ApplyReport { outline, ..report_without_writes(p.item.repo, &p.prepared, &p.admissions, p.item.ops, sets, p.owner_side) }
+                } else {
+                    ApplyReport { outline, ..ApplyReport::default() }
+                }
+            })
+            .collect();
+        if writing.is_empty() {
+            drop(guard);
+            self.after_skips(&preps, &reports);
+            return Ok(reports);
+        }
+        let mut phases = Phases::new(first.options.source == WriteSource::Firehose);
+        // 3. Ids for the whole batch, in their own statements before the
+        // transaction, so a rollback leaves no cached id that does not exist.
+        let mut keyed = self.batch_ids(&preps, &writing).await?;
+        phases.mark(Phase::Ids);
+
+        let mut tx = self.pool.begin().await?;
+        phases.acquired();
+        // 4 and 5: counts deferred; every DID lock of the batch in one sorted
+        // statement, then every URI lock in one.
+        let mut lock_dids: Vec<String> = Vec::new();
+        let mut lock_uri_list: Vec<String> = Vec::new();
+        for &i in &writing {
+            lock_dids.extend(preps[i].lock_dids.iter().cloned());
+            lock_uri_list.extend(preps[i].lock_uris.iter().cloned());
+        }
+        #[cfg(test)]
+        let defer = !crate::test_support::hooks::injected_in(crate::test_support::hooks::WRITER_NO_DEFER, &self.pool, "*");
+        #[cfg(not(test))]
+        let defer = true;
+        lock_dids_shared_deferring(&mut tx, &lock_dids, defer).await?;
+        lock_uris(&mut tx, &lock_uri_list).await?;
+        // 6. After the locks: an account whose deletion purge runs without
+        // the scope write guard is re-read here, and full's arm checks the
+        // statuses of every repo with a full-arm op, in one statement.
+        let checked: Vec<(String, bool)> = writing
+            .iter()
+            .filter(|&&i| !sets.full.purge_markers.contains(preps[i].item.repo) && preps[i].admissions.contains(&Some(Admission::Admit(AdmitRule::Full))))
+            .map(|&i| (preps[i].item.repo.to_string(), sets.is_restored(preps[i].item.repo)))
+            .collect();
+        let refusals = full_arm_refusals(&mut tx, &checked, &sets.full.takedown_relays).await?;
+        for &i in &writing {
+            let p = &mut preps[i];
+            let marked = sets.full.purge_markers.contains(p.item.repo);
+            let refusal = if marked { Some(RejectReason::Purging(PurgeKind::AccountDeleted)) } else { refusals.get(p.item.repo).copied() };
+            if let Some(reason) = refusal {
+                for (a, plan) in p.admissions.iter_mut().zip(p.plans.iter_mut()) {
+                    let drop = if marked { matches!(a, Some(Admission::Admit(_) | Admission::GrowOnly)) } else { *a == Some(Admission::Admit(AdmitRule::Full)) };
+                    if drop {
+                        *a = Some(Admission::Reject(reason));
+                        *plan = GrowthPlan::default();
+                    }
+                }
+            }
+        }
+        phases.mark(Phase::Locks);
+
+        // 7. Ops, commit by commit in order. A trial's record probe sees the
+        // batch's pending entries before `full_trial_rows`.
+        let recording = sets.recording().is_some();
+        let mut entries: Vec<crate::indexing::trial::Entry> = Vec::new();
+        let mut outs: Vec<Option<CommitOut>> = (0..preps.len()).map(|_| None).collect();
+        for &i in &writing {
+            #[cfg(test)]
+            if crate::test_support::hooks::injected_in(crate::test_support::hooks::WRITER_FAIL_IN_BATCH, &self.pool, preps[i].item.repo) {
+                return Err(Transient::new("injected failure inside a writer transaction"));
+            }
+            let ids = std::mem::take(&mut keyed[i].0);
+            let mut out = self.commit_ops(&mut tx, &preps[i], &ids, sets, if recording { &entries } else { &[] }).await?;
+            entries.extend(std::mem::take(&mut out.effects.trial));
+            outs[i] = Some(out);
+        }
+        phases.mark(Phase::Ops);
+        // 8. Counts, once, in key order.
+        sqlx::query("SELECT prism_apply_counts()").execute(&mut *tx).await?;
+        phases.mark(Phase::Counts);
+        // 9. A full trial's record, after the row statements, before
+        // continuity: one statement, entries merged by key.
+        #[cfg(test)]
+        let entries = if crate::test_support::hooks::injected_in(crate::test_support::hooks::TRIAL_RECORD_OFF, &self.pool, "*") { Vec::new() } else { entries };
+        crate::indexing::trial::insert_entries(&mut tx, &entries).await?;
+        // 10. Full indexing's continuity, after every count write, the
+        // batch's `full_crawl` rows in one ascending pass.
+        let copies: Vec<ContinuityCopy<'_>> = writing
+            .iter()
+            .filter_map(|&i| {
+                let p = &preps[i];
+                let (stream, account) = (p.continuity?, keyed[i].1?);
+                Some(ContinuityCopy { index: i, account, item: p.item, stream, failed: outs[i].as_ref().is_some_and(|o| o.failed_enabled) })
+            })
+            .collect();
+        let first_sights = if copies.is_empty() {
+            Vec::new()
+        } else {
+            let groups: Vec<String> = sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
+            let generation = i64::try_from(sets.public.crawl_generation).unwrap_or(i64::MAX);
+            let sights = batch_continuity(&mut tx, &copies, &groups, generation).await?;
+            phases.mark(Phase::Continuity);
+            sights
+        };
+        tx.commit().await?;
+        phases.mark(Phase::Commit);
+        drop(guard);
+
+        // 12. After commit, in order: first sightings, the trial's counters,
+        // memory effects, the feed.
+        if let Some(queue) = &self.first_sight {
+            for i in first_sights {
+                queue.push(preps[i].item.repo);
+            }
+        }
+        let counters = (recording || preps.iter().any(|p| p.full_decisions > 0)).then(|| self.scope.trial_counters());
+        if let Some(counters) = &counters {
+            for e in &entries {
+                counters.recorded(e.tbl.name(), 1);
+            }
+        }
+        for (i, p) in preps.iter().enumerate() {
+            if let Some(counters) = &counters {
+                for _ in 0..p.full_decisions {
+                    counters.full_decision();
+                }
+            }
+            if let Some(out) = outs[i].take() {
+                if let Some(counters) = &counters {
+                    for table in &out.effects.start_writes {
+                        counters.start_write(table);
+                    }
+                }
+                let outline = std::mem::take(&mut reports[i].outline);
+                reports[i] = ApplyReport { outline, ..out.report };
+                self.commit_effects(out.effects).await;
+                self.commit_copied(out.copied).await;
+            }
+            if let Some(tap) = &self.feed {
+                tap.observe(feed_view(&p.prepared, p.item.ops, &reports[i]), p.item.options.source, p.item.relay, p.item.repo);
+            }
+        }
+        Ok(reports)
+    }
+
+    /// The writer's test hooks for one commit of `repo`.
+    #[cfg(test)]
+    async fn test_hooks(&self, repo: &str) -> Result<(), Transient> {
         // Firehose throughput design §2.4: a hung database, before the
         // nothing-to-write check so it holds every entry alike.
-        #[cfg(test)]
         if let Some(db) = self.pool.connect_options().get_database()
             && crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_HANG, db).await
         {
             return Err(Transient::new("injected hang"));
         }
         // Public page T-P17: one repo's commits take longer, and succeed.
-        #[cfg(test)]
         if let Some(db) = self.pool.connect_options().get_database() {
             crate::test_support::hooks::delay(crate::test_support::hooks::WRITER_DELAY_REPO, &format!("{db}/{repo}")).await;
             if crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_CONFLICT, &format!("{db}/{repo}")) {
                 return Err(Transient::with_code("injected deadlock", "40P01"));
             }
         }
-        let now = Utc::now();
+        Ok(())
+    }
+
+    /// The feed and the trial's decision counter for a call whose commits
+    /// all had nothing to write.
+    fn after_skips(&self, preps: &[Prepped<'_>], reports: &[ApplyReport]) {
+        if preps.iter().any(|p| p.full_decisions > 0) {
+            let counters = self.scope.trial_counters();
+            for p in preps {
+                for _ in 0..p.full_decisions {
+                    counters.full_decision();
+                }
+            }
+        }
+        if let Some(tap) = &self.feed {
+            for (p, report) in preps.iter().zip(reports) {
+                tap.observe(feed_view(&p.prepared, p.item.ops, report), p.item.options.source, p.item.relay, p.item.repo);
+            }
+        }
+    }
+
+    /// One commit's preparation under the guard: its ops prepared and
+    /// admitted, its locks, and whether it may share a transaction.
+    fn prep<'a>(&self, item: &LiveCommit<'a>, sets: &ScopeSets, now: DateTime<Utc>) -> Prepped<'a> {
+        let LiveCommit { relay, repo, rev, ops, options, tier, stream, .. } = *item;
         let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
         // Thread outline design §3.1: after `prepare`, for every DID and
         // every public-indexing mode, before admission decides anything.
@@ -1248,15 +1473,11 @@ impl Writer {
         } else {
             Vec::new()
         };
-
-        // 1. Read guard before any connection.
-        let guard = self.scope.read_guard().await;
-        let sets: &ScopeSets = &guard;
-
         // Admission and growth plans from the guarded sets.
         let mut admissions: Vec<Option<Admission>> = Vec::with_capacity(prepared.len());
         let mut plans: Vec<GrowthPlan> = Vec::with_capacity(prepared.len());
         let mut lock_dids: Vec<String> = vec![repo.to_string()];
+        let mut full_decisions = 0;
         for p in &prepared {
             if let Prepared::Upsert(u) = p {
                 let mut a = admit(&u.input, sets);
@@ -1281,21 +1502,15 @@ impl Writer {
                             _ => "reply",
                         },
                     };
-                    growth::plan(
-                        &u.input,
-                        sets,
-                        self.scope.policy(),
-                        self.scope.max_follow_scope_per_member(),
-                        &recency,
-                    )
+                    growth::plan(&u.input, sets, self.scope.policy(), self.scope.max_follow_scope_per_member(), &recency)
                 } else {
                     GrowthPlan::default()
                 };
                 lock_dids.extend(plan.lock_dids());
                 // A full trial's sanity line: the full arm's decisions,
-                // counted apart from the record.
+                // counted apart from the record, once the call succeeded.
                 if a == Admission::Admit(AdmitRule::Full) && sets.recording().is_some() {
-                    self.scope.trial_counters().full_decision();
+                    full_decisions += 1;
                 }
                 admissions.push(Some(a));
                 plans.push(plan);
@@ -1304,7 +1519,7 @@ impl Writer {
                 plans.push(GrowthPlan::default());
             }
         }
-        let mut lock_uri_list: Vec<String> = prepared.iter().filter_map(|p| p.uri().map(str::to_string)).collect();
+        let mut lock_uris: Vec<String> = prepared.iter().filter_map(|p| p.uri().map(str::to_string)).collect();
         // A post delete also deletes the post's canonical gates (design-v3
         // §14.1), so their URIs are locked with it, in the same sorted pass.
         // A private post's delete deletes its private gates (private posting
@@ -1313,7 +1528,7 @@ impl Writer {
             if let Prepared::Delete(d) = p
                 && matches!(d.kind, RecordKind::Post | RecordKind::PrivatePost)
             {
-                lock_uri_list.extend(canonical_gates(&d.uri));
+                lock_uris.extend(canonical_gates(&d.uri));
             }
         }
         // Rule 4 (§4.3): the owner-side rules run for a repo that owns a
@@ -1322,96 +1537,82 @@ impl Writer {
         let owner_side = options.subscription_rules && sets.subscribed.tracks(repo);
         if owner_side {
             let items = ops.iter().filter(|op| op.collection == NSID_LISTITEM && proto_blue::syntax::RecordKey::is_valid(&op.rkey));
-            lock_uri_list.extend(items.map(|op| format!("at://{repo}/{NSID_LISTITEM}/{}", op.rkey)));
+            lock_uris.extend(items.map(|op| format!("at://{repo}/{NSID_LISTITEM}/{}", op.rkey)));
         }
-
-        // §5.5 "Nothing to write": a commit whose transaction would run no
-        // statement besides its locks opens none.
         let tracked = sets.is_tracked(repo);
-        #[cfg(test)]
-        let forced = crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, repo)
-            || crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, "*");
-        #[cfg(not(test))]
-        let forced = false;
         // Full indexing's continuity: every live copy with a rev runs its
         // statements, so the transaction always runs.
         let continuity = match stream {
             Some(s) if sets.public.breadth == crate::indexing::Breadth::Full && options.source == WriteSource::Firehose => Some(s),
             _ => None,
         };
-        if !forced && continuity.is_none() && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options) {
-            let mut report = report_without_writes(repo, &prepared, &admissions, ops, sets, owner_side);
-            report.outline = outline;
-            drop(guard);
-            if let Some(tap) = &self.feed {
-                tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
-            }
-            return Ok(report);
-        }
-
-        let mut phases = Phases::new(options.source == WriteSource::Firehose);
-        // Ids for the rows this commit writes, in their own statements
-        // before the transaction, so a rollback leaves no cached id that
-        // does not exist.
-        let keyed = self.op_ids(repo, &prepared, &admissions).await?;
-        let repo_id = match continuity {
-            Some(_) => self.ids.account_ids(&[repo.to_string()]).await?.get(repo).copied(),
-            None => None,
-        };
-        phases.mark(Phase::Ids);
-
-        let mut tx = self.pool.begin().await?;
-        phases.acquired();
-        // 2 and 3: DID locks, then per-URI locks.
-        lock_dids_shared(&mut tx, &lock_dids).await?;
-        lock_uris(&mut tx, &lock_uri_list).await?;
-        // After the locks: an account whose deletion purge runs without the
-        // scope write guard is re-read here, and full's arm checks the
-        // account's status. Every op of the commit is the repo's own.
-        let full_arm = admissions.contains(&Some(Admission::Admit(AdmitRule::Full)));
-        let marked = sets.full.purge_markers.contains(repo);
-        if marked || full_arm {
-            let refusal = if marked { Some(RejectReason::Purging(PurgeKind::AccountDeleted)) } else { full_arm_refusal(&mut tx, repo, sets).await? };
-            if let Some(reason) = refusal {
-                for (a, plan) in admissions.iter_mut().zip(plans.iter_mut()) {
-                    let drop = if marked {
-                        matches!(a, Some(Admission::Admit(_) | Admission::GrowOnly))
-                    } else {
-                        *a == Some(Admission::Admit(AdmitRule::Full))
-                    };
-                    if drop {
-                        *a = Some(Admission::Reject(reason));
-                        *plan = GrowthPlan::default();
-                    }
-                }
-            }
-        }
-        // The repo's owner lock, once, before any op's row locks, when an op
-        // may change its owner rows: a private post upsert or a private
-        // delete (private-audiences design §11). The later takes inside
-        // `ingest` re-enter it.
+        // §5.5 "Nothing to write": a commit whose transaction would run no
+        // statement besides its locks opens none.
+        #[cfg(test)]
+        let forced = crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, repo)
+            || crate::test_support::hooks::injected(crate::test_support::hooks::WRITER_FORCE_TX, "*");
+        #[cfg(not(test))]
+        let forced = false;
+        let skip = !forced && continuity.is_none() && nothing_to_write(&prepared, &admissions, ops, owner_side, tracked, options);
+        // The repo's owner lock is needed when an op may change its owner
+        // rows: a private post upsert or a private delete.
         let owner_rows = prepared.iter().any(|p| match p {
             Prepared::Upsert(u) => u.body == Body::Private,
             Prepared::Delete(d) => matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate),
             Prepared::Skip(_) | Prepared::Invalid(_) => false,
         });
-        if owner_rows {
-            crate::private_tier::owners::lock(&mut tx, repo).await?;
+        let private = prepared.iter().any(|p| match p {
+            Prepared::Upsert(u) => matches!(u.body, Body::Private | Body::PrivateGate),
+            Prepared::Delete(d) => matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate),
+            Prepared::Skip(_) | Prepared::Invalid(_) => false,
+        });
+        let grows = plans.iter().any(|p| !p.is_empty()) || admissions.contains(&Some(Admission::GrowOnly));
+        let batchable = !tracked && !owner_side && !private && !grows;
+        Prepped { item: *item, prepared, outline, admissions, plans, lock_dids, lock_uris, owner_side, tracked, continuity, skip, owner_rows, batchable, full_decisions }
+    }
+
+    /// One commit's statements inside the writer's transaction: the owner
+    /// lock and owner-side rules, its ops in savepoints, readiness, a
+    /// tracked repo's chain, and the holds it names.
+    async fn commit_ops(
+        &self,
+        tx: &mut PgConnection,
+        p: &Prepped<'_>,
+        keyed: &[Option<OpIds>],
+        sets: &ScopeSets,
+        pending: &[crate::indexing::trial::Entry],
+    ) -> Result<CommitOut, Transient> {
+        let LiveCommit { repo, rev, since, ops, options, .. } = p.item;
+        // The repo's owner lock, once, before any op's row locks, when an op
+        // may change its owner rows (private-audiences design §11). The
+        // later takes inside `ingest` re-enter it.
+        if p.owner_rows {
+            crate::private_tier::owners::lock(&mut *tx, repo).await?;
             #[cfg(test)]
             crate::test_support::hooks::pause_in(crate::test_support::hooks::WRITER_AFTER_OWNER_LOCK, &self.pool, repo).await;
         }
-
-        phases.mark(Phase::Locks);
-        let mut report = ApplyReport { transaction: true, outline, ..ApplyReport::default() };
+        let tracked = p.tracked;
+        let (prepared, admissions, plans) = (&p.prepared, &p.admissions, &p.plans);
+        let mut report = ApplyReport { transaction: true, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
         let mut copied = copy::Effects::default();
         let mut failed_enabled = false;
-        for (i, (p, op)) in prepared.iter().zip(ops).enumerate() {
-            if owner_side {
-                self.owner_side(&mut tx, repo, rev, op, sets, &mut copied).await?;
+        for (i, (prep, op)) in prepared.iter().zip(ops).enumerate() {
+            if p.owner_side {
+                self.owner_side(&mut *tx, repo, rev, op, sets, &mut copied).await?;
             }
-            let decided = outcome_without_sql(p, admissions[i], tracked);
-            let outcome = match (p, decided) {
+            // The trial's pending entries: the batch's earlier commits' and
+            // this commit's own earlier ops'.
+            let own: Vec<crate::indexing::trial::Entry>;
+            let pending: &[crate::indexing::trial::Entry] = if effects.trial.is_empty() {
+                pending
+            } else {
+                own = pending.iter().chain(&effects.trial).copied().collect();
+                &own
+            };
+            let ctx = OpCtx { options, repo, rev, sets, pending };
+            let decided = outcome_without_sql(prep, admissions[i], tracked);
+            let outcome = match (prep, decided) {
                 (_, Some(outcome)) => outcome,
                 (Prepared::Skip(_) | Prepared::Invalid(_), None) => unreachable!("decided without SQL"),
                 (Prepared::Upsert(u), None) => match admissions[i] {
@@ -1427,34 +1628,25 @@ impl Writer {
                         } else {
                             OpTarget::RejectedFollow(u, reason.as_str())
                         };
-                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
-                            .await?
+                        self.run_with_attempts(&mut *tx, &ctx, target, &mut effects).await?
                     }
                     Some(Admission::GrowOnly) => {
-                        let target = OpTarget::GrowOnly(u, &plans[i], keyed[i].as_ref());
-                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
-                            .await?
+                        let target = OpTarget::GrowOnly(u, &plans[i], keyed.get(i).and_then(Option::as_ref));
+                        self.run_with_attempts(&mut *tx, &ctx, target, &mut effects).await?
                     }
-                    Some(Admission::Admit(AdmitRule::PublicRootGate)) => {
-                        self.run_with_attempts(&mut tx, options, OpTarget::RootGate(u), repo, rev, sets, &mut effects)
-                            .await?
-                    }
+                    Some(Admission::Admit(AdmitRule::PublicRootGate)) => self.run_with_attempts(&mut *tx, &ctx, OpTarget::RootGate(u), &mut effects).await?,
                     // Reached by `Admit` only.
                     _ => {
-                        let target = OpTarget::Upsert(u, &plans[i], keyed[i].as_ref());
-                        self.run_with_attempts(&mut tx, options, target, repo, rev, sets, &mut effects)
-                            .await?
+                        let target = OpTarget::Upsert(u, &plans[i], keyed.get(i).and_then(Option::as_ref));
+                        self.run_with_attempts(&mut *tx, &ctx, target, &mut effects).await?
                     }
                 },
-                (Prepared::Delete(d), None) => {
-                    self.run_with_attempts(&mut tx, options, OpTarget::Delete(d), repo, rev, sets, &mut effects)
-                        .await?
-                }
+                (Prepared::Delete(d), None) => self.run_with_attempts(&mut *tx, &ctx, OpTarget::Delete(d), &mut effects).await?,
             };
             if let OpOutcome::Failed(error) = &outcome {
                 // A failed op of an enabled group (not a malformed one) is a
                 // hole in full indexing's chain at once.
-                failed_enabled |= !matches!(p, Prepared::Invalid(_))
+                failed_enabled |= !matches!(prep, Prepared::Invalid(_))
                     && crate::indexing::full::group_of(&op.collection).is_some_and(|g| sets.full.kinds.contains(&g));
                 report.failed.push(FailedOp {
                     index: i,
@@ -1463,91 +1655,73 @@ impl Writer {
                     error: error.clone(),
                     // An invalid op was decided without SQL; any other
                     // failure is of an op that ran SQL, which matters.
-                    matters: !matches!(p, Prepared::Invalid(_)) || invalid_op_matters(repo, op, sets, owner_side),
+                    matters: !matches!(prep, Prepared::Invalid(_)) || invalid_op_matters(repo, op, sets, p.owner_side),
                 });
             }
             report.outcomes.push(outcome);
         }
-
-        // A full trial's record, in the transaction of the rows it names.
-        let entries = std::mem::take(&mut effects.trial);
-        #[cfg(test)]
-        let entries = if crate::test_support::hooks::injected_in(crate::test_support::hooks::TRIAL_RECORD_OFF, &self.pool, "*") { Vec::new() } else { entries };
-        if !entries.is_empty() {
-            crate::indexing::trial::insert_entries(&mut tx, &entries).await?;
-        }
-
         // §6.11.6: failed ops of a tracked repo or a kryphocron path.
         if options.dead_letter_readiness
             && !report.failed.is_empty()
-            && (sets.is_tracked(repo)
-                || report.failed.iter().any(|f| f.path.starts_with("tools.kryphocron.")))
+            && (tracked || report.failed.iter().any(|f| f.path.starts_with("tools.kryphocron.")))
         {
-            clear_readiness(&mut tx, self.private.as_ref(), repo).await?;
+            clear_readiness(&mut *tx, self.private.as_ref(), repo).await?;
             report.readiness_cleared = true;
         }
         // §6.11.3: the worker advances applied_rev for a tracked repo once
         // every op committed or failed, whatever the ops were.
-        if options.advance_applied_rev && sets.is_tracked(repo) {
-            advance_applied_rev(&mut tx, repo, rev, true).await?;
+        if options.advance_applied_rev && tracked {
+            advance_applied_rev(&mut *tx, repo, rev, true).await?;
             // Degraded-mode design §2.4: the chain, for a commit with
             // `since` none of whose ops is dead-lettered.
             if let Some(since) = since
                 && !report.failed.iter().any(|f| f.matters)
             {
-                chain_commit(&mut tx, repo, rev, since).await?;
+                chain_commit(&mut *tx, repo, rev, since).await?;
             }
         }
         // Scope recency §3.2: the holds this commit names, recorded under
         // the read guard and before the commit, so a sweep that clears the
         // set under the write guard either sees the commit's rows or the
         // record. A failed op leaves an entry that only keeps a DID a day.
-        for plan in &plans {
+        for plan in plans {
             self.scope.touch(&plan.holds);
         }
-        phases.mark(Phase::Ops);
-        // Full indexing's continuity, after every write that fires a count
-        // trigger.
-        let mut first_sight = false;
-        if let (Some(stream), Some(account)) = (continuity, repo_id) {
-            let stream_ms = stream.ms;
-            if tier == super::tier::CopyTier::Aside {
-                crate::indexing::crawl::continuity::on_aside(&mut tx, account, rev, stream_ms, relay.unwrap_or("other")).await?;
-            } else {
-                let groups: Vec<String> = sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect();
-                let copy = crate::indexing::crawl::continuity::Copy {
-                    account,
-                    rev,
-                    since,
-                    stream_ms,
-                    crawl_generation: i64::try_from(sets.public.crawl_generation).unwrap_or(i64::MAX),
-                    groups: &groups,
-                    failed: failed_enabled,
-                    stamped: stream.stamped,
-                    carries_ops: !ops.is_empty(),
-                };
-                first_sight = crate::indexing::crawl::continuity::on_copy(&mut tx, &copy).await?.inserted;
+        Ok(CommitOut { report, effects, copied, failed_enabled })
+    }
+
+    /// Ids for every writing commit of a batch: one interning of accounts
+    /// and one of record keys for the whole batch, in their own statements.
+    /// Per commit: its ops' ids and, for continuity, its repo's account.
+    async fn batch_ids(&self, preps: &[Prepped<'_>], writing: &[usize]) -> Result<Vec<(Vec<Option<OpIds>>, Option<AccountId>)>, sqlx::Error> {
+        let names: Vec<Option<OpNames<'_>>> = preps.iter().enumerate().map(|(i, p)| if writing.contains(&i) { op_names(p.item.repo, &p.prepared, &p.admissions) } else { None }).collect();
+        let mut dids: Vec<String> = Vec::new();
+        for (i, p) in preps.iter().enumerate() {
+            if let Some(n) = &names[i] {
+                dids.extend(n.dids.iter().cloned());
             }
-            phases.mark(Phase::Continuity);
-        }
-        tx.commit().await?;
-        phases.mark(Phase::Commit);
-        drop(guard);
-        if first_sight && let Some(queue) = &self.first_sight {
-            queue.push(repo);
-        }
-        if !entries.is_empty() {
-            let counters = self.scope.trial_counters();
-            for e in &entries {
-                counters.recorded(e.tbl.name(), 1);
+            if p.continuity.is_some() && writing.contains(&i) {
+                dids.push(p.item.repo.to_string());
             }
         }
-        self.commit_effects(effects).await;
-        self.commit_copied(copied).await;
-        if let Some(tap) = &self.feed {
-            tap.observe(feed_view(&prepared, ops, &report), options.source, relay, repo);
+        let accounts = if dids.is_empty() { std::collections::HashMap::new() } else { self.ids.account_ids(&dids).await? };
+        let mut keys: Vec<(AccountId, String)> = Vec::new();
+        for (i, p) in preps.iter().enumerate() {
+            if let Some(n) = &names[i] {
+                keys.extend(op_keys(p.item.repo, n, &accounts));
+            }
         }
-        Ok(report)
+        let rkeys = if keys.is_empty() { std::collections::HashMap::new() } else { self.ids.rkey_ids(&keys).await? };
+        let mut out = Vec::with_capacity(preps.len());
+        for (i, p) in preps.iter().enumerate() {
+            let ids = match &names[i] {
+                Some(n) => self.op_build(p.item.repo, &p.prepared, n, &accounts, &rkeys).await?,
+                None => vec![None; p.prepared.len()],
+            };
+            let account = if p.continuity.is_some() { accounts.get(p.item.repo).copied() } else { None };
+            out.push((ids, account));
+        }
+        Ok(out)
     }
 
     /// A relay's `#sync` of `repo` at `rev`, read from the stream at
@@ -1751,105 +1925,21 @@ impl Writer {
         Ok(inserted)
     }
 
-    /// The ids every admitted upsert of a commit writes with, interned in
-    /// their own statements: for a follow or block its key, subject and
-    /// `via`; for a like or repost its key, subject and `via`; for a post
-    /// its key, its references and the accounts it mentions, with its
-    /// record encoded. A delete's author and key, and a rejected follow's
-    /// or block's, are interned too, for the tombstone it may leave, and
-    /// get no entry. `None` for any other op, and for one whose author, key
-    /// or subject is not valid.
-    async fn op_ids(&self, repo: &str, prepared: &[Prepared], admissions: &[Option<Admission>]) -> Result<Vec<Option<OpIds>>, sqlx::Error> {
-        let admitted: Vec<Option<&Upsert>> = prepared
-            .iter()
-            .zip(admissions)
-            .map(|(p, a)| match (p, a) {
-                (Prepared::Upsert(u), Some(Admission::Admit(rule))) if *rule != AdmitRule::PublicRootGate => match &u.body {
-                    Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) | Body::Profile(_) => Some(u.as_ref()),
-                    Body::Row(row) if matches!(row.layout, Layout::Keyed { .. }) => Some(u.as_ref()),
-                    _ => None,
-                },
-                // A member's post under the off rule writes its reference.
-                (Prepared::Upsert(u), Some(Admission::GrowOnly)) if matches!(u.body, Body::Post(_)) => Some(u.as_ref()),
-                _ => None,
-            })
-            .collect();
-        // The ops that may leave a tombstone: deletes of public records, and
-        // the rejected follows and blocks that take their own path.
-        let tombstoning: Vec<&str> = prepared
-            .iter()
-            .zip(admissions)
-            .filter_map(|(p, a)| match (p, a) {
-                (Prepared::Delete(d), _) if !matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate) => {
-                    d.uri.rsplit('/').next()
-                }
-                (Prepared::Upsert(u), Some(Admission::Reject(_))) if matches!(u.body, Body::Follow(_) | Body::Block(_)) => Some(u.rkey.as_str()),
-                _ => None,
-            })
-            .collect();
-        if admitted.iter().all(Option::is_none) && tombstoning.is_empty() {
-            return Ok(vec![None; prepared.len()]);
-        }
-        // The references the rows name, as URIs.
-        let mut dids = vec![repo.to_string()];
-        let mut uris: Vec<&str> = Vec::new();
-        for u in admitted.iter().flatten() {
-            match &u.body {
-                Body::Follow(g) | Body::Block(g) => {
-                    dids.push(g.subject_did.clone());
-                    uris.extend(g.via.as_ref().map(|v| v.uri.as_str()));
-                }
-                Body::Like(s) | Body::Repost(s) => {
-                    uris.push(&s.subject.uri);
-                    uris.extend(s.via.as_ref().map(|v| v.uri.as_str()));
-                }
-                Body::Post(p) => {
-                    uris.extend(post_references(p));
-                    dids.extend(p.mention_dids.iter().cloned());
-                }
-                Body::Row(row) => {
-                    for (_, cell) in &row.cells {
-                        match cell {
-                            Cell::Ref(_, uri) => uris.push(uri),
-                            Cell::Account(did) => dids.push(did.clone()),
-                            _ => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        dids.extend(uris.iter().filter_map(|u| ref_did(u)));
-        let accounts = self.ids.account_ids(&dids).await?;
+    /// A commit's op ids from ids already interned (see [`op_names`]).
+    async fn op_build(
+        &self,
+        repo: &str,
+        prepared: &[Prepared],
+        names: &OpNames<'_>,
+        accounts: &std::collections::HashMap<String, AccountId>,
+        rkeys: &std::collections::HashMap<(AccountId, String), i64>,
+    ) -> Result<Vec<Option<OpIds>>, sqlx::Error> {
         let Some(&author) = accounts.get(repo) else {
             return Ok(vec![None; prepared.len()]);
         };
-        // A row keyed by its author or collection, and a profile, has no key
-        // of its own.
-        let own_key = |u: &Upsert| {
-            !matches!(&u.body, Body::Profile(_) | Body::Row(Row { layout: Layout::Keyed { key: RowKey::Author | RowKey::Coll, .. }, .. }))
-        };
-        let mut keys: Vec<(AccountId, String)> = admitted.iter().flatten().filter(|u| own_key(u)).map(|u| (author, u.rkey.clone())).collect();
-        for u in admitted.iter().flatten() {
-            if let Body::Row(row) = &u.body {
-                keys.extend(row.cells.iter().filter_map(|(_, cell)| match cell {
-                    Cell::OwnRkey(rkey) => Some((author, rkey.clone())),
-                    _ => None,
-                }));
-            }
-        }
-        keys.extend(tombstoning.iter().map(|rkey| (author, (*rkey).to_string())));
-        for uri in &uris {
-            if let Some((did, rkey)) = ref_rkey(uri)
-                && let Some(a) = accounts.get(&did)
-            {
-                keys.push((*a, rkey));
-            }
-        }
-        let rkeys = self.ids.rkey_ids(&keys).await?;
-        let stored = |r: &super::records::StrongRef| (stored_ref(&r.uri, &accounts, &rkeys), r.cid.as_deref().map(cid_to_db));
-        let mut out = Vec::with_capacity(admitted.len());
-        for u in admitted {
+        let stored = |r: &super::records::StrongRef| (stored_ref(&r.uri, accounts, rkeys), r.cid.as_deref().map(cid_to_db));
+        let mut out = Vec::with_capacity(names.admitted.len());
+        for u in &names.admitted {
             let Some(u) = u else {
                 out.push(None);
                 continue;
@@ -1865,10 +1955,10 @@ impl Writer {
                     OpIds::Subject(SubjectIds { author, rkey, subject, subject_cid, via: s.via.as_ref().map(stored) })
                 }),
                 Body::Post(p) => match rkey {
-                    Some(rkey) => Some(OpIds::Post(Box::new(post_ids(&self.pool, &accounts, &rkeys, (author, rkey), u, p).await?))),
+                    Some(rkey) => Some(OpIds::Post(Box::new(post_ids(&self.pool, accounts, rkeys, (author, rkey), u, p).await?))),
                     None => None,
                 },
-                Body::Row(row) => row_ids(&self.pool, &accounts, &rkeys, author, rkey, u, row).await?.map(|ids| OpIds::Row(Box::new(ids))),
+                Body::Row(row) => row_ids(&self.pool, accounts, rkeys, author, rkey, u, row).await?.map(|ids| OpIds::Row(Box::new(ids))),
                 Body::Profile(_) => Some(OpIds::Profile(Box::new(ProfileIds {
                     author,
                     record: records::encode(&self.pool, records::FAMILY_PROFILES, &u.record).await?,
@@ -1994,16 +2084,8 @@ impl Writer {
     /// Run one op in savepoints until it succeeds, fails transiently (abort)
     /// or exhausts its deterministic attempts.
     #[allow(clippy::too_many_arguments)]
-    async fn run_with_attempts(
-        &self,
-        tx: &mut PgConnection,
-        options: ApplyOptions,
-        target: OpTarget<'_>,
-        repo: &str,
-        rev: &str,
-        sets: &ScopeSets,
-        effects: &mut MemoryEffects,
-    ) -> Result<OpOutcome, Transient> {
+    async fn run_with_attempts(&self, tx: &mut PgConnection, ctx: &OpCtx<'_>, target: OpTarget<'_>, effects: &mut MemoryEffects) -> Result<OpOutcome, Transient> {
+        let OpCtx { options, repo, rev, sets, pending } = *ctx;
         // A private-tier op from the live firehose: the relays deliver the
         // private tier (`private_tier_last_event_age_seconds`).
         if options.source == WriteSource::Firehose {
@@ -2025,7 +2107,7 @@ impl Writer {
             let result = match target {
                 OpTarget::Upsert(u, plan, ids) => self.apply_upsert(&mut sp, u, plan, ids, rev, sets, options).await,
                 OpTarget::GrowOnly(u, plan, ids) => self.apply_grow_only(&mut sp, u, plan, ids, rev, options).await,
-                OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets).await,
+                OpTarget::Delete(d) => self.apply_delete(&mut sp, d, repo, rev, sets, pending).await,
                 OpTarget::RejectedFollow(u, reason) => self.apply_rejected_follow(&mut sp, u, reason, repo, rev, sets).await,
                 OpTarget::RejectedBlock(u, reason) => self.apply_rejected_block(&mut sp, u, reason, rev).await,
                 OpTarget::RootGate(u) => self.apply_root_gate(&mut sp, u, rev, options).await.map(|written| {
@@ -2275,7 +2357,8 @@ impl Writer {
         } else if recording.is_some()
             && let Some(table) = trial_table_name(&u.body)
         {
-            self.scope.trial_counters().start_write(table);
+            // Counted once the transaction committed.
+            eff.start_writes.push(table);
         }
         // A public record naming a private post notifies privately, in
         // every mode, outside the `notify` flag below (private posting §4.8).
@@ -2471,6 +2554,7 @@ impl Writer {
         repo: &str,
         rev: &str,
         sets: &ScopeSets,
+        pending: &[crate::indexing::trial::Entry],
     ) -> Result<(OpOutcome, MemoryEffects), OpError> {
         let mut eff = MemoryEffects::default();
         let author_in_scope = sets.in_scope(repo);
@@ -2559,12 +2643,12 @@ impl Writer {
         // While a trial's exit runs, a delete that only removed a row the
         // trial recorded leaves no tombstone: the start mode never stored
         // the row, so no older copy of it can come back.
-        let trial_row_gone = removed && !start_reasons && sets.trial_exit() && removed_row_recorded(conn, d.kind, &d.uri).await?;
+        let trial_row_gone = removed && !start_reasons && sets.trial_exit() && removed_row_recorded(conn, d.kind, &d.uri, &[]).await?;
         if (removed || start_reasons || full) && !trial_row_gone {
             // A full trial records a tombstone the start mode would not
             // have written: none of its reasons, and no row removed but
             // one the trial recorded.
-            let record = if sets.recording().is_some() && !start_reasons && (!removed || removed_row_recorded(conn, d.kind, &d.uri).await?) {
+            let record = if sets.recording().is_some() && !start_reasons && (!removed || removed_row_recorded(conn, d.kind, &d.uri, pending).await?) {
                 new_tombstone_key(conn, &d.uri).await?
             } else {
                 None
@@ -2702,6 +2786,309 @@ impl Writer {
     }
 }
 
+/// One commit as the stream delivered it, for [`Writer::apply_batch`].
+#[derive(Debug, Clone, Copy)]
+pub struct LiveCommit<'a> {
+    pub relay: Option<&'a str>,
+    pub repo: &'a str,
+    pub rev: &'a str,
+    pub since: Option<&'a str>,
+    pub ops: &'a [RawOp],
+    pub options: ApplyOptions,
+    pub tier: super::tier::CopyTier,
+    pub stream: Option<LiveStream>,
+}
+
+/// A commit prepared under the read guard.
+struct Prepped<'a> {
+    item: LiveCommit<'a>,
+    prepared: Vec<Prepared>,
+    outline: Vec<crate::thread_outline::ops::Op>,
+    admissions: Vec<Option<Admission>>,
+    plans: Vec<GrowthPlan>,
+    lock_dids: Vec<String>,
+    lock_uris: Vec<String>,
+    owner_side: bool,
+    tracked: bool,
+    /// Full indexing's continuity runs for it.
+    continuity: Option<LiveStream>,
+    /// Nothing to write: no transaction.
+    skip: bool,
+    /// An op may change the repo's owner rows.
+    owner_rows: bool,
+    /// It may share a transaction with other commits.
+    batchable: bool,
+    /// Its full-arm admissions while a trial records.
+    full_decisions: u64,
+}
+
+/// One commit's results inside the transaction.
+struct CommitOut {
+    report: ApplyReport,
+    effects: MemoryEffects,
+    copied: copy::Effects,
+    /// A failed op of an enabled group: a hole in full's chain.
+    failed_enabled: bool,
+}
+
+/// What every op of one commit is applied with.
+struct OpCtx<'a> {
+    options: ApplyOptions,
+    repo: &'a str,
+    rev: &'a str,
+    sets: &'a ScopeSets,
+    /// A full trial's entries written earlier in the transaction and not
+    /// yet in `full_trial_rows`.
+    pending: &'a [crate::indexing::trial::Entry],
+}
+
+/// The names one commit's op ids need, before interning.
+struct OpNames<'a> {
+    /// Per op, the admitted upsert that writes ids.
+    admitted: Vec<Option<&'a Upsert>>,
+    /// Record keys a delete or a rejected follow or block may tombstone.
+    tombstoning: Vec<&'a str>,
+    /// Every account named, the repo first.
+    dids: Vec<String>,
+    /// Every reference named, as URIs.
+    uris: Vec<&'a str>,
+}
+
+/// The names a commit's ops intern, or `None` when they intern nothing.
+fn op_names<'a>(repo: &str, prepared: &'a [Prepared], admissions: &[Option<Admission>]) -> Option<OpNames<'a>> {
+    let admitted: Vec<Option<&Upsert>> = prepared
+        .iter()
+        .zip(admissions)
+        .map(|(p, a)| match (p, a) {
+            (Prepared::Upsert(u), Some(Admission::Admit(rule))) if *rule != AdmitRule::PublicRootGate => match &u.body {
+                Body::Follow(_) | Body::Block(_) | Body::Like(_) | Body::Repost(_) | Body::Post(_) | Body::Profile(_) => Some(u.as_ref()),
+                Body::Row(row) if matches!(row.layout, Layout::Keyed { .. }) => Some(u.as_ref()),
+                _ => None,
+            },
+            // A member's post under the off rule writes its reference.
+            (Prepared::Upsert(u), Some(Admission::GrowOnly)) if matches!(u.body, Body::Post(_)) => Some(u.as_ref()),
+            _ => None,
+        })
+        .collect();
+    // The ops that may leave a tombstone: deletes of public records, and
+    // the rejected follows and blocks that take their own path.
+    let tombstoning: Vec<&str> = prepared
+        .iter()
+        .zip(admissions)
+        .filter_map(|(p, a)| match (p, a) {
+            (Prepared::Delete(d), _) if !matches!(d.kind, RecordKind::PrivatePost | RecordKind::PrivateGate) => d.uri.rsplit('/').next(),
+            (Prepared::Upsert(u), Some(Admission::Reject(_))) if matches!(u.body, Body::Follow(_) | Body::Block(_)) => Some(u.rkey.as_str()),
+            _ => None,
+        })
+        .collect();
+    if admitted.iter().all(Option::is_none) && tombstoning.is_empty() {
+        return None;
+    }
+    // The references the rows name, as URIs.
+    let mut dids = vec![repo.to_string()];
+    let mut uris: Vec<&str> = Vec::new();
+    for u in admitted.iter().flatten() {
+        match &u.body {
+            Body::Follow(g) | Body::Block(g) => {
+                dids.push(g.subject_did.clone());
+                uris.extend(g.via.as_ref().map(|v| v.uri.as_str()));
+            }
+            Body::Like(s) | Body::Repost(s) => {
+                uris.push(&s.subject.uri);
+                uris.extend(s.via.as_ref().map(|v| v.uri.as_str()));
+            }
+            Body::Post(p) => {
+                uris.extend(post_references(p));
+                dids.extend(p.mention_dids.iter().cloned());
+            }
+            Body::Row(row) => {
+                for (_, cell) in &row.cells {
+                    match cell {
+                        Cell::Ref(_, uri) => uris.push(uri),
+                        Cell::Account(did) => dids.push(did.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    dids.extend(uris.iter().filter_map(|u| ref_did(u)));
+    Some(OpNames { admitted, tombstoning, dids, uris })
+}
+
+/// The record keys a commit's ops intern, once its accounts are.
+fn op_keys(repo: &str, names: &OpNames<'_>, accounts: &std::collections::HashMap<String, AccountId>) -> Vec<(AccountId, String)> {
+    let Some(&author) = accounts.get(repo) else {
+        return Vec::new();
+    };
+    // A row keyed by its author or collection, and a profile, has no key
+    // of its own.
+    let own_key = |u: &Upsert| !matches!(&u.body, Body::Profile(_) | Body::Row(Row { layout: Layout::Keyed { key: RowKey::Author | RowKey::Coll, .. }, .. }));
+    let mut keys: Vec<(AccountId, String)> = names.admitted.iter().flatten().filter(|u| own_key(u)).map(|u| (author, u.rkey.clone())).collect();
+    for u in names.admitted.iter().flatten() {
+        if let Body::Row(row) = &u.body {
+            keys.extend(row.cells.iter().filter_map(|(_, cell)| match cell {
+                Cell::OwnRkey(rkey) => Some((author, rkey.clone())),
+                _ => None,
+            }));
+        }
+    }
+    keys.extend(names.tombstoning.iter().map(|rkey| (author, (*rkey).to_string())));
+    for uri in &names.uris {
+        if let Some((did, rkey)) = ref_rkey(uri)
+            && let Some(a) = accounts.get(&did)
+        {
+            keys.push((*a, rkey));
+        }
+    }
+    keys
+}
+
+/// Shared DID locks for every DID in `dids`, in ascending key order, as
+/// [`lock_dids_shared`]; with `defer`, the statement also defers the
+/// transaction's counts (`prism_defer_counts`), in the same round trip.
+async fn lock_dids_shared_deferring(conn: &mut PgConnection, dids: &[String], defer: bool) -> Result<(), sqlx::Error> {
+    if !defer {
+        return lock_dids_shared(conn, dids).await;
+    }
+    sqlx::query(
+        "SELECT prism_defer_counts() FROM (SELECT count(pg_advisory_xact_lock_shared(k)) FROM \
+         (SELECT DISTINCT hashtextextended('did:' || d, 0) AS k FROM unnest($1::text[]) AS d ORDER BY k) AS s) AS l",
+    )
+    .bind(dids)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Full's post-lock status check for every repo of `repos` (with whether
+/// Refract lists it): a deleted account, or one a takedown relay reports
+/// non-active while `suspended_accounts = "refract_only"` and Refract does
+/// not list it, has no record admitted by full's arm. One statement.
+async fn full_arm_refusals(conn: &mut PgConnection, repos: &[(String, bool)], takedown_relays: &[String]) -> Result<std::collections::HashMap<String, RejectReason>, sqlx::Error> {
+    if repos.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let (dids, restored): (Vec<String>, Vec<bool>) = repos.iter().cloned().unzip();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT u.did, CASE \
+           WHEN EXISTS (SELECT 1 FROM actors a WHERE a.id = d.id AND a.account_status = 'deleted') THEN 'deleted' \
+           WHEN NOT u.restored AND EXISTS (SELECT 1 FROM relay_account_status r WHERE r.account = d.id AND r.relay = ANY($3)) THEN 'suspended' \
+         END \
+         FROM unnest($1::text[], $2::bool[]) AS u(did, restored) JOIN dids d ON d.did = u.did",
+    )
+    .bind(&dids)
+    .bind(&restored)
+    .bind(takedown_relays)
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(did, status)| match status.as_deref() {
+            Some("deleted") => Some((did, RejectReason::Deleted)),
+            Some("suspended") => Some((did, RejectReason::Suspended)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// One copy's continuity in a batch.
+struct ContinuityCopy<'a> {
+    /// Its commit's place in the batch.
+    index: usize,
+    account: AccountId,
+    item: LiveCommit<'a>,
+    stream: LiveStream,
+    failed: bool,
+}
+
+/// Continuity for every copy of a batch, after its counts: the accounts'
+/// existing `full_crawl` rows locked in account order; then, for each
+/// account whose first copy in the batch is Whole or Covered and simply
+/// chains (its row exists at the current generation, no Aside field, no
+/// open link, `since` at or below `chain_rev`), `last_rev` and `chain_rev`
+/// raised in one statement; then `on_copy` or `on_aside` for every other
+/// copy, in account order and, within an account, in stream order. The
+/// commits whose account was seen for the first time.
+async fn batch_continuity(conn: &mut PgConnection, copies: &[ContinuityCopy<'_>], groups: &[String], crawl_generation: i64) -> Result<Vec<usize>, sqlx::Error> {
+    use crate::indexing::crawl::continuity;
+    let mut accounts: Vec<AccountId> = copies.iter().map(|c| c.account).collect();
+    accounts.sort_unstable();
+    accounts.dedup();
+    if accounts.len() > 1 {
+        sqlx::query("SELECT 1 FROM full_crawl WHERE account = ANY($1) ORDER BY account FOR UPDATE")
+            .bind(&accounts)
+            .execute(&mut *conn)
+            .await?;
+    }
+    // Each account's first copy, when it may take the one statement.
+    let mut fast: Vec<(AccountId, String, String)> = Vec::new();
+    for &a in &accounts {
+        if let Some(c) = copies.iter().find(|c| c.account == a)
+            && c.item.tier != super::tier::CopyTier::Aside
+            && !c.failed
+            && let Some(since) = c.item.since
+        {
+            fast.push((a, c.item.rev.to_string(), since.to_string()));
+        }
+    }
+    let chained: std::collections::HashSet<AccountId> = if fast.is_empty() {
+        std::collections::HashSet::new()
+    } else {
+        let (a, r, s): (Vec<AccountId>, Vec<String>, Vec<String>) = fast.into_iter().fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (a, r, s)| {
+            acc.0.push(a);
+            acc.1.push(r);
+            acc.2.push(s);
+            acc
+        });
+        let rows: Vec<AccountId> = sqlx::query_scalar(
+            "UPDATE full_crawl f SET last_rev = GREATEST(f.last_rev, c.rev COLLATE \"C\"), chain_rev = c.rev COLLATE \"C\" \
+             FROM unnest($1::int[], $2::text[], $3::text[]) AS c(account, rev, since) \
+             WHERE f.account = c.account AND f.chain_generation = $4 AND f.chain_rev IS NOT NULL \
+               AND f.aside_rev IS NULL AND NOT f.uncovered \
+               AND c.since COLLATE \"C\" <= f.chain_rev AND c.rev COLLATE \"C\" > f.chain_rev \
+               AND NOT EXISTS (SELECT 1 FROM full_chain_links l WHERE l.account = f.account) \
+             RETURNING f.account",
+        )
+        .bind(&a)
+        .bind(&r)
+        .bind(&s)
+        .bind(crawl_generation)
+        .fetch_all(&mut *conn)
+        .await?;
+        rows.into_iter().collect()
+    };
+    let mut first_sights = Vec::new();
+    for &a in &accounts {
+        let mut mine = copies.iter().filter(|c| c.account == a);
+        if chained.contains(&a) {
+            mine.next();
+        }
+        for c in mine {
+            if c.item.tier == super::tier::CopyTier::Aside {
+                continuity::on_aside(&mut *conn, c.account, c.item.rev, c.stream.ms, c.item.relay.unwrap_or("other")).await?;
+            } else {
+                let copy = continuity::Copy {
+                    account: c.account,
+                    rev: c.item.rev,
+                    since: c.item.since,
+                    stream_ms: c.stream.ms,
+                    crawl_generation,
+                    groups,
+                    failed: c.failed,
+                    stamped: c.stream.stamped,
+                    carries_ops: !c.item.ops.is_empty(),
+                };
+                if continuity::on_copy(&mut *conn, &copy).await?.inserted {
+                    first_sights.push(c.index);
+                }
+            }
+        }
+    }
+    Ok(first_sights)
+}
+
 /// Whether the inbound-block pass writes a block with this admission, a
 /// rejection being counted. A block is never grow-only (public-indexing
 /// design §4.1); were it one, it would not be written.
@@ -2730,28 +3117,6 @@ async fn list_block_target(conn: &mut PgConnection, uri: &str) -> Result<Option<
         .fetch_optional(conn)
         .await
         .map(Option::flatten)
-}
-
-/// Full's post-lock status check: a deleted account, or one a takedown
-/// relay reports non-active while `suspended_accounts = "refract_only"`
-/// and Refract does not list it, has no record admitted by full's arm.
-async fn full_arm_refusal(conn: &mut PgConnection, repo: &str, sets: &ScopeSets) -> Result<Option<RejectReason>, sqlx::Error> {
-    let relays: &[String] = if sets.is_restored(repo) { &[] } else { &sets.full.takedown_relays };
-    let status: Option<String> = sqlx::query_scalar(
-        "SELECT CASE \
-           WHEN EXISTS (SELECT 1 FROM actors a JOIN dids d ON d.id = a.id WHERE d.did = $1 AND a.account_status = 'deleted') THEN 'deleted' \
-           WHEN EXISTS (SELECT 1 FROM relay_account_status r JOIN dids d ON d.id = r.account WHERE d.did = $1 AND r.relay = ANY($2)) THEN 'suspended' \
-         END",
-    )
-    .bind(repo)
-    .bind(relays)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(match status.as_deref() {
-        Some("deleted") => Some(RejectReason::Deleted),
-        Some("suspended") => Some(RejectReason::Suspended),
-        _ => None,
-    })
 }
 
 /// In full, a post's or a repost's feed item is written for any author whose
@@ -2814,8 +3179,10 @@ fn trial_entries(u: &Upsert, ids: Option<&OpIds>, rev: &str) -> Vec<crate::index
     vec![entry]
 }
 
-/// Whether the row a delete removed is in a full trial's record.
-async fn removed_row_recorded(conn: &mut PgConnection, kind: RecordKind, uri: &str) -> Result<bool, sqlx::Error> {
+/// Whether the row a delete removed is in a full trial's record: among
+/// `pending`, the entries the transaction wrote that are not in
+/// `full_trial_rows` yet, or there.
+async fn removed_row_recorded(conn: &mut PgConnection, kind: RecordKind, uri: &str, pending: &[crate::indexing::trial::Entry]) -> Result<bool, sqlx::Error> {
     use crate::indexing::trial::TrialTable as T;
     let (tbl, b, c) = match kind {
         RecordKind::Post => (T::Posts, "k.rkey", "0"),
@@ -2833,11 +3200,17 @@ async fn removed_row_recorded(conn: &mut PgConnection, kind: RecordKind, uri: &s
         RecordKind::PublicRootGate => (T::Threadgates, "k.rkey", "0"),
         RecordKind::PrivatePost | RecordKind::PrivateGate => return Ok(false),
     };
+    let pending: Vec<&crate::indexing::trial::Entry> = pending.iter().filter(|e| e.tbl == tbl).collect();
+    let (pa, pb, pc): (Vec<i32>, Vec<i64>, Vec<i16>) = (pending.iter().map(|e| e.a).collect(), pending.iter().map(|e| e.b).collect(), pending.iter().map(|e| e.c).collect());
     sqlx::query_scalar(&format!(
-        "SELECT EXISTS (SELECT 1 FROM ref_of($1) k JOIN full_trial_rows r ON r.tbl = $2 AND r.a = k.author AND r.b = {b} AND r.c = {c})"
+        "SELECT EXISTS (SELECT 1 FROM ref_of($1) k JOIN unnest($3::int[], $4::bigint[], $5::smallint[]) AS r(a, b, c) ON r.a = k.author AND r.b = {b} AND r.c = {c}) \
+             OR EXISTS (SELECT 1 FROM ref_of($1) k JOIN full_trial_rows r ON r.tbl = $2 AND r.a = k.author AND r.b = {b} AND r.c = {c})"
     ))
     .bind(uri)
     .bind(tbl.code())
+    .bind(&pa)
+    .bind(&pb)
+    .bind(&pc)
     .fetch_one(conn)
     .await
 }
@@ -4253,6 +4626,9 @@ pub(crate) mod fixtures {
         upsert_feed_item(&mut conn, &row, sort_at).await.expect("feed item");
     }
 }
+
+#[cfg(test)]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {

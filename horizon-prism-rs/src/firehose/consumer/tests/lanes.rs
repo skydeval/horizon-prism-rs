@@ -347,3 +347,70 @@ async fn three_relays_of_the_same_commits_drop_two_copies_of_three() {
     assert_eq!(pending(&mut f).await, 0);
     f.cleanup().await;
 }
+
+/// Accounts in S that are not members: their commits share transactions.
+async fn in_scope(f: &Fixture, dids: &[String]) {
+    let mut sets = f.writer.scope().write_guard().await;
+    for d in dids {
+        sets.scope.insert(d.clone());
+    }
+}
+
+/// A batch whose third commit fails is rolled back and run again one
+/// commit per transaction: the two before it commit and are booked, it
+/// stops the lane, and once it passes everything is applied; nothing is
+/// acked past an entry that did not commit.
+#[tokio::test]
+async fn a_failed_batch_runs_again_one_commit_at_a_time() {
+    let (rec, handle) = recorder();
+    let _local = metrics::set_default_local_recorder(&rec);
+    let repos: Vec<String> = (0..5).map(|i| format!("did:plc:batchlane{i}aaaaaaaaaaaaaaa")).collect();
+    let opts = Options { members: Vec::new(), ..Options::default() };
+    let Some(mut f) = Fixture::new("fl_batch_split", opts).await else {
+        return;
+    };
+    in_scope(&f, &repos).await;
+    f.cfg.writer_lanes = 1;
+    for repo in &repos {
+        f.add(&post_commit(repo, "3kaaaaaaaaab2", "3kaaaaaaaaab2", BSKY), None).await;
+    }
+    // Fails the batch, then the third commit alone; passes the third time.
+    let failing = hooks::arm_times(hooks::WRITER_FAIL_IN_BATCH, &format!("{}/{}", f.key(), repos[2]), 2);
+    let (mut c, _) = f.consumer().await;
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 5, Duration::from_secs(20)).await);
+    assert_eq!(failing.hits(), 2);
+    for repo in &repos {
+        assert!(posts::stored(&f.db.pool, &post_uri(repo, "3kaaaaaaaaab2")).await, "{repo}");
+    }
+    assert_eq!(c.throughput.by_path, [0, 5, 0, 0], "each entry booked once");
+    assert_eq!(rendered(&handle, METRIC_LANE_BATCH_SPLITS, &["lane=\"0\""]), Some(1.0));
+    assert_eq!(pending(&mut f).await, 0);
+    drop(failing);
+    f.cleanup().await;
+}
+
+/// Another relay's copy behind its original in the same batch is dropped
+/// as a duplicate and booked with the batch.
+#[tokio::test]
+async fn a_copy_behind_its_original_in_one_batch_is_dropped_with_it() {
+    let repos: Vec<String> = (0..2).map(|i| format!("did:plc:batchdup{i}aaaaaaaaaaaaaaaa")).collect();
+    let opts = Options { members: Vec::new(), ..Options::default() };
+    let Some(mut f) = Fixture::new("fl_batch_dup", opts).await else {
+        return;
+    };
+    in_scope(&f, &repos).await;
+    f.cfg.writer_lanes = 1;
+    f.cfg.dedupe = Dedupe::On;
+    f.add(&post_commit(&repos[0], "3kaaaaaaaaab2", "3kaaaaaaaaab2", BSKY), None).await;
+    f.add(&post_commit(&repos[1], "3kaaaaaaaaab2", "3kaaaaaaaaab2", BSKY), None).await;
+    f.add(&post_commit(&repos[0], "3kaaaaaaaaab2", "3kaaaaaaaaab2", MICROCOSM), None).await;
+    let (mut c, _) = f.consumer().await;
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 3, Duration::from_secs(10)).await);
+    assert_eq!(c.throughput.deduped, 1);
+    assert_eq!(c.throughput.by_path, [1, 2, 0, 0]);
+    assert!(c.watermarks.get("microcosm").is_some(), "the dropped copy's relay still moves its watermark");
+    assert_eq!(pending(&mut f).await, 0);
+    f.cleanup().await;
+}

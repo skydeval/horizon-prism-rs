@@ -265,6 +265,9 @@ pub enum IndexingAction {
         /// Lane counts to try, comma-separated.
         #[arg(long, value_delimiter = ',', default_value = "1,2,4,8")]
         lanes: Vec<u32>,
+        /// Commits per writer transaction; firehose.lane_batch when not given.
+        #[arg(long)]
+        lane_batch: Option<u32>,
         /// Keep the scratch database afterwards.
         #[arg(long)]
         keep: bool,
@@ -815,7 +818,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                     commands::refract::render_list(&commands::pool(&cfg).await?, state.as_deref()).await
                 }
                 AdminCmd::Refract { action: RefractAction::Show { did } } => commands::refract::render_show(&commands::pool(&cfg).await?, did).await,
-                AdminCmd::Indexing { action: IndexingAction::FullCheck { accounts, posts, likes, follows, commits, lanes, keep } } => {
+                AdminCmd::Indexing { action: IndexingAction::FullCheck { accounts, posts, likes, follows, commits, lanes, lane_batch, keep } } => {
                     let params = crate::indexing::full_check::Params {
                         accounts: *accounts,
                         posts: *posts,
@@ -823,6 +826,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                         follows: *follows,
                         commits: *commits,
                         lanes: lanes.clone(),
+                        lane_batch: lane_batch.unwrap_or(cfg.file.firehose.lane_batch).max(1),
                         keep: *keep,
                         ..crate::indexing::full_check::Params::default()
                     };

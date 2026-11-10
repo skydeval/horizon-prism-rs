@@ -144,6 +144,7 @@ coverage_window_secs = 600
 coverage_capacity = 3000000
 writer_lanes = 1
 lane_queue = 2000
+lane_batch = 64
 dedupe = "auto"
 dedupe_window_secs = 600
 dedupe_repos = 2000000

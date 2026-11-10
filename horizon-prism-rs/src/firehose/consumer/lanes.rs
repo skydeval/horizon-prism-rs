@@ -22,7 +22,7 @@ use super::super::router::route_identity;
 use super::super::stream::{Commit, IdentityKind, Readable, StreamEntry, readable_despite, repo_hint};
 use super::super::tier::CopyTier;
 use super::super::watermark::{Watermarks, contribution};
-use super::super::writer::{ApplyOptions, ApplyReport, Transient, Writer};
+use super::super::writer::{ApplyOptions, ApplyReport, LiveCommit, Transient, Writer};
 use super::{ConsumerError, EntryPath};
 use crate::subscriptions::triggers;
 
@@ -37,6 +37,14 @@ pub const METRIC_LANE_BUSY: &str = "firehose_lane_busy_seconds_total";
 /// How often a lane retries a conflicting transaction before the failure
 /// stops it.
 pub const CONFLICT_RETRIES: u32 = 5;
+/// Metric: transactions of several commits that failed and were run again
+/// one commit per transaction, by lane.
+pub const METRIC_LANE_BATCH_SPLITS: &str = "firehose_lane_batch_splits_total";
+
+/// A commit copy's relay watermark contribution.
+fn watermark_of(w: &CommitWork<'_>) -> Option<(String, DateTime<Utc>)> {
+    contribution(w.entry.id_ms(), w.commit.time).map(|c| (w.label.clone(), c))
+}
 
 /// The lane of a repo.
 #[must_use]
@@ -148,6 +156,19 @@ pub(super) struct Lane {
     /// a later copy of one of them in the same round is a duplicate, since
     /// the consumer marks copies seen only once the round is booked.
     pub seen: HashMap<String, Vec<CopyKey>>,
+    /// The most commits applied in one writer transaction.
+    pub batch: usize,
+}
+
+/// A commit a lane applies: its entry's place in the round, the entry, and
+/// what the consumer read from it.
+pub(super) struct CommitWork<'e> {
+    pub at: usize,
+    pub entry: &'e StreamEntry,
+    pub commit: Commit,
+    pub label: String,
+    pub tier: CopyTier,
+    pub key: Option<CopyKey>,
 }
 
 impl Lane {
@@ -182,7 +203,10 @@ impl Lane {
                 Ok(Done { seen, ..Done::nothing() })
             }
             Work::Identity { kind, did, relay, active, status, label } => self.identity(entry, kind, &did, relay.as_deref(), active, status.as_deref(), &label).await,
-            Work::Commit { commit, label, tier, key } => self.commit(entry, commit, label, tier, key).await,
+            Work::Commit { commit, label, tier, key } => {
+                let mut out = self.commits(vec![CommitWork { at: 0, entry, commit, label, tier, key }], None).await;
+                out.pop().map_or_else(|| Err(ConsumerError::Shape("a writer lane applied nothing".into())), |(_, r)| r)
+            }
         }
     }
 
@@ -278,22 +302,106 @@ impl Lane {
         Ok(Done { path: EntryPath::Identity, outline, ..Done::nothing() })
     }
 
-    async fn commit(&mut self, entry: &StreamEntry, commit: Commit, label: String, tier: CopyTier, key: Option<CopyKey>) -> Result<Done, ConsumerError> {
-        let watermark = contribution(entry.id_ms(), commit.time).map(|c| (label.clone(), c));
-        if self.duplicate_here(&commit.repo, key.as_ref()) {
-            return Ok(Done::duplicate(&label, watermark));
+    /// Apply consecutive commits of this lane in order, in writer
+    /// transactions of at most `batch` commits. A copy of a commit applied
+    /// earlier in the round, or earlier in the same transaction, is a
+    /// duplicate, dropped once its original committed. A conflicting
+    /// transaction is retried in place; a transaction of several commits
+    /// that still fails is run again one commit per transaction, so a
+    /// single bad commit fails alone, and then batches resume. A failed
+    /// commit stops the lane: results end at it. `stop`, when another
+    /// lane failed, ends the lane before its next transaction.
+    pub(super) async fn commits(&mut self, run: Vec<CommitWork<'_>>, stop: Option<&std::sync::atomic::AtomicBool>) -> Vec<(usize, Result<Done, ConsumerError>)> {
+        let mut out: Vec<(usize, Result<Done, ConsumerError>)> = Vec::with_capacity(run.len());
+        let mut pos = 0;
+        // Before this index, commits run one per transaction.
+        let mut singles_until = 0;
+        while pos < run.len() {
+            if stop.is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire)) {
+                break;
+            }
+            let limit = if pos < singles_until { 1 } else { self.batch.max(1) };
+            // The transaction's commits, and copies of them behind them.
+            let mut slice: Vec<usize> = Vec::new();
+            let mut dups: Vec<usize> = Vec::new();
+            let mut next = run.len();
+            for (j, w) in run.iter().enumerate().skip(pos) {
+                if self.duplicate_here(&w.commit.repo, w.key.as_ref()) {
+                    if slice.is_empty() {
+                        out.push((w.at, Ok(Done::duplicate(&w.label, watermark_of(w)))));
+                        pos = j + 1;
+                        continue;
+                    }
+                    dups.push(j);
+                    continue;
+                }
+                let behind = w.key.is_some_and(|k| slice.iter().any(|&o| run[o].commit.repo == w.commit.repo && run[o].key.is_some_and(|ok| k.dropped_by(&ok))));
+                if behind {
+                    dups.push(j);
+                    continue;
+                }
+                if slice.len() == limit {
+                    next = j;
+                    break;
+                }
+                slice.push(j);
+            }
+            if slice.is_empty() {
+                continue;
+            }
+            #[cfg(test)]
+            if let Some(db) = self.pool.connect_options().get_database() {
+                for &j in &slice {
+                    crate::test_support::hooks::pause(crate::test_support::hooks::LANE_BEFORE_ENTRY, &format!("{db}/{}", run[j].commit.repo)).await;
+                }
+            }
+            let reports = self.apply(&run, &slice).await;
+            match reports {
+                Ok(reports) => {
+                    let applied = reports.len();
+                    for (k, report) in reports.into_iter().enumerate() {
+                        let w = &run[slice[k]];
+                        let done = self.committed_commit(w, report).await;
+                        let failed = done.is_err();
+                        out.push((w.at, done));
+                        if failed {
+                            return out;
+                        }
+                    }
+                    // Where the next transaction starts: the first commit
+                    // not applied; copies before it had their original
+                    // applied.
+                    let resume = slice.get(applied).copied().unwrap_or(next);
+                    for &j in dups.iter().filter(|&&j| j < resume) {
+                        let w = &run[j];
+                        out.push((w.at, Ok(Done::duplicate(&w.label, watermark_of(w)))));
+                    }
+                    pos = resume;
+                }
+                Err(e) if slice.len() > 1 => {
+                    tracing::debug!(event = "firehose_lane_batch_failed", lane = self.index, commits = slice.len(), error = %e, "a batch failed; its commits run one per transaction");
+                    metrics::counter!(METRIC_LANE_BATCH_SPLITS, "lane" => self.label.clone()).increment(1);
+                    singles_until = slice.last().map_or(pos, |l| l + 1);
+                }
+                Err(e) => {
+                    out.push((run[slice[0]].at, Err(e.into())));
+                    return out;
+                }
+            }
         }
-        #[cfg(test)]
-        if let Some(db) = self.pool.connect_options().get_database() {
-            crate::test_support::hooks::pause(crate::test_support::hooks::LANE_BEFORE_ENTRY, &format!("{db}/{}", commit.repo)).await;
-        }
-        let report = self.apply(&commit, &label, tier, entry.id_ms()).await?;
+        out
+    }
+
+    /// One applied commit's result: its malformed ops counted or
+    /// dead-lettered, its copy marked committed in the round.
+    async fn committed_commit(&mut self, w: &CommitWork<'_>, report: ApplyReport) -> Result<Done, ConsumerError> {
+        let entry = w.entry;
         // A malformed op that could not matter is counted, not dead-lettered
         // (actionable-warnings design §6.3).
         let dropped = report.failed.iter().filter(|f| !f.matters).count();
         if dropped > 0 {
             metrics::counter!(deadletter::METRIC_MALFORMED_DROPPED, "check" => "record").increment(dropped as u64);
-            tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check = "record", repo = %commit.repo, ops = dropped, "malformed ops that could not matter were dropped");
+            tracing::debug!(event = "firehose_malformed_dropped", id = %entry.id, check = "record", repo = %w.commit.repo, ops = dropped, "malformed ops that could not matter were dropped");
         }
         if report.failed.iter().any(|f| f.matters) {
             let data = entry.raw("data").map(<[u8]>::to_vec).unwrap_or_default();
@@ -304,10 +412,10 @@ impl Lane {
                 .map(|f| DeadLetter {
                     orig_id: entry.id.clone(),
                     entry_type: "commit".to_string(),
-                    relay: label.clone(),
+                    relay: w.label.clone(),
                     seq: entry.field("seq").unwrap_or_default().to_string(),
-                    repo: commit.repo.clone(),
-                    rev: commit.rev.clone(),
+                    repo: w.commit.repo.clone(),
+                    rev: w.commit.rev.clone(),
                     action: f.action.as_str().to_string(),
                     path: f.path.clone(),
                     error: f.error.clone(),
@@ -316,35 +424,46 @@ impl Lane {
                 .collect();
             self.dead_letter(&letters).await?;
         }
-        let seen = self.committed(&commit.repo, key, &label, entry.id_ms());
+        let seen = self.committed(&w.commit.repo, w.key, &w.label, entry.id_ms());
         Ok(Done {
             path: if report.transaction { EntryPath::Tx } else { EntryPath::NoTx },
             outline: report.outline,
-            watermark,
+            watermark: watermark_of(w),
             seen,
             duplicate: false,
         })
     }
 
-    /// The writer's call for one copy, retried in place when another
-    /// lane's transaction conflicted with it.
-    async fn apply(&self, commit: &Commit, label: &str, tier: CopyTier, stream_ms: Option<i64>) -> Result<ApplyReport, Transient> {
-        let stream = stream_ms.map(|ms| crate::firehose::writer::LiveStream { ms, stamped: commit.cap.is_some() });
-        // A tracked repo's chain is advanced only by a whole copy: any other
-        // copy may have dropped a commit its filter left out, in every
-        // public-indexing mode.
-        let options = ApplyOptions { advance_applied_rev: tier == CopyTier::Whole, ..self.options };
+    /// The writer's call for the commits `slice` of `run`, retried in place
+    /// when another lane's transaction conflicted with it.
+    async fn apply(&self, run: &[CommitWork<'_>], slice: &[usize]) -> Result<Vec<ApplyReport>, Transient> {
+        let items: Vec<LiveCommit<'_>> = slice
+            .iter()
+            .map(|&j| {
+                let w = &run[j];
+                LiveCommit {
+                    relay: Some(&w.label),
+                    repo: &w.commit.repo,
+                    rev: &w.commit.rev,
+                    since: w.commit.since.as_deref(),
+                    ops: &w.commit.ops,
+                    // A tracked repo's chain is advanced only by a whole
+                    // copy: any other copy may have dropped a commit its
+                    // filter left out, in every public-indexing mode.
+                    options: ApplyOptions { advance_applied_rev: w.tier == CopyTier::Whole, ..self.options },
+                    tier: w.tier,
+                    stream: w.entry.id_ms().map(|ms| crate::firehose::writer::LiveStream { ms, stamped: w.commit.cap.is_some() }),
+                }
+            })
+            .collect();
         let mut tries = 0;
         loop {
-            let result = self
-                .writer
-                .apply_live(Some(label), &commit.repo, &commit.rev, commit.since.as_deref(), &commit.ops, options, tier, stream)
-                .await;
+            let result = self.writer.apply_batch(&items, items.len()).await;
             match result {
                 Err(t) if tries < CONFLICT_RETRIES && t.conflict().is_some() => {
                     tries += 1;
                     let code = t.conflict().unwrap_or_default().to_string();
-                    tracing::debug!(event = "firehose_lane_retry", lane = self.index, repo = %commit.repo, %code, tries, "a conflicting transaction is retried in place");
+                    tracing::debug!(event = "firehose_lane_retry", lane = self.index, repo = %items[0].repo, %code, tries, "a conflicting transaction is retried in place");
                     metrics::counter!(METRIC_LANE_RETRIES, "lane" => self.label.clone(), "code" => code).increment(1);
                     tokio::time::sleep(Duration::from_millis(5 * u64::from(tries))).await;
                 }

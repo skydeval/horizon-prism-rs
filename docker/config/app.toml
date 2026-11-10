@@ -172,6 +172,9 @@ coverage_capacity = 3000000
 # full-check` advises how many).
 writer_lanes = 1
 lane_queue = 2000
+# The most commits a lane applies in one transaction (1: one each). Commits
+# of members, of tracked accounts and of the private tier always run alone.
+lane_batch = 64
 # Copies of the same commit from several relays: "auto" drops repeats while
 # full runs; true or false forces it.
 dedupe = "auto"

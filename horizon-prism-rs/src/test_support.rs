@@ -317,6 +317,12 @@ pub mod hooks {
     /// Writer lanes: a lane waits before it applies an entry of this repo.
     /// Key: `<database>/<repo>`.
     pub const LANE_BEFORE_ENTRY: &str = "fl_lane_before_entry";
+    /// Batched writes: a writer transaction does not defer its counts.
+    /// Key: `<database>/*`.
+    pub const WRITER_NO_DEFER: &str = "tb_writer_no_defer";
+    /// Batched writes: a writer transaction fails transiently when it comes
+    /// to this repo's commit. Key: `<database>/<repo>`.
+    pub const WRITER_FAIL_IN_BATCH: &str = "tb_writer_fail_in_batch";
     /// The keyset counts repair holds a range's count rows locked, before
     /// it recomputes them. Key: the database.
     pub const KEYSET_AFTER_LOCK: &str = "fl_keyset_after_lock";

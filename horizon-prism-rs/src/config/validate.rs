@@ -605,8 +605,9 @@ fn with_leave(_cfg: &FileConfig, _value: &str, _intents: &[Intent], checked: Res
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 40] = [
+    let nonzero: [(&str, u64); 41] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
+        ("firehose.lane_batch", u64::from(cfg.firehose.lane_batch)),
         ("firehose.writer_lanes", u64::from(cfg.firehose.writer_lanes)),
         ("firehose.lane_queue", u64::from(cfg.firehose.lane_queue)),
         ("firehose.dedupe_window_secs", cfg.firehose.dedupe_window_secs),

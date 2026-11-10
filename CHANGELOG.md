@@ -25,6 +25,11 @@ released.
 
 ### Changed
 
+- Writer lanes apply up to `[firehose] lane_batch` (64) commits in one
+  transaction, and a transaction's counts are applied once, in key order,
+  so lanes no longer deadlock on hot posts. Commits of members, of tracked
+  accounts and of the private tier still run alone. **Upgrade:** migration
+  0067.
 - **Published image.** `app` runs `ghcr.io/skydeval/horizon-prism-rs`, at the
   version the checkout ships with (`APP_VERSION` in `.env` picks another).
   Get it with `docker compose pull app`; `docker compose build` now builds
