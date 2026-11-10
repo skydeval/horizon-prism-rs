@@ -38,6 +38,11 @@ max_event_size_bytes = 4194304
 # Skip (not fail_hard): fail_hard would let one crafted commit stop all ingest.
 # An oversize commit only affects its own repo; see design §6.11.5.
 on_oversize = "skip_with_log"
+# Repo syncs as `sync` entries, and a `resume` entry wherever the reader
+# lost events. Full indexing uses both; community and kryphocron_only read
+# and skip them.
+publish_sync = true
+publish_resume = true
 
 [logging]
 level = "info"

@@ -331,6 +331,11 @@ impl Reader {
             if let Some(id) = parse_id(&e.id) {
                 self.id = id;
             }
+            // A repo sync and a relay reader's loss point are not lines of
+            // the feed, and not undecodable either.
+            if matches!(e.field("type"), Some("sync" | "resume")) {
+                continue;
+            }
             match decode(e, &self.labels) {
                 Some(d) => decoded.push(d),
                 None => undecodable += 1,

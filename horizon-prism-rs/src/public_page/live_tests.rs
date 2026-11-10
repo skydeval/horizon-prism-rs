@@ -553,7 +553,8 @@ async fn t_p19a_hung_redis() {
 }
 
 /// T-P19a: undecodable entries give no line, count in the metric and the
-/// input, and not in `events`.
+/// input, and not in `events`; a repo sync and a relay reader's loss point
+/// give no line and are not undecodable.
 #[tokio::test]
 async fn t_p19a_undecodable() {
     let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -569,6 +570,8 @@ async fn t_p19a_undecodable() {
     xadd(&mut r.conn, &k, "*", &event("labels", &json!({"did": "did:plc:a"}))).await;
     xadd(&mut r.conn, &k, "*", &[("type".to_string(), "commit".to_string()), ("data".to_string(), "{nope".to_string())]).await;
     xadd(&mut r.conn, &k, "*", &commit("did:plc:a", &json!([{"action": "create"}]), RELAY_A, None)).await;
+    xadd(&mut r.conn, &k, "*", &event("sync", &json!({"did": "did:plc:a", "rev": "3kaaaaaaaaaa2", "time": "2026-11-01T00:00:00Z"}))).await;
+    xadd(&mut r.conn, &k, "*", &event("resume", &json!({"reason": "no_saved_cursor", "saved_cursor": null, "first_lost_seq": null, "continues_from": 7}))).await;
     xadd(&mut r.conn, &k, "*", &commit("did:plc:marker1aaaaaaaaaaaaaaaaa", &like("1"), RELAY_A, None)).await;
     let (lines, _) = collect_lines(&mut rx, 1, Duration::from_secs(5)).await;
     assert_eq!(lines.len(), 1);

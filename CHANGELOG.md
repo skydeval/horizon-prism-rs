@@ -19,6 +19,10 @@ released.
   only the relay sidecars. To keep building from source, add
   `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env`. A compose
   override that sets `app`'s image or build keeps working.
+- The shipped relay sidecar configs (`docker/firehose/*.toml`) turn on
+  `publish_sync` and `publish_resume`, which full indexing uses. A sidecar
+  config of your own needs the same two lines under `[publisher]`; restart
+  the sidecars after the change.
 
 ### Fixed
 
