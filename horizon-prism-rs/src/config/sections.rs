@@ -188,7 +188,7 @@ pub struct FullConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AtLag {
     /// Strangers' quiet commits are acked unapplied, and their accounts
-    /// fetched again whole; members', S's and everything that involves
+    /// fetched again whole; members', tracked accounts' and everything that involves
     /// them always apply.
     #[default]
     Shed,

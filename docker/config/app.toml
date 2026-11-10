@@ -80,7 +80,7 @@ weekly_count_repair = false
 # When live ingest falls so far behind that the stream would drop unread
 # entries within shed_margin_minutes: "shed" acks strangers' likes,
 # reposts and follows that notify no member without applying them, and
-# fetches those accounts again whole later; members', S's and everything
+# fetches those accounts again whole later; members', tracked accounts' and everything
 # involving them always apply. "none": a dropped stretch is a gap.
 at_lag = "shed"
 shed_margin_minutes = 10

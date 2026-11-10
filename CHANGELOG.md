@@ -33,7 +33,7 @@ Full indexing throughput and fixes.
   (15; `end_on_lag`, or `--no-end-on-lag` per trial), and full sheds
   strangers' quiet commits within `[full] shed_margin_minutes` (10,
   `at_lag = "shed"`), fetching those accounts again whole later; members',
-  S's and anything involving them always apply. A trial writes a capacity
+  tracked accounts' and anything involving them always apply. A trial writes a capacity
   sample a minute and its result says what the server kept up with. Health
   shows full ingest. **Upgrade:** migration 0068.
 - Metrics of where full's writers spend their time, of what Prism's own
