@@ -235,7 +235,30 @@ enum Window {
     Author(Vec<i32>),
 }
 
+/// Whether a sweep of `list` passes over `table` without deleting: a
+/// trial's drain leaves the count rows and the trend hours to the triggers
+/// of the rows it deletes, so what the start mode held before the trial
+/// stays, and then removes the rows those deletes left at zero. The
+/// ordinary drain's predicates there would take every count row and trend
+/// hour the off rule does not write itself, though it keeps the members'
+/// likes and reposts they come from.
+#[must_use]
+pub fn left_to_triggers(list: SweepList, table: &str) -> bool {
+    list == SweepList::TrialFull && matches!(table, "post_counts" | "tag_activity_hourly")
+}
+
 impl Window {
+    fn empty(key: Key) -> Self {
+        match key {
+            Key::Text(_) => Self::Text(Vec::new()),
+            Key::Id => Self::Id(Vec::new()),
+            Key::TagHour => Self::TagHour(Vec::new(), Vec::new()),
+            Key::AuthorRkey => Self::AuthorRkey(Vec::new(), Vec::new()),
+            Key::FeedItem => Self::FeedItem(Vec::new(), Vec::new(), Vec::new()),
+            Key::Author => Self::Author(Vec::new()),
+        }
+    }
+
     fn last(&self) -> Option<Cursor> {
         match self {
             Self::Text(keys) => keys.last().cloned().map(Cursor::Text),
@@ -322,8 +345,9 @@ impl PublicIndexing {
                     .await?;
             }
         }
-        // 3. The window, with no predicate on the rows.
-        let window = select_window(&mut tx, t, after, n).await?;
+        // 3. The window, with no predicate on the rows. A trial's drain
+        // leaves the counts and the trend hours to their triggers.
+        let window = if left_to_triggers(list, t.name) { Window::empty(t.key) } else { select_window(&mut tx, t, after, n).await? };
         let Some(last) = window.last() else {
             let next = match (TABLES.get(table + 1), list) {
                 (Some(next), _) => next.name,
@@ -558,7 +582,7 @@ impl PublicIndexing {
             None
         };
         if let Some(old) = sets.trial.as_ref().filter(|_| kept) {
-            sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+            super::trial::drop_record(&mut tx).await?;
             sqlx::query("UPDATE full_trials SET state = 'kept', ended_by = 'kept' WHERE id = $1").bind(old.id).execute(&mut *tx).await?;
         }
         if let Some(tr) = t.trial.as_ref().filter(|_| check) {
@@ -794,6 +818,22 @@ mod tests {
         // Any other table's mismatched cursor is still refused.
         let tags = json!({"table": "tag_activity_hourly", "after": 7, "last_advanced_at": "2026-10-14T05:00:00Z"});
         assert!(valid_state(&tags).is_none());
+    }
+
+    /// Only a trial's drain passes over the counts and the trend hours, and
+    /// its steps then remove the rows left at zero.
+    #[test]
+    fn a_trial_drain_leaves_counts_and_trends_to_their_triggers() {
+        for list in [SweepList::Today, SweepList::Full, SweepList::TrialFull] {
+            for t in TABLES {
+                let left = left_to_triggers(list, t.name);
+                assert_eq!(left, list == SweepList::TrialFull && matches!(t.name, "post_counts" | "tag_activity_hourly"), "{list:?} {}", t.name);
+            }
+        }
+        for step in [super::super::narrowing::TRIAL_ZERO_COUNTS, super::super::narrowing::TRIAL_ZERO_TRENDS] {
+            assert!(super::super::narrowing::TRIAL_FULL_DRAIN_STEP_NAMES.contains(&step), "{step}");
+            assert!(!super::super::narrowing::FULL_DRAIN_STEP_NAMES.contains(&step), "{step}");
+        }
     }
 
     #[test]

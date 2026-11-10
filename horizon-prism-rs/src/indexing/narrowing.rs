@@ -300,14 +300,18 @@ pub const TRIAL_STEP_NAMES: [&str; 39] = [
 ];
 
 /// A trial's drain from full: the drain's steps, with the trial's profiles
-/// cleared after the identity rows.
-pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 21] = [
+/// cleared after the identity rows, and the count rows and trend hours the
+/// drain's deletes left at zero removed (the drain's own tables leave them
+/// to their triggers).
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 23] = [
     "post_search",
     "blocks",
     "actor_self_records",
     "actors",
     TRIAL_PROFILES,
     "actor_counts",
+    TRIAL_ZERO_COUNTS,
+    TRIAL_ZERO_TRENDS,
     "constellation_counts",
     "record_tombstones",
     "did_cache",

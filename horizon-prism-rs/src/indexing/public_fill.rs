@@ -82,6 +82,11 @@ impl PublicIndexing {
         if let Some(last) = dids.last() {
             // 5. Staggered due times; a queued resync is left alone.
             let not_befores: Vec<DateTime<Utc>> = (0..dids.len()).map(|i| due(fill.since, fill.enqueued, i)).collect();
+            // A trial's fill records the jobs it touches, so its exit can
+            // put them back.
+            if guard.trial.as_ref().is_some_and(|t| t.state == super::trial::TrialState::Running) {
+                super::trial::record_fill_jobs(&mut tx, &dids).await?;
+            }
             jobs::enqueue_staggered(&mut tx, &dids, &not_befores).await?;
             next.after.clone_from(last);
             next.enqueued += u64::try_from(dids.len()).unwrap_or(u64::MAX);

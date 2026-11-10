@@ -456,6 +456,156 @@ pub async fn insert_entries(conn: &mut PgConnection, entries: &[Entry]) -> Resul
     Ok(())
 }
 
+/// Drop the record: its rows, emptied with `TRUNCATE`, which returns their
+/// disk at once, and the fill's jobs, deleted (a few rows per member and S
+/// account), so a fill batch still open does not hold the drop up.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn drop_record(conn: &mut PgConnection) -> Result<(), sqlx::Error> {
+    sqlx::query("TRUNCATE full_trial_rows").execute(&mut *conn).await?;
+    sqlx::query("DELETE FROM full_trial_jobs").execute(&mut *conn).await?;
+    Ok(())
+}
+
+/// Record the `resync` jobs of `dids` that the fill's enqueue is about to
+/// touch, as they are now, in the enqueue's transaction: a missing job, or
+/// one not queued (a queued job the enqueue leaves alone). A job already
+/// recorded keeps its first entry.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn record_fill_jobs(conn: &mut PgConnection, dids: &[String]) -> Result<(), sqlx::Error> {
+    if dids.is_empty() {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO full_trial_jobs (did, depth, existed, state, attempts, not_before, last_error, updated_at, generation, gap_epoch, \
+           rerun_requested, priority, refract_cursor, fill_generation) \
+         SELECT d, 'resync', j.did IS NOT NULL, j.state, j.attempts, j.not_before, j.last_error, j.updated_at, j.generation, j.gap_epoch, \
+           j.rerun_requested, j.priority, j.refract_cursor, COALESCE(j.generation + 1, 0) \
+         FROM unnest($1::text[]) AS t(d) LEFT JOIN backfill_jobs j ON j.did = t.d AND j.depth = 'resync' \
+         WHERE j.did IS NULL OR j.state <> 'queued' \
+         ON CONFLICT (did, depth) DO NOTHING",
+    )
+    .bind(dids)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// A recorded job the fill still holds: a job it created that is still
+/// there with the fill's generation, or one it queued again that is still
+/// queued or running with it.
+const FILL_JOB_HELD: &str = "j.generation = r.fill_generation AND (NOT r.existed OR j.state IN ('queued', 'running'))";
+
+/// Put the fill's jobs back as they were before the trial. A job the fill
+/// created goes; one it queued again gets its earlier state, unless the
+/// start mode queued it again since (a newer generation, still queued or
+/// running), which is left for the start mode. A job that was running
+/// before is queued once more, with a new generation, since its run was
+/// superseded. A worker still running the fill's generation finds its row
+/// changed and leaves it. Returns the jobs put back and removed.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn restore_fill_jobs(conn: &mut PgConnection) -> Result<(u64, u64), sqlx::Error> {
+    let restored = sqlx::query(
+        "UPDATE backfill_jobs j SET \
+           state = CASE WHEN r.state = 'running' THEN 'queued' ELSE r.state END, \
+           attempts = r.attempts, \
+           not_before = CASE WHEN r.state = 'running' THEN now() ELSE r.not_before END, \
+           last_error = r.last_error, \
+           updated_at = CASE WHEN r.state = 'running' THEN now() ELSE r.updated_at END, \
+           generation = CASE WHEN r.state = 'running' THEN j.generation + 1 ELSE r.generation END, \
+           gap_epoch = r.gap_epoch, rerun_requested = r.rerun_requested, priority = r.priority, refract_cursor = r.refract_cursor \
+         FROM full_trial_jobs r \
+         WHERE r.existed AND j.did = r.did AND j.depth = r.depth \
+           AND (j.generation = r.fill_generation OR (j.generation > r.fill_generation AND j.state NOT IN ('queued', 'running')))",
+    )
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    let removed = sqlx::query(
+        "DELETE FROM backfill_jobs j USING full_trial_jobs r \
+         WHERE NOT r.existed AND j.did = r.did AND j.depth = r.depth \
+           AND (j.generation = r.fill_generation OR j.state NOT IN ('queued', 'running'))",
+    )
+    .execute(&mut *conn)
+    .await?
+    .rows_affected();
+    Ok((restored, removed))
+}
+
+/// The recorded jobs the fill still holds (none once they are put back).
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn fill_jobs_held(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(&format!("SELECT count(*) FROM full_trial_jobs r JOIN backfill_jobs j ON j.did = r.did AND j.depth = r.depth WHERE {FILL_JOB_HELD}"))
+        .fetch_one(pool)
+        .await
+}
+
+/// Account ids per statement when the count rows are compared.
+const COUNT_RANGE: i32 = 1 << 20;
+
+/// Posts that stored likes, reposts, replies or quotes name and that have
+/// no count row above zero: rows the counts should hold and do not. Read
+/// in ranges of the subject's account id, one short statement each.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn missing_post_counts(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let max: Option<i32> = sqlx::query_scalar("SELECT max(id) FROM dids").fetch_one(pool).await?;
+    let max = max.unwrap_or(0);
+    let mut total = 0;
+    let mut lo = 0;
+    while lo <= max {
+        let hi = lo.saturating_add(COUNT_RANGE);
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM ( \
+               SELECT subj_author AS a, subj_rkey AS k FROM likes WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 \
+               UNION SELECT subj_author, subj_rkey FROM reposts WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 \
+               UNION SELECT parent_author, parent_rkey FROM posts WHERE parent_coll = 1 AND parent_author >= $1 AND parent_author < $2 \
+               UNION SELECT quote_author, quote_rkey FROM posts WHERE quote_coll = 1 AND quote_author >= $1 AND quote_author < $2 \
+             ) s WHERE a IS NOT NULL AND k IS NOT NULL AND NOT EXISTS (SELECT 1 FROM post_counts c WHERE c.author = s.a AND c.rkey = s.k \
+               AND (c.like_count > 0 OR c.repost_count > 0 OR c.reply_count > 0 OR c.quote_count > 0))",
+        )
+        .bind(lo)
+        .bind(hi)
+        .fetch_one(pool)
+        .await?;
+        total += n;
+        if hi == i32::MAX {
+            break;
+        }
+        lo = hi;
+    }
+    Ok(total)
+}
+
+/// The trend hours still within the trends cutoff, each with its rows that
+/// count anything: `{hour: rows}`.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn trend_hours(pool: &PgPool) -> Result<BTreeMap<String, i64>, sqlx::Error> {
+    let rows: Vec<(DateTime<Utc>, i64)> = sqlx::query_as(
+        "SELECT hour, count(*) FILTER (WHERE posts > 0 OR likes > 0 OR reposts > 0 OR replies > 0) FROM tag_activity_hourly \
+         WHERE hour >= trends_cutoff() GROUP BY hour",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(h, n)| (rfc3339(&h), n)).collect())
+}
+
 /// How the trial treats a table of the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -504,7 +654,7 @@ pub fn class_of(table: &str) -> Option<Class> {
         "post_counts" | "actor_counts" | "starter_pack_counts" | "odd_refs" | "post_search" | "tag_activity_hourly" => Class::Derived,
         "did_cache" | "constellation_counts" | "identity_refresh" | "learned_inbound_blocks" | "refract_record_reads" => Class::Cache,
         "dids" | "rkey_aliases" | "collections" | "record_dicts" => Class::Kept,
-        "_sqlx_migrations" | "full_trials" | "full_trial_rows" | "members" | "scope_dids" | "operator_settings" | "operator_settings_history"
+        "_sqlx_migrations" | "full_trials" | "full_trial_rows" | "full_trial_jobs" | "members" | "scope_dids" | "operator_settings" | "operator_settings_history"
         | "worker_state" | "backfill_jobs" | "sync_state" | "sync_chain_links" | "purging_dids" | "labels" | "mutes" | "list_mutes"
         | "thread_mutes" | "bookmarks" | "drafts" | "activity_subscriptions" | "notifications" | "purging" => Class::ModeIndependent,
         _ if prefixed.iter().any(|p| table.starts_with(p)) => Class::ModeIndependent,
@@ -633,7 +783,11 @@ pub async fn baseline(pool: &PgPool, free: Option<(u64, u64)>) -> Result<Value, 
     let collections: i64 = sqlx::query_scalar("SELECT count(*) FROM collections").fetch_one(pool).await?;
     let dicts: i64 = sqlx::query_scalar("SELECT count(*) FROM record_dicts").fetch_one(pool).await?;
     let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM worker_state ORDER BY key").fetch_all(pool).await?;
+    let missing_counts = missing_post_counts(pool).await?;
+    let trends = trend_hours(pool).await?;
     Ok(json!({
+        "post_counts_missing": missing_counts,
+        "trend_hours": trends,
         "tables": tables,
         "database_bytes": db,
         "free_bytes": free.map(|f| f.0),
@@ -830,7 +984,8 @@ impl PublicIndexing {
             };
             return Ok(Err(Refused(format!("No trial started: {what}."))));
         }
-        let record: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM full_trial_rows)").fetch_one(&self.pool).await?;
+        let record: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM full_trial_rows) OR EXISTS (SELECT 1 FROM full_trial_jobs)").fetch_one(&self.pool).await?;
         if record {
             return Ok(Err(Refused("No trial started: an earlier trial's record has not been dropped; run `full-trial dismiss` first.".into())));
         }
@@ -1070,7 +1225,7 @@ impl PublicIndexing {
             return Err(Refused(format!("The trial is {}; only a failed trial's record is dismissed.", t.state.as_str())));
         }
         let mut tx = self.pool.begin().await.map_err(db)?;
-        sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await.map_err(db)?;
+        drop_record(&mut tx).await.map_err(db)?;
         sqlx::query("UPDATE worker_state SET value = value - 'trial', updated_at = now() WHERE key = 'public_transition'")
             .execute(&mut *tx)
             .await

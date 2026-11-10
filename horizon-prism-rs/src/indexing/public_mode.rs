@@ -1245,7 +1245,7 @@ impl PublicIndexing {
                     .bind(TRANSITION_KEY)
                     .execute(&mut *tx)
                     .await?;
-                sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+                super::trial::drop_record(&mut tx).await?;
                 sqlx::query("UPDATE full_crawl SET state = 'pending', reason = NULL WHERE state = 'skipped' AND reason = 'trial'")
                     .execute(&mut *tx)
                     .await?;
@@ -1392,7 +1392,16 @@ impl PublicIndexing {
         .await?;
         upsert_transition(&mut tx, &change).await?;
         if drop_record {
-            sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+            super::trial::drop_record(&mut tx).await?;
+        }
+        // A trial's exit to kryphocron_only stops its fill and puts the
+        // fill's jobs back, so none is left queued for the mode it returns
+        // to. An exit to community fills S again anyway.
+        if trial_row == Some("ending") && next_trial.as_ref().is_some_and(|t| t.to == ScopeValue::KryphocronOnly) {
+            let (restored, removed) = super::trial::restore_fill_jobs(&mut tx).await?;
+            if restored + removed > 0 {
+                tracing::info!(event = "full_trial_jobs_restored", restored, removed, "the trial's fill jobs are back as they were before it");
+            }
         }
         if let (Some(state), Some(t)) = (trial_row, carried.as_ref()) {
             let ended_by = next_trial.as_ref().and_then(|n| n.ended_by.clone()).unwrap_or_else(|| state.to_string());

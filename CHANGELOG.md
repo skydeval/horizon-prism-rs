@@ -20,6 +20,13 @@ released.
   `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env`. A compose
   override that sets `app`'s image or build keeps working.
 
+### Fixed
+
+- A full trial started from `kryphocron_only` keeps the post counts and tag
+  activity from before the trial, and puts its fill's jobs back as they
+  were. Its check now fails if any of these differ. **Upgrade:** migration
+  0066.
+
 ## [0.2.0] (2026-11-09)
 
 Full network indexing.
@@ -49,9 +56,6 @@ Full network indexing.
 
 ### Known issues
 
-- A full trial started from `kryphocron_only` can, when it ends, remove post
-  counts and tag activity from before the trial and leave its fill's jobs
-  queued. Start trials from `community` until this is fixed.
 - Full ingest needs fast disk writes: one test host applied about a third of
   what three relays sent. Watch the consumer lag on Health during a trial.
 

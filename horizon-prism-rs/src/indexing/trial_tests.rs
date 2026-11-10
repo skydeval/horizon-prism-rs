@@ -337,6 +337,129 @@ async fn a_trial_from_kryphocron_only_fills_then_drains() {
     db.drop_db().await;
 }
 
+/// A kryphocron_only stack with state of its own before a trial: a count
+/// row from a member's like of a stranger's post, two trend hours, and
+/// finished `resync` jobs of the member and of an account outside S.
+/// Returns the writer and the count query of the stranger's post.
+async fn off_with_state(p: &PgPool) -> (PublicIndexing, ScopeState, Writer, String) {
+    let (pi, scope, w) = stack(p, ScopeValue::KryphocronOnly, Some(now() - TimeDelta::days(3))).await;
+    let liked = post_uri(STRANGER, "3kaaaaaaaab31");
+    assert_eq!(w.apply(MEMBER, &tid(1), &[like("3kaaaaaaaab30", &liked)], LIVE).await.expect("like").outcomes, [OpOutcome::Written]);
+    let likes = format!("SELECT COALESCE((SELECT like_count::bigint FROM post_counts pc WHERE (pc.author, pc.rkey) = (SELECT r.author, r.rkey FROM ref_of('{liked}') r)), 0)");
+    assert_eq!(count(p, &likes).await, 1, "the member's like counts");
+    exec(
+        p,
+        &format!(
+            "INSERT INTO tag_activity_hourly (tag, hour, posts) VALUES \
+               ('pretag', date_trunc('hour', now(), 'UTC') - interval '2 hours', 3), ('trialtag', date_trunc('hour', now(), 'UTC'), 1); \
+             INSERT INTO backfill_jobs (did, depth, state, attempts, generation, not_before, updated_at) VALUES \
+               ('{MEMBER}', 'resync', 'done', 0, 4, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z'), \
+               ('{OTHER}', 'resync', 'done', 0, 2, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');"
+        ),
+    )
+    .await;
+    (pi, scope, w, likes)
+}
+
+/// `(state, generation, updated before the trial)` of a DID's `resync` job.
+async fn resync_job(p: &PgPool, did: &str) -> Option<(String, i64, bool)> {
+    sqlx::query_as("SELECT state, generation, updated_at < '2026-01-02T00:00:00Z' FROM backfill_jobs WHERE did = $1 AND depth = 'resync'")
+        .bind(did)
+        .fetch_optional(p)
+        .await
+        .expect("job")
+}
+
+const TRIAL_TAG: &str = "SELECT COALESCE(sum(posts), 0)::bigint FROM tag_activity_hourly WHERE tag = 'trialtag'";
+const PRE_TAG: &str = "SELECT COALESCE(sum(posts), 0)::bigint FROM tag_activity_hourly WHERE tag = 'pretag'";
+
+/// A trial from kryphocron_only gives back what the start mode held: the
+/// drain leaves the count row of a member's like and the trend hours from
+/// before the trial (the trial's like and tagged post are taken back by
+/// their triggers), and the fill's jobs are put back as they were, the one
+/// it created removed; the check compares them and passes.
+#[tokio::test]
+async fn a_trial_from_kryphocron_only_leaves_counts_trends_and_jobs_as_they_were() {
+    let Some(db) = fresh_db("trial_off_state").await else {
+        return;
+    };
+    let p = &db.pool;
+    let (pi, scope, w, likes) = off_with_state(p).await;
+    pi.start_trial(bounds(), "cli").await.expect("start");
+    eventually("on, full", async || scope.public_mode() == PublicMode::On).await;
+    // The fill queued the member's job again and created S's.
+    assert_eq!(resync_job(p, MEMBER).await, Some(("queued".into(), 5, false)));
+    assert_eq!(resync_job(p, B).await.map(|j| (j.0, j.1)), Some(("queued".into(), 0)));
+    let recorded = count(p, "SELECT count(*) FROM full_trial_jobs").await;
+    let both = format!("SELECT count(*) FROM full_trial_jobs WHERE did IN ('{MEMBER}', '{B}')");
+    assert_eq!(count(p, &both).await, 2, "the member's and S's");
+    assert_eq!(count(p, &format!("SELECT count(*) FROM full_trial_jobs WHERE did = '{OTHER}'")).await, 0, "not a fill job");
+    // The trial: a stranger's like of the same post and a tagged post.
+    w.apply(STRANGER, &tid(2), &[like("3kaaaaaaaab32", &post_uri(STRANGER, "3kaaaaaaaab31")), tagged("3kaaaaaaaab33")], LIVE).await.expect("trial rows");
+    assert_eq!(count(p, &likes).await, 2);
+    assert_eq!(count(p, TRIAL_TAG).await, 2);
+    assert_eq!(pi.end_trial("manual").await.expect("end").expect("ended").action, "draining");
+    settled(&scope).await;
+    assert_eq!(scope.public_mode(), PublicMode::Off);
+    assert_eq!(count(p, &likes).await, 1, "the member's like still counts");
+    assert_eq!((count(p, PRE_TAG).await, count(p, TRIAL_TAG).await), (3, 1), "the trend hours from before the trial stay");
+    assert_eq!(resync_job(p, MEMBER).await, Some(("done".into(), 4, true)), "the member's job is as it was");
+    assert_eq!(resync_job(p, B).await, None, "the job the fill created is gone");
+    assert_eq!(resync_job(p, OTHER).await, Some(("done".into(), 2, true)), "a job the fill did not touch");
+    let (state, result) = last_trial(p).await;
+    assert_eq!(state, "passed", "{result}");
+    let held = &result["start_mode"];
+    assert_eq!((&held["post_counts_missing"]["now"], &held["trend_rows_lost"], &held["fill_jobs"]["recorded"]), (&json!(0), &json!(0), &json!(recorded)), "{result}");
+    assert!(result["words"].as_str().unwrap_or_default().contains(&format!("the fill's {recorded} jobs put back")), "{result}");
+    assert_eq!(count(p, "SELECT count(*) FROM full_trial_jobs").await, 0, "the record is dropped");
+    db.drop_db().await;
+}
+
+/// The check fails when the start mode's own state is not back: a count
+/// row stored rows still need (repaired), a trend row from before the trial
+/// (not repairable: it fails again until dismissed) and a fill job left
+/// queued (put back).
+#[tokio::test]
+async fn the_check_fails_on_lost_counts_trends_and_jobs() {
+    let Some(db) = fresh_db("trial_off_lost").await else {
+        return;
+    };
+    let p = &db.pool;
+    let (pi, scope, _w, likes) = off_with_state(p).await;
+    pi.start_trial(bounds(), "cli").await.expect("start");
+    eventually("on, full", async || scope.public_mode() == PublicMode::On).await;
+    let pause = pi.hooks.arm("trial_check");
+    pi.end_trial("manual").await.expect("end");
+    pause.0.notified().await;
+    // What the exit used to do.
+    exec(
+        p,
+        &format!(
+            "DELETE FROM post_counts; DELETE FROM tag_activity_hourly WHERE tag = 'pretag'; \
+             UPDATE backfill_jobs SET state = 'queued', generation = 5 WHERE did = '{MEMBER}' AND depth = 'resync';"
+        ),
+    )
+    .await;
+    pause.1.notify_one();
+    settled(&scope).await;
+    let (state, result) = last_trial(p).await;
+    assert_eq!(state, "failed", "{result}");
+    let causes = result["causes"].to_string();
+    for part in ["had no count row", "trend rows from before the trial are gone", "jobs had not been put back"] {
+        assert!(causes.contains(part), "{part}: {causes}");
+    }
+    assert_eq!(count(p, &likes).await, 1, "the count row is repaired");
+    assert_eq!(resync_job(p, MEMBER).await, Some(("done".into(), 4, true)), "the job is put back");
+    pi.recheck_trial().await.expect("check again");
+    settled(&scope).await;
+    let (state, result) = last_trial(p).await;
+    assert_eq!(state, "failed", "the trend row is still gone: {result}");
+    assert_eq!(result["causes"].as_array().map(Vec::len), Some(1), "{result}");
+    pi.dismiss_trial().await.expect("dismiss");
+    assert_eq!(count(p, "SELECT count(*) FROM full_trial_jobs").await, 0);
+    db.drop_db().await;
+}
+
 // ---------------------------------------------------------------------
 // Full's labels at the exit.
 // ---------------------------------------------------------------------

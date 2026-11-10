@@ -166,6 +166,68 @@ impl Counts {
 /// One classified key.
 type Classified = (i32, i64, i16, Option<i64>, bool, bool, Option<String>);
 
+/// What the start mode held before the trial, against now: posts whose
+/// count rows are missing though stored rows name them (the baseline's
+/// figure and now's), trend rows of the hours before the trial that are
+/// gone, and the fill's jobs that were not put back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StartHeld {
+    missing_start: Option<i64>,
+    missing_now: i64,
+    counts_repaired: bool,
+    trends_compared: bool,
+    trend_rows_lost: i64,
+    jobs_recorded: i64,
+    jobs_held: i64,
+}
+
+impl StartHeld {
+    fn causes(&self, from: ScopeValue) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(start) = self.missing_start
+            && self.missing_now > start
+        {
+            out.push(format!(
+                "{} posts that stored rows name had no count row ({start} before the trial); the counts were repaired",
+                self.missing_now
+            ));
+        }
+        if self.trend_rows_lost > 0 {
+            out.push(format!("{} of {}'s trend rows from before the trial are gone", self.trend_rows_lost, from.as_str()));
+        }
+        if self.jobs_held > 0 {
+            out.push(format!("{} of the fill's {} jobs had not been put back; they are now", self.jobs_held, self.jobs_recorded));
+        }
+        out
+    }
+
+    fn words(&self, from: ScopeValue) -> String {
+        let from = from.as_str();
+        let mut parts = vec![match self.missing_start {
+            Some(start) if self.missing_now > start => format!("{} posts lost their count rows, repaired", n_words(u64::try_from(self.missing_now - start).unwrap_or(0))),
+            Some(_) => "count rows as before".to_string(),
+            None => "count rows not in the baseline".to_string(),
+        }];
+        parts.push(match (self.trends_compared, self.trend_rows_lost) {
+            (false, _) => "trend hours not compared".to_string(),
+            (true, 0) => "trend hours as before".to_string(),
+            (true, n) => format!("{} trend rows gone", n_words(u64::try_from(n).unwrap_or(0))),
+        });
+        if self.jobs_recorded > 0 {
+            parts.push(format!("the fill's {} jobs put back as they were", n_words(u64::try_from(self.jobs_recorded).unwrap_or(0))));
+        }
+        format!("{from}'s own state: {}.", parts.join("; "))
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "post_counts_missing": { "start": self.missing_start, "now": self.missing_now, "repaired": self.counts_repaired },
+            "trend_rows_lost": if self.trends_compared { json!(self.trend_rows_lost) } else { Value::Null },
+            "fill_jobs": { "recorded": self.jobs_recorded, "not_put_back": self.jobs_held },
+        })
+    }
+}
+
 impl PublicIndexing {
     /// Spawn the check.
     #[must_use]
@@ -263,6 +325,9 @@ impl PublicIndexing {
         let left_after: u64 = Counts::total(&again.missed) + Counts::total(&again.unexplained) + self.check_derived(&t, false).await?.iter().map(|(_, n)| n).sum::<u64>();
         // 3. Counts of the subjects the trial moved.
         let (posts, accounts, repaired) = self.check_counts().await?;
+        // What the start mode held before the trial: its count rows, its
+        // trend hours and its jobs.
+        let held = self.check_start_mode(&t).await?;
         // 4. The tables only full writes.
         let mut full_left = Vec::new();
         for table in FULL_ONLY {
@@ -300,8 +365,9 @@ impl PublicIndexing {
         if !sane {
             causes.push(format!("full admitted {full_decisions} ops but the record is empty: the record was not being written"));
         }
+        causes.extend(held.causes(t.from));
         let passed = causes.is_empty();
-        let words = result_words(&t, &counts, (posts, accounts, repaired), &full_left, (labels_start, labels_exit), &report, &causes);
+        let words = result_words(&t, &counts, (posts, accounts, repaired, &held.words(t.from)), &full_left, (labels_start, labels_exit), &report, &causes);
         let faults = Counts::total(&counts.missed) + Counts::total(&counts.unexplained);
         for (result, n) in [
             ("removed", counts.removed),
@@ -320,6 +386,7 @@ impl PublicIndexing {
             "recorded_total": recorded_total,
             "full_decisions": full_decisions,
             "counts_checked": { "posts": posts, "accounts": accounts, "repaired": repaired },
+            "start_mode": held.to_json(),
             "full_only_left": full_left,
             "full_labels": { "rows_at_start": labels_start, "emptied_by": labels_exit.as_str() },
             "report": report,
@@ -334,7 +401,7 @@ impl PublicIndexing {
         }
         let mut tx = self.pool.begin().await?;
         let n = if passed {
-            sqlx::query("TRUNCATE full_trial_rows").execute(&mut *tx).await?;
+            super::trial::drop_record(&mut tx).await?;
             sqlx::query(
                 "UPDATE worker_state SET value = value - 'trial', updated_at = now() \
                  WHERE key = 'public_transition' AND (value->'trial'->>'id')::bigint = $1 AND value->'trial'->>'state' = 'checking'",
@@ -602,6 +669,51 @@ impl PublicIndexing {
         Ok((u64::try_from(posts.len()).unwrap_or(0), u64::try_from(accounts.len()).unwrap_or(0), repaired))
     }
 
+    /// What the start mode held before the trial, against the baseline: no
+    /// post that stored rows name may have lost its count row (they are
+    /// repaired if one did); and when the trial returned to its start mode,
+    /// no hour before the trial that is still within the trends cutoff may
+    /// have fewer trend rows, and every job the fill touched must be back as
+    /// it was (one that is not is put back). A baseline taken before these
+    /// figures existed is not compared.
+    async fn check_start_mode(&self, t: &Trial) -> Result<StartHeld, sqlx::Error> {
+        let base: Value = sqlx::query_scalar("SELECT baseline FROM full_trials WHERE id = $1").bind(t.id).fetch_optional(&self.pool).await?.unwrap_or(Value::Null);
+        let mut held = StartHeld { missing_start: base.get("post_counts_missing").and_then(Value::as_i64), ..StartHeld::default() };
+        held.missing_now = super::trial::missing_post_counts(&self.pool).await?;
+        if held.missing_start.is_some_and(|s| held.missing_now > s) {
+            crate::aggregations::rebuild::repair_counts_keyset(&self.pool).await?;
+            held.counts_repaired = true;
+        }
+        if t.to == t.from
+            && let Some(hours) = base.get("trend_hours").and_then(Value::as_object)
+        {
+            held.trends_compared = true;
+            // An hour about to pass the cutoff may be pruned meanwhile.
+            let cutoff: DateTime<Utc> = sqlx::query_scalar("SELECT trends_cutoff() + interval '1 hour'").fetch_one(&self.pool).await?;
+            let now_hours = super::trial::trend_hours(&self.pool).await?;
+            for (hour, n) in hours {
+                let (Some(at), Some(n)) = (super::public_mode::parse_ts(&json!(hour)), n.as_i64()) else {
+                    continue;
+                };
+                if at >= cutoff {
+                    held.trend_rows_lost += (n - now_hours.get(hour).copied().unwrap_or(0)).max(0);
+                }
+            }
+        }
+        // An exit to community fills S again, so the jobs are its own.
+        if t.to != t.from {
+            return Ok(held);
+        }
+        held.jobs_recorded = sqlx::query_scalar("SELECT count(*) FROM full_trial_jobs").fetch_one(&self.pool).await?;
+        held.jobs_held = super::trial::fill_jobs_held(&self.pool).await?;
+        if held.jobs_held > 0 {
+            let mut tx = self.pool.begin().await?;
+            super::trial::restore_fill_jobs(&mut tx).await?;
+            tx.commit().await?;
+        }
+        Ok(held)
+    }
+
     /// Step 6: what compact storage keeps, every table before and now beside
     /// the start mode's own writes, and the database before and now.
     async fn trial_report(&self, t: &Trial) -> Result<Value, sqlx::Error> {
@@ -712,7 +824,7 @@ fn cause_words(c: Option<&str>) -> &'static str {
 fn result_words(
     t: &Trial,
     c: &Counts,
-    counted: (u64, u64, u64),
+    counted: (u64, u64, u64, &str),
     full_left: &[String],
     labels: (Option<i64>, super::narrowing::LabelsExit),
     report: &Value,
@@ -779,13 +891,14 @@ fn result_words(
     if !c.samples.is_empty() {
         out.push(format!("Keys: {}.", c.samples.join("; ")));
     }
-    let (posts, accounts, repaired) = counted;
+    let (posts, accounts, repaired, held) = counted;
     out.push(format!(
         "Counts checked for {} posts and {} accounts: {}.",
         n_words(posts),
         n_words(accounts),
         if repaired == 0 { "all match".to_string() } else { format!("{repaired} repaired") }
     ));
+    out.push(held.to_string());
     out.push(match labels {
         (_, super::narrowing::LabelsExit::Truncate) => "Full labels: none when the trial started; the exit truncated the table.".to_string(),
         (Some(n), super::narrowing::LabelsExit::Delete) => format!("Full labels: {} when the trial started, left by an earlier full; the exit deleted every row.", n_words(u64::try_from(n).unwrap_or(0))),
