@@ -13,6 +13,9 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   source-checks:
     runs-on: ubuntu-24.04
@@ -38,18 +41,10 @@ jobs:
           leaks="$(grep -v '^src/system_accounts/' /tmp/sysacct_refs || true)"
           if [ -n "$leaks" ]; then echo "system-accounts table referenced outside src/system_accounts/:"; echo "$leaks"; exit 1; fi
 
-  rust:
+  clippy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 150
-    env:
-      CARGO_TERM_COLOR: always
-      HPRS_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/postgres
-      HPRS_TEST_REDIS_URL: redis://127.0.0.1:6379
-      HPRS_REQUIRE_REPO_TEXT: "1"
+    timeout-minutes: 60
     steps:
-      - name: Free runner disk
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@1.90.0
@@ -59,9 +54,74 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: horizon-prism-rs
+          shared-key: clippy
 
       - name: proto-blue-codegen (the lexicon build runs it)
         run: command -v proto-blue-codegen || cargo install proto-blue-codegen --locked --version 0.3.3
+
+      - name: Clippy
+        working-directory: horizon-prism-rs
+        run: cargo clippy --release --locked --all-targets -- -D warnings
+
+  build-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.90.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: horizon-prism-rs
+          shared-key: tests
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: proto-blue-codegen (the lexicon build runs it)
+        run: command -v proto-blue-codegen || cargo install proto-blue-codegen --locked --version 0.3.3
+
+      - name: Build the tests once
+        working-directory: horizon-prism-rs
+        run: cargo nextest archive --release --locked --all-targets --archive-file "$RUNNER_TEMP/tests.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests
+          path: ${{ runner.temp }}/tests.tar.zst
+          retention-days: 1
+
+  test:
+    needs: build-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    env:
+      HPRS_TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/postgres
+      HPRS_TEST_REDIS_URL: redis://127.0.0.1:6379
+      HPRS_REQUIRE_REPO_TEXT: "1"
+    steps:
+      - name: Free runner disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - uses: actions/checkout@v4
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests
+          path: ${{ runner.temp }}
 
       - name: Postgres 16 and Redis 7
         run: |
@@ -76,11 +136,12 @@ jobs:
           done
           exit 1
 
-      - name: Clippy
-        working-directory: horizon-prism-rs
-        run: cargo clippy --release --locked --all-targets -- -D warnings
-
-      - name: Tests
-        working-directory: horizon-prism-rs
+      - name: Tests, part ${{ matrix.partition }} of 4
         # The microbenchmark has a 5 µs wall-clock bound a shared runner can miss.
-        run: cargo test --release --locked --all-targets -- --skip lean_decode_microbenchmark
+        run: >
+          cargo nextest run
+          --archive-file "$RUNNER_TEMP/tests.tar.zst"
+          --workspace-remap horizon-prism-rs
+          --partition count:${{ matrix.partition }}/4
+          --no-fail-fast
+          -E 'not test(lean_decode_microbenchmark)'
