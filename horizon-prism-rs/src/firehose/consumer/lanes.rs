@@ -82,7 +82,7 @@ pub(super) struct Done {
     /// Its relay's watermark contribution.
     pub watermark: Option<(String, DateTime<Utc>)>,
     /// The copy to mark seen.
-    pub seen: Option<(String, CopyKey)>,
+    pub seen: Option<Seen>,
     /// A duplicate copy, dropped.
     pub duplicate: bool,
 }
@@ -98,6 +98,17 @@ impl Done {
         metrics::counter!(dedupe::METRIC_DROPPED, "relay" => label.to_string()).increment(1);
         Self { watermark, duplicate: true, ..Self::nothing() }
     }
+}
+
+/// A committed copy with a key: marked seen when its round is booked.
+#[derive(Debug, Clone)]
+pub(super) struct Seen {
+    pub repo: String,
+    pub key: CopyKey,
+    /// Its relay's label.
+    pub relay: String,
+    /// Its stream entry id's milliseconds.
+    pub ms: Option<i64>,
 }
 
 /// The low-water entry: the oldest entry read and not yet committed or
@@ -148,10 +159,10 @@ impl Lane {
         key.is_some_and(|k| self.seen.get(repo).is_some_and(|keys| keys.iter().any(|s| k.dropped_by(s))))
     }
 
-    fn committed(&mut self, repo: &str, key: Option<CopyKey>) -> Option<(String, CopyKey)> {
+    fn committed(&mut self, repo: &str, key: Option<CopyKey>, relay: &str, ms: Option<i64>) -> Option<Seen> {
         let key = key?;
         self.seen.entry(repo.to_string()).or_default().push(key);
-        Some((repo.to_string(), key))
+        Some(Seen { repo: repo.to_string(), key, relay: relay.to_string(), ms })
     }
 
     /// Apply one entry.
@@ -167,7 +178,7 @@ impl Lane {
                 if let Some(ms) = entry.id_ms() {
                     self.writer.apply_sync(&did, &rev, tier, ms).await?;
                 }
-                let seen = self.committed(&did, key);
+                let seen = self.committed(&did, key, &label, entry.id_ms());
                 Ok(Done { seen, ..Done::nothing() })
             }
             Work::Identity { kind, did, relay, active, status, label } => self.identity(entry, kind, &did, relay.as_deref(), active, status.as_deref(), &label).await,
@@ -231,16 +242,19 @@ impl Lane {
                 (sets.public.breadth == crate::indexing::Breadth::Full, sets.full.status_relays.clone(), hides, groups, restored)
             };
             if full && relays.iter().any(|r| r.as_str() == label) {
-                crate::indexing::full::record_relay_status(&self.pool, did, label, active, status).await?;
+                // One transaction for the event's statements.
+                let mut tx = self.pool.begin().await?;
+                crate::indexing::full::record_relay_status_in(&mut tx, did, label, active, status).await?;
                 // A deactivation or a deletion hides the account at once,
                 // until the refresher confirms or undoes it; never for an
                 // account Refract lists.
                 if active == Some(false) && !restored {
-                    crate::indexing::full::provisional_status(&self.pool, did, status).await?;
+                    crate::indexing::full::provisional_status_in(&mut tx, did, status).await?;
                 }
                 // The crawl follows the account: a deletion or a suspension
                 // refuses an in-flight crawl, a return to active queues one.
-                crate::indexing::crawl::state::account_status(&self.pool, did, active, status, hides, &groups).await?;
+                crate::indexing::crawl::state::account_status_in(&mut tx, did, active, status, hides, &groups).await?;
+                tx.commit().await?;
             } else if full && active == Some(false) && label == super::super::watermark::UNKNOWN_RELAY {
                 tracing::warn!(event = "firehose_unaliased_status", relay = ?relay, %did, "an account status from a relay URL with no label or alias; list it in firehose.relay_aliases if it stands in for a takedown relay");
             }
@@ -302,7 +316,7 @@ impl Lane {
                 .collect();
             self.dead_letter(&letters).await?;
         }
-        let seen = self.committed(&commit.repo, key);
+        let seen = self.committed(&commit.repo, key, &label, entry.id_ms());
         Ok(Done {
             path: if report.transaction { EntryPath::Tx } else { EntryPath::NoTx },
             outline: report.outline,

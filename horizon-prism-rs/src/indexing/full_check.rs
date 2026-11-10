@@ -122,6 +122,9 @@ pub async fn run(cfg: &AppConfig, params: &Params) -> Result<String, String> {
         let _ = writeln!(out, "The result could not be kept for Health ({e}).");
     }
     out.push_str(&report);
+    for line in crate::indexing::full::postgres_warnings(&admin).await {
+        let _ = writeln!(out, "{line}");
+    }
     if params.keep {
         let _ = writeln!(out, "The scratch database {scratch} was kept.");
     }

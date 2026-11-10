@@ -1532,8 +1532,15 @@ impl PublicIndexing {
         };
         let w = self.tier_board.writer();
         #[allow(clippy::cast_precision_loss)]
-        let dedupe_rate = if w.entries == 0 { 0.0 } else { w.deduped as f64 / w.entries as f64 };
-        let writer = json!({ "lanes": w.lanes, "dedupe": w.dedupe, "entries": w.entries, "deduped": w.deduped, "dedupe_rate": dedupe_rate });
+        let dedupe_rate = if w.window_entries == 0 { 0.0 } else { w.window_deduped as f64 / w.window_entries as f64 };
+        let writer = json!({
+            "lanes": w.lanes,
+            "dedupe": w.dedupe,
+            "entries": w.entries,
+            "deduped": w.deduped,
+            "dedupe_rate": dedupe_rate,
+            "dedupe_rate_window_secs": crate::firehose::consumer::DEDUPE_WINDOW.as_secs(),
+        });
         let trial = self.trial_status().await?;
         let full = self.full_status().await?;
         Ok(json!({

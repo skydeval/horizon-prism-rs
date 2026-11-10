@@ -160,18 +160,27 @@ pub async fn excluded_dids(conn: &mut sqlx::PgConnection) -> Result<Vec<String>,
 ///
 /// Any database error.
 pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, active: Option<bool>, status: Option<&str>) -> Result<(), sqlx::Error> {
+    record_relay_status_in(&mut *pool.acquire().await?, did, relay, active, status).await
+}
+
+/// [`record_relay_status`] on `conn`, in its transaction if it has one.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn record_relay_status_in(conn: &mut sqlx::PgConnection, did: &str, relay: &str, active: Option<bool>, status: Option<&str>) -> Result<(), sqlx::Error> {
     match active {
         None => Ok(()),
         Some(true) => {
             sqlx::query("DELETE FROM relay_account_status r USING dids d WHERE d.id = r.account AND d.did = $1 AND r.relay = $2")
                 .bind(did)
                 .bind(relay)
-                .execute(pool)
+                .execute(&mut *conn)
                 .await?;
             Ok(())
         }
         Some(false) => {
-            sqlx::query("INSERT INTO dids (did) VALUES ($1) ON CONFLICT (did) DO NOTHING").bind(did).execute(pool).await?;
+            sqlx::query("INSERT INTO dids (did) VALUES ($1) ON CONFLICT (did) DO NOTHING").bind(did).execute(&mut *conn).await?;
             sqlx::query(
                 "INSERT INTO relay_account_status (account, relay, status) SELECT id, $2, $3 FROM dids WHERE did = $1 \
                  ON CONFLICT (account, relay) DO UPDATE SET status = EXCLUDED.status",
@@ -179,7 +188,7 @@ pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, ac
             .bind(did)
             .bind(relay)
             .bind(status.unwrap_or("inactive"))
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
             metrics::counter!(METRIC_SUSPENDED, "relay" => relay.to_string()).increment(1);
             Ok(())
@@ -198,6 +207,15 @@ pub async fn record_relay_status(pool: &sqlx::PgPool, did: &str, relay: &str, ac
 ///
 /// Any database error.
 pub async fn provisional_status(pool: &sqlx::PgPool, did: &str, status: Option<&str>) -> Result<bool, sqlx::Error> {
+    provisional_status_in(&mut *pool.acquire().await?, did, status).await
+}
+
+/// [`provisional_status`] on `conn`, in its transaction if it has one.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn provisional_status_in(conn: &mut sqlx::PgConnection, did: &str, status: Option<&str>) -> Result<bool, sqlx::Error> {
     let Some(status) = status.filter(|s| matches!(*s, "deactivated" | "deleted")) else {
         return Ok(false);
     };
@@ -207,7 +225,7 @@ pub async fn provisional_status(pool: &sqlx::PgPool, did: &str, status: Option<&
     )
     .bind(did)
     .bind(status)
-    .execute(pool)
+    .execute(conn)
     .await?
     .rows_affected();
     if n > 0 {
@@ -427,6 +445,88 @@ pub fn more_warnings(file: &crate::config::FileConfig, last_check: Option<String
     out
 }
 
+/// The Postgres settings full's warnings read, never write.
+pub const POSTGRES_SETTINGS: [&str; 6] = ["shared_buffers", "synchronous_commit", "max_wal_size", "checkpoint_timeout", "effective_io_concurrency", "random_page_cost"];
+
+/// One `pg_settings` row: its name, value and unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PgSetting {
+    pub name: String,
+    pub setting: String,
+    pub unit: Option<String>,
+}
+
+impl PgSetting {
+    /// The value in bytes or seconds, for a numeric setting.
+    fn base(&self) -> Option<f64> {
+        let v: f64 = self.setting.parse().ok()?;
+        let scale = match self.unit.as_deref() {
+            None | Some("") | Some("s") => 1.0,
+            Some("8kB") => 8192.0,
+            Some("kB") => 1024.0,
+            Some("MB") => 1024.0 * 1024.0,
+            Some("ms") => 0.001,
+            Some("min") => 60.0,
+            Some(_) => return None,
+        };
+        Some(v * scale)
+    }
+}
+
+/// Lines for the Postgres settings that are at Postgres's default (or
+/// worse for full), with advice in words. Prism never changes them; the
+/// operator tunes them for the machine.
+#[must_use]
+pub fn settings_warnings(settings: &[PgSetting]) -> Vec<String> {
+    const MB: f64 = 1024.0 * 1024.0;
+    let get = |name: &str| settings.iter().find(|s| s.name == name);
+    let mut out = Vec::new();
+    if let Some(v) = get("shared_buffers").and_then(PgSetting::base)
+        && v <= 128.0 * MB
+    {
+        out.push(format!("Postgres's shared_buffers is {:.0} MB, Postgres's default; for full, a quarter of the machine's memory is usual.", v / MB));
+    }
+    if let Some(v) = get("max_wal_size").and_then(PgSetting::base)
+        && v <= 1024.0 * MB
+    {
+        out.push(format!("Postgres's max_wal_size is {:.0} MB, Postgres's default; full writes WAL fast, and 4 to 16 GB spaces checkpoints out.", v / MB));
+    }
+    if let Some(v) = get("checkpoint_timeout").and_then(PgSetting::base)
+        && v <= 300.0
+    {
+        out.push(format!("Postgres's checkpoint_timeout is {:.0} minutes, Postgres's default; 15 to 30 minutes is usual for a write-heavy database.", v / 60.0));
+    }
+    if let Some(v) = get("effective_io_concurrency").and_then(PgSetting::base)
+        && v <= 1.0
+    {
+        out.push("Postgres's effective_io_concurrency is 1, Postgres's default; on an SSD, 200 is usual.".to_string());
+    }
+    if let Some(v) = get("random_page_cost").and_then(PgSetting::base)
+        && v >= 4.0
+    {
+        out.push("Postgres's random_page_cost is 4, Postgres's default for spinning disks; on an SSD, 1.1 is usual.".to_string());
+    }
+    if get("synchronous_commit").is_some_and(|s| s.setting == "off") {
+        out.push("Postgres's synchronous_commit is off: a database crash can lose the last commits Prism acknowledged to the stream, which it does not read again.".to_string());
+    }
+    out
+}
+
+/// [`settings_warnings`] for the database `pool` reaches; none when the
+/// settings cannot be read.
+pub async fn postgres_warnings(pool: &sqlx::PgPool) -> Vec<String> {
+    let names: Vec<String> = POSTGRES_SETTINGS.iter().map(|s| (*s).to_string()).collect();
+    let rows: Result<Vec<(String, String, Option<String>)>, sqlx::Error> =
+        sqlx::query_as("SELECT name, setting, unit FROM pg_settings WHERE name = ANY($1)").bind(&names).fetch_all(pool).await;
+    match rows {
+        Ok(rows) => settings_warnings(&rows.into_iter().map(|(name, setting, unit)| PgSetting { name, setting, unit }).collect::<Vec<_>>()),
+        Err(error) => {
+            tracing::debug!(event = "full_postgres_settings_unread", %error, "Postgres settings could not be read");
+            Vec::new()
+        }
+    }
+}
+
 /// The live writer against the relays, over the last minutes, in words:
 /// entries the relays added a second and entries Prism applied a second.
 #[must_use]
@@ -532,5 +632,37 @@ mod tests {
         assert!(likes_only[0].contains("about 100 days"), "{likes_only:?}");
         assert!(w.iter().any(|l| l.contains("One writer lane")) && likes_only.iter().any(|l| l.starts_with("4 writer lanes")));
         assert!(likes_only.iter().any(|l| l.contains("not set")));
+    }
+
+    #[test]
+    fn postgres_settings_at_their_defaults_are_named() {
+        let s = |name: &str, setting: &str, unit: Option<&str>| PgSetting { name: name.into(), setting: setting.into(), unit: unit.map(str::to_string) };
+        // Postgres 16's defaults as `pg_settings` reports them.
+        let defaults = [
+            s("shared_buffers", "16384", Some("8kB")),
+            s("synchronous_commit", "on", None),
+            s("max_wal_size", "1024", Some("MB")),
+            s("checkpoint_timeout", "300", Some("s")),
+            s("effective_io_concurrency", "1", None),
+            s("random_page_cost", "4", None),
+        ];
+        let w = settings_warnings(&defaults);
+        assert_eq!(w.len(), 5, "{w:?}");
+        assert!(w[0].contains("shared_buffers is 128 MB, Postgres's default; for full, a quarter of the machine's memory is usual"), "{w:?}");
+        assert!(w.iter().any(|l| l.contains("max_wal_size is 1024 MB")));
+        assert!(w.iter().any(|l| l.contains("checkpoint_timeout is 5 minutes")));
+        // Tuned values are not named; synchronous_commit only when off.
+        let tuned = [
+            s("shared_buffers", "262144", Some("8kB")),
+            s("synchronous_commit", "off", None),
+            s("max_wal_size", "8192", Some("MB")),
+            s("checkpoint_timeout", "900", Some("s")),
+            s("effective_io_concurrency", "200", None),
+            s("random_page_cost", "1.1", None),
+        ];
+        let w = settings_warnings(&tuned);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("synchronous_commit is off"));
+        assert!(settings_warnings(&[]).is_empty());
     }
 }

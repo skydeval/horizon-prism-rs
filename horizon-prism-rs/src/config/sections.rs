@@ -1058,12 +1058,69 @@ impl Default for IndexRequestConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct DbConfig {
     pub lock_timeout_secs: u64,
+    /// The database connections Prism opens at most: `"auto"` sizes the
+    /// pool from the writers that hold connections, or a number.
+    pub pool_size: PoolSize,
 }
 
 impl Default for DbConfig {
     fn default() -> Self {
         Self {
             lock_timeout_secs: 30,
+            pool_size: PoolSize::Auto,
+        }
+    }
+}
+
+/// `[db] pool_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PoolSize {
+    /// 16, plus one connection for each writer lane, history-crawl claimer
+    /// and backfill worker.
+    #[default]
+    Auto,
+    Fixed(u32),
+}
+
+impl PoolSize {
+    /// Connections that are not a writer's: HTTP reads, samplers and the
+    /// other background tasks.
+    pub const BASE: u32 = 16;
+
+    /// The pool's size for `file`.
+    #[must_use]
+    pub fn connections(self, file: &FileConfig) -> u32 {
+        match self {
+            Self::Fixed(n) => n,
+            Self::Auto => Self::BASE
+                .saturating_add(file.firehose.writer_lanes)
+                .saturating_add(file.full_crawl.concurrency)
+                .saturating_add(file.backfill.concurrency),
+        }
+    }
+}
+
+impl Serialize for PoolSize {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::Fixed(n) => s.serialize_u32(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolSize {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Number(u32),
+            Word(String),
+        }
+        match Raw::deserialize(d)? {
+            Raw::Number(n) => Ok(Self::Fixed(n)),
+            Raw::Word(w) if w == "auto" => Ok(Self::Auto),
+            Raw::Word(w) => Err(serde::de::Error::custom(format!("pool_size must be \"auto\" or a number, not {w:?}"))),
         }
     }
 }

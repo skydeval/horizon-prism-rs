@@ -49,6 +49,73 @@ pub const METRIC_LWW_SKIPPED: &str = "lww_skipped";
 /// Metric: full-arm ops of Aside copies that were dropped, by relay.
 pub const METRIC_ASIDE_DROPPED: &str = "firehose_aside_dropped_total";
 
+/// Metric: the time a writer lane's transactions spend in each phase.
+pub const METRIC_PHASE: &str = "firehose_lane_phase_seconds";
+
+/// A phase of a writer transaction, for [`METRIC_PHASE`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// Interning ids, before the transaction.
+    Ids,
+    /// Waiting for a pooled connection and `BEGIN`.
+    Acquire,
+    /// Advisory locks and the checks after them.
+    Locks,
+    /// The ops' own statements.
+    Ops,
+    /// Applying the counts a transaction deferred.
+    Counts,
+    /// Full indexing's continuity statements.
+    Continuity,
+    /// `COMMIT`, and its flush.
+    Commit,
+}
+
+impl Phase {
+    pub const ALL: [Self; 7] = [Self::Ids, Self::Acquire, Self::Locks, Self::Ops, Self::Counts, Self::Continuity, Self::Commit];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ids => "ids",
+            Self::Acquire => "acquire",
+            Self::Locks => "locks",
+            Self::Ops => "ops",
+            Self::Counts => "counts",
+            Self::Continuity => "continuity",
+            Self::Commit => "commit",
+        }
+    }
+}
+
+/// A transaction's phase clock: each mark records the time since the last.
+struct Phases {
+    on: bool,
+    at: std::time::Instant,
+}
+
+impl Phases {
+    fn new(on: bool) -> Self {
+        Self { on, at: std::time::Instant::now() }
+    }
+
+    fn mark(&mut self, phase: Phase) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        let took = now.duration_since(self.at);
+        self.at = now;
+        if self.on {
+            metrics::histogram!(METRIC_PHASE, "phase" => phase.as_str()).record(took.as_secs_f64());
+        }
+        took
+    }
+
+    /// The connection was acquired and the transaction begun.
+    fn acquired(&mut self) {
+        let took = self.mark(Phase::Acquire);
+        crate::db::pool::record_acquire(took);
+    }
+}
+
 /// A commit op's action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -1282,6 +1349,7 @@ impl Writer {
             return Ok(report);
         }
 
+        let mut phases = Phases::new(options.source == WriteSource::Firehose);
         // Ids for the rows this commit writes, in their own statements
         // before the transaction, so a rollback leaves no cached id that
         // does not exist.
@@ -1290,8 +1358,10 @@ impl Writer {
             Some(_) => self.ids.account_ids(&[repo.to_string()]).await?.get(repo).copied(),
             None => None,
         };
+        phases.mark(Phase::Ids);
 
         let mut tx = self.pool.begin().await?;
+        phases.acquired();
         // 2 and 3: DID locks, then per-URI locks.
         lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
@@ -1331,6 +1401,7 @@ impl Writer {
             crate::test_support::hooks::pause_in(crate::test_support::hooks::WRITER_AFTER_OWNER_LOCK, &self.pool, repo).await;
         }
 
+        phases.mark(Phase::Locks);
         let mut report = ApplyReport { transaction: true, outline, ..ApplyReport::default() };
         let mut effects = MemoryEffects::default();
         let mut copied = copy::Effects::default();
@@ -1434,6 +1505,7 @@ impl Writer {
         for plan in &plans {
             self.scope.touch(&plan.holds);
         }
+        phases.mark(Phase::Ops);
         // Full indexing's continuity, after every write that fires a count
         // trigger.
         let mut first_sight = false;
@@ -1456,8 +1528,10 @@ impl Writer {
                 };
                 first_sight = crate::indexing::crawl::continuity::on_copy(&mut tx, &copy).await?.inserted;
             }
+            phases.mark(Phase::Continuity);
         }
         tx.commit().await?;
+        phases.mark(Phase::Commit);
         drop(guard);
         if first_sight && let Some(queue) = &self.first_sight {
             queue.push(repo);
@@ -2850,7 +2924,7 @@ async fn upsert_post(conn: &mut PgConnection, ids: &PostIds, p: &PostRecord, rev
              quote_author = EXCLUDED.quote_author, quote_coll = EXCLUDED.quote_coll, quote_rkey = EXCLUDED.quote_rkey, \
              embed_kind = EXCLUDED.embed_kind, mention_ids = EXCLUDED.mention_ids, record = EXCLUDED.record \
            WHERE posts.rev < EXCLUDED.rev \
-           RETURNING author, rkey), \
+           RETURNING (xmax = 0) AS inserted, author, rkey), \
          odd AS ( \
            INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
            SELECT 1, up.author, up.rkey, v.slot, v.raw \
@@ -2864,7 +2938,7 @@ async fn upsert_post(conn: &mut PgConnection, ids: &PostIds, p: &PostRecord, rev
              search_tsv = EXCLUDED.search_tsv, tags = EXCLUDED.tags, link_domains = EXCLUDED.link_domains, \
              link_urls = EXCLUDED.link_urls, lang_prefixes = EXCLUDED.lang_prefixes, mention_ids = EXCLUDED.mention_ids), \
          unsearched AS (DELETE FROM post_search s USING up WHERE NOT $26 AND s.author = up.author AND s.rkey = up.rkey) \
-         SELECT true FROM up",
+         SELECT inserted FROM up",
     )
     .bind(ids.author)
     .bind(ids.rkey)
@@ -2899,7 +2973,8 @@ async fn upsert_post(conn: &mut PgConnection, ids: &PostIds, p: &PostRecord, rev
         .filter(|(_, r)| odd(r).is_none())
         .map(|(slot, _)| slot.id())
         .collect();
-    if written.is_some() && !whole.is_empty() {
+    // Only an updated row can hold an odd reference an older version left.
+    if written == Some(false) && !whole.is_empty() {
         sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = ANY($4)")
             .bind(OddTable::Posts.id())
             .bind(ids.author)
@@ -2977,14 +3052,14 @@ async fn upsert_subject(conn: &mut PgConnection, tbl: OddTable, ids: &SubjectIds
              created_at = EXCLUDED.created_at, via_author = EXCLUDED.via_author, via_coll = EXCLUDED.via_coll, \
              via_rkey = EXCLUDED.via_rkey, via_cid = EXCLUDED.via_cid \
            WHERE {table}.rev < EXCLUDED.rev \
-           RETURNING author, rkey), \
+           RETURNING (xmax = 0) AS inserted, author, rkey), \
          odd AS ( \
            INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
            SELECT $13, up.author, up.rkey, v.slot, v.raw \
            FROM up, (VALUES ($14::smallint, $15::text), ($16::smallint, $17::text)) AS v(slot, raw) \
            WHERE v.raw IS NOT NULL \
            ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw) \
-         SELECT true FROM up"
+         SELECT inserted FROM up"
     ))
     .bind(ids.author)
     .bind(ids.rkey)
@@ -3010,7 +3085,8 @@ async fn upsert_subject(conn: &mut PgConnection, tbl: OddTable, ids: &SubjectIds
         .filter(|(_, odd)| odd.is_none())
         .map(|(slot, _)| slot.id())
         .collect();
-    if written.is_some() && !whole.is_empty() {
+    // Only an updated row can hold an odd reference an older version left.
+    if written == Some(false) && !whole.is_empty() {
         sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = ANY($4)")
             .bind(tbl.id())
             .bind(ids.author)
@@ -3067,7 +3143,9 @@ async fn upsert_follow(conn: &mut PgConnection, ids: &GraphIds, g: &GraphRecord,
     .bind(odd)
     .fetch_optional(&mut *conn)
     .await?;
-    if inserted.is_some() && odd.is_none() {
+    // A row just inserted has no odd reference an older version left: a
+    // deleted row's went with it.
+    if inserted == Some(false) && odd.is_none() {
         sqlx::query("DELETE FROM odd_refs WHERE tbl = $1 AND author = $2 AND rkey = $3 AND slot = $4")
             .bind(OddTable::Follows.id())
             .bind(ids.author)

@@ -20,6 +20,7 @@ pub mod schema_backfill;
 #[cfg(test)]
 mod sql_guard;
 pub mod tombstones;
+pub mod waits;
 
 pub use migrations::{
     GateError, GateOutcome, GatePlan, MIGRATION_GATE_EXIT_CODE, MIGRATOR, enforce_gate,

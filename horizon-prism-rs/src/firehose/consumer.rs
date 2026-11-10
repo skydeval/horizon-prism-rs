@@ -55,6 +55,13 @@ mod lanes;
 use lanes::{Done, Lane, Work};
 pub use lanes::{CONFLICT_RETRIES, LowWater, METRIC_LANE_BUSY, METRIC_LANE_QUEUE, METRIC_LANE_RETRIES, lane_of};
 
+/// The span status reports the dedupe share over.
+pub const DEDUPE_WINDOW: Duration = Duration::from_secs(300);
+
+/// Metric: wall time of every round times its lanes. Less the lanes' busy
+/// time, it is the time lanes stood idle in rounds.
+pub const METRIC_LANE_CAPACITY: &str = "firehose_lane_capacity_seconds_total";
+
 /// `XAUTOCLAIM` min-idle (§5.3).
 pub const AUTOCLAIM_MIN_IDLE_MS: u64 = 60_000;
 /// Blocking read timeout (§5.3).
@@ -501,6 +508,15 @@ pub struct Consumer {
     /// Where a relay whose entries come from its primary URL again is
     /// named, so its account statuses are read again (full indexing).
     back_on_primary: Option<Arc<crate::indexing::crawl::DidQueue>>,
+    /// The batch being processed was read with dedupe on.
+    batch_dedupe: bool,
+    /// Entries booked from batches read with dedupe on, and their
+    /// duplicates; snapshots of both over [`DEDUPE_WINDOW`].
+    dedupe_on_entries: u64,
+    dedupe_on_deduped: u64,
+    dedupe_ring: VecDeque<(Instant, u64, u64)>,
+    /// Duplicates dropped at dispatch, for the delay's sampling.
+    drops_seen: u64,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -556,6 +572,11 @@ impl Consumer {
             covered: Arc::default(),
             via_alias: std::collections::HashSet::new(),
             back_on_primary: None,
+            batch_dedupe: false,
+            dedupe_on_entries: 0,
+            dedupe_on_deduped: 0,
+            dedupe_ring: VecDeque::new(),
+            drops_seen: 0,
         }
     }
 
@@ -1086,16 +1107,24 @@ impl Consumer {
         self.test.record.lock().expect("record").batches.push((Instant::now(), entries.len()));
         let entries = Arc::new(entries);
         let dedupe = self.dedupe_on();
+        self.batch_dedupe = dedupe;
         let mut start = 0;
         let mut carry = None;
         while start < entries.len() {
             self.low_water.set(Some(&entries[start].id));
+            let round = Instant::now();
             let (end, outcome, next) = if self.lanes() == 1 {
                 (entries.len(), self.run_inline(&entries, start, dedupe).await, None)
             } else {
                 self.run_lanes(&entries, start, carry.take(), dedupe).await
             };
-            self.finish(&entries[start..end], outcome).await?;
+            let finished = self.finish(&entries[start..end], outcome).await;
+            // Every lane's time in the round, busy or not: the share the
+            // lanes were not busy is the round's barrier and the consumer's
+            // serial reading and booking.
+            #[allow(clippy::cast_precision_loss)]
+            metrics::gauge!(METRIC_LANE_CAPACITY).increment(round.elapsed().as_secs_f64() * self.lanes() as f64);
+            finished?;
             start = end;
             carry = next;
         }
@@ -1269,11 +1298,14 @@ impl Consumer {
                 Some(Ok(_)) | None => stopped = true,
             }
         }
+        let (window_entries, window_deduped) = self.dedupe_window();
         self.tiers.board().set_writer(super::tier::WriterFigures {
             lanes: u32::try_from(self.lanes()).unwrap_or(u32::MAX),
             dedupe: self.dedupe_on(),
             entries: self.throughput.processed,
             deduped: self.throughput.deduped,
+            window_entries,
+            window_deduped,
         });
         // The low-water entry: the oldest not committed, else the last read.
         match entries.get(acks.len()) {
@@ -1305,6 +1337,10 @@ impl Consumer {
         if done.duplicate {
             self.throughput.deduped += 1;
         }
+        if self.batch_dedupe {
+            self.dedupe_on_entries += 1;
+            self.dedupe_on_deduped += u64::from(done.duplicate);
+        }
         if let Some((label, c)) = done.watermark {
             self.watermarks.observe(&label, c);
             // Thread outline design §3.3 (R5-4): each relay's liveness ring.
@@ -1315,8 +1351,9 @@ impl Consumer {
         if let Some(o) = &mut self.outline {
             o.commit(&entry.id, done.outline);
         }
-        if let Some((repo, key)) = done.seen {
-            self.dedupe.insert(&repo, key, Instant::now());
+        if let Some(seen) = done.seen {
+            metrics::counter!(super::dedupe::METRIC_FIRST, "relay" => seen.relay).increment(1);
+            self.dedupe.insert_at(&seen.repo, seen.key, Instant::now(), seen.ms);
         }
     }
 
@@ -1392,9 +1429,9 @@ impl Consumer {
                 tracing::debug!(event = "firehose_sync", id = %entry.id, relay = %label, tier = tier.as_str(), repo = %sync.did, rev = %sync.rev, "repo sync received");
                 metrics::counter!(METRIC_STREAM_EVENTS, "type" => "sync").increment(1);
                 let key = if dedupe { CopyKey::of(&sync.rev, CopyKind::Sync, tier, sync.cap.as_ref()) } else { None };
-                match key {
-                    Some(k) if self.dedupe.drops(&sync.did, &k, Instant::now()) => Work::Done(Done::duplicate(&label, None)),
-                    key => Work::Sync { did: sync.did, rev: sync.rev, tier, key, label },
+                match key.and_then(|k| self.copy_dropped(&sync.did, &k, &label, entry.id_ms())) {
+                    Some(()) => Work::Done(Done::duplicate(&label, None)),
+                    None => Work::Sync { did: sync.did, rev: sync.rev, tier, key, label },
                 }
             }
             Event::Resume(resume) => {
@@ -1438,15 +1475,47 @@ impl Consumer {
                     "commit received"
                 );
                 let key = if dedupe { CopyKey::of(&commit.rev, CopyKind::Commit, tier, commit.cap.as_ref()) } else { None };
-                match key {
-                    Some(k) if self.dedupe.drops(&commit.repo, &k, Instant::now()) => {
+                match key.and_then(|k| self.copy_dropped(&commit.repo, &k, &label, entry.id_ms())) {
+                    Some(()) => {
                         let watermark = contribution(entry.id_ms(), commit.time).map(|c| (label.clone(), c));
                         Work::Done(Done::duplicate(&label, watermark))
                     }
-                    key => Work::Commit { commit, label, tier, key },
+                    None => Work::Commit { commit, label, tier, key },
                 }
             }
         })
+    }
+
+    /// A keyed copy read while dedupe is on: counted per relay, and
+    /// whether an applied copy makes it a duplicate. One drop in
+    /// [`super::dedupe::DELAY_SAMPLE_EVERY`] records how long after the
+    /// applied copy it arrived.
+    fn copy_dropped(&mut self, repo: &str, key: &CopyKey, label: &str, ms: Option<i64>) -> Option<()> {
+        metrics::counter!(super::dedupe::METRIC_COPIES, "relay" => label.to_string()).increment(1);
+        let first = self.dedupe.dropped_by(repo, key, Instant::now())?;
+        self.drops_seen += 1;
+        if self.drops_seen % super::dedupe::DELAY_SAMPLE_EVERY == 1
+            && let (Some(first), Some(ms)) = (first, ms)
+        {
+            #[allow(clippy::cast_precision_loss)]
+            metrics::histogram!(super::dedupe::METRIC_DELAY).record((ms - first).max(0) as f64 / 1000.0);
+        }
+        Some(())
+    }
+
+    /// The dedupe share over the last [`DEDUPE_WINDOW`] of batches read
+    /// with dedupe on: entries and duplicates.
+    fn dedupe_window(&mut self) -> (u64, u64) {
+        let now = Instant::now();
+        let current = (self.dedupe_on_entries, self.dedupe_on_deduped);
+        if self.dedupe_ring.back().is_none_or(|(t, ..)| now.duration_since(*t) >= Duration::from_secs(10)) {
+            self.dedupe_ring.push_back((now, current.0, current.1));
+        }
+        while self.dedupe_ring.get(1).is_some_and(|(t, ..)| now.duration_since(*t) >= DEDUPE_WINDOW) {
+            self.dedupe_ring.pop_front();
+        }
+        let (_, e0, d0) = self.dedupe_ring.front().copied().unwrap_or((now, current.0, current.1));
+        (current.0.saturating_sub(e0), current.1.saturating_sub(d0))
     }
 
     async fn ack(&mut self, ids: &[String]) -> Result<(), ConsumerError> {
@@ -1488,6 +1557,7 @@ fn register_series() {
         metrics::counter!(METRIC_SAMPLE_FAILURES, "call" => call.as_str()).increment(0);
     }
     metrics::gauge!(METRIC_BUSY).increment(0.0);
+    metrics::gauge!(METRIC_LANE_CAPACITY).increment(0.0);
     metrics::gauge!(METRIC_BACKLOG_BUSY).increment(0.0);
     metrics::counter!(METRIC_BACKLOG_PROCESSED).increment(0);
     metrics::gauge!(METRIC_GROUP_PRESENT).set(1.0);

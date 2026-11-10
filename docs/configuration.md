@@ -52,6 +52,7 @@ Only these stop a start (exit 78):
 | `[identity]` | PLC directory, caches, optional Lodestar, the identity refresher's concurrency and queue bound. |
 | `[private_read]`, `[private_notify]`, `[private_push]`, `[private_search]`, `[private_any_pds]` | [kryphocron](design/kryphocron.md) reads, notifications, push and search. |
 | `[sync]`, `[backfill]`, `[index_request]` | Load on PDSes: head checks, backfill rate, catch-up. |
+| `[db]` | Lock timeout; the most database connections Prism opens (`pool_size`, sized from the writers by default). |
 | `[constellation]` | Upstream AppViews by PDS pattern, their rates, and the lookup order. |
 | `[microcosm]`, `[counts]` | Constellation and Slingshot URLs; where public counts come from. |
 | `[retention]`, `[storage]` | What is deleted and when; the storage budget (`budget_bytes`, the space the database may use; not set by default, and Health warns until it is). |

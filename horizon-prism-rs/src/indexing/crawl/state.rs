@@ -367,13 +367,24 @@ pub async fn requeue(conn: &mut PgConnection, account: AccountId, groups: &[Stri
 ///
 /// Any database error.
 pub async fn account_status(pool: &PgPool, did: &str, active: Option<bool>, status: Option<&str>, hides: bool, groups: &[String]) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    account_status_in(&mut tx, did, active, status, hides, groups).await?;
+    tx.commit().await
+}
+
+/// [`account_status`] in the caller's transaction `tx`.
+///
+/// # Errors
+///
+/// Any database error.
+pub async fn account_status_in(tx: &mut sqlx::PgConnection, did: &str, active: Option<bool>, status: Option<&str>, hides: bool, groups: &[String]) -> Result<(), sqlx::Error> {
     let Some(active) = active else {
         return Ok(());
     };
-    let Some(account) = crate::db::ids::account_id(pool, did).await? else {
+    let account: Option<i32> = sqlx::query_scalar("SELECT id FROM dids WHERE did = $1").bind(did).fetch_optional(&mut *tx).await?;
+    let Some(account) = account else {
         return Ok(());
     };
-    let mut tx = pool.begin().await?;
     if active {
         let still: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM relay_account_status WHERE account = $1)").bind(account).fetch_one(&mut *tx).await?;
         if !still {
@@ -381,7 +392,7 @@ pub async fn account_status(pool: &PgPool, did: &str, active: Option<bool>, stat
                 .bind(account)
                 .execute(&mut *tx)
                 .await?;
-            requeue(&mut tx, account, groups, &["pending"]).await?;
+            requeue(&mut *tx, account, groups, &["pending"]).await?;
         }
     } else {
         let next = match status {
@@ -402,7 +413,6 @@ pub async fn account_status(pool: &PgPool, did: &str, active: Option<bool>, stat
             }
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 

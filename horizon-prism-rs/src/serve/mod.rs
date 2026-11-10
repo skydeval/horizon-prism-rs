@@ -694,6 +694,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     }
     tasks.push(consumer.spawn());
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
+    // The pool's use, and what Prism's backends wait on while full runs.
+    tasks.push(crate::db::waits::spawn(pool.clone(), scope.clone()));
 
     // The post-migration task, made here so retention's age cap can wait
     // for its indexes; it is spawned once ingest runs (below).

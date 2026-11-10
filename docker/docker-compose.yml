@@ -26,6 +26,21 @@ x-horizon-firehose: &horizon-firehose
 services:
   db:
     image: postgres:16-bookworm
+    # Settings for a write-heavy database, modest enough for a small host.
+    # POSTGRES_SHARED_BUFFERS (.env) is best near a quarter of the machine's
+    # memory. Prism reads these and warns about defaults; it never sets them.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-512MB}
+      - -c
+      - max_wal_size=${POSTGRES_MAX_WAL_SIZE:-4GB}
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - random_page_cost=1.1
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}

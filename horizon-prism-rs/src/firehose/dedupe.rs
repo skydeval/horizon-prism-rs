@@ -27,6 +27,16 @@ use super::tier::CopyTier;
 pub const METRIC_DROPPED: &str = "firehose_dedupe_dropped_total";
 /// Metric: repos remembered.
 pub const METRIC_REPOS: &str = "firehose_dedupe_repos";
+/// Metric: copies read with a key while dedupe was on, by relay.
+pub const METRIC_COPIES: &str = "firehose_dedupe_copies_total";
+/// Metric: of those, the copies that applied (the first to arrive), by
+/// relay.
+pub const METRIC_FIRST: &str = "firehose_dedupe_first_total";
+/// Metric: for one dropped copy in [`DELAY_SAMPLE_EVERY`], the time between
+/// the applied copy's stream entry and its own.
+pub const METRIC_DELAY: &str = "firehose_dedupe_delay_seconds";
+/// One dropped copy in this many has its delay recorded.
+pub const DELAY_SAMPLE_EVERY: u64 = 100;
 
 /// What a copy carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,7 +97,8 @@ fn repo_key(repo: &str) -> RepoKey {
 struct Ring {
     /// The touch that put the repo last in `order`.
     touch: u64,
-    keys: Vec<(CopyKey, Instant)>,
+    /// Each seen key, when it was marked, and its stream entry's ms.
+    keys: Vec<(CopyKey, Instant, Option<i64>)>,
 }
 
 /// The seen copies.
@@ -117,21 +128,36 @@ impl Dedupe {
     /// Whether a copy keyed `key` of `repo` is a duplicate at `now`.
     #[must_use]
     pub fn drops(&self, repo: &str, key: &CopyKey, now: Instant) -> bool {
+        self.dropped_by(repo, key, now).is_some()
+    }
+
+    /// When a copy keyed `key` of `repo` is a duplicate at `now`: the
+    /// stream entry milliseconds of the copy that applied, when known.
+    #[must_use]
+    pub fn dropped_by(&self, repo: &str, key: &CopyKey, now: Instant) -> Option<Option<i64>> {
         self.repos
-            .get(&repo_key(repo))
-            .is_some_and(|r| r.keys.iter().any(|(seen, at)| now.duration_since(*at) < self.window && key.dropped_by(seen)))
+            .get(&repo_key(repo))?
+            .keys
+            .iter()
+            .find(|(seen, at, _)| now.duration_since(*at) < self.window && key.dropped_by(seen))
+            .map(|(_, _, ms)| *ms)
     }
 
     /// Mark a committed copy seen.
     pub fn insert(&mut self, repo: &str, key: CopyKey, now: Instant) {
+        self.insert_at(repo, key, now, None);
+    }
+
+    /// Mark a committed copy seen, read from the stream at `ms`.
+    pub fn insert_at(&mut self, repo: &str, key: CopyKey, now: Instant, ms: Option<i64>) {
         self.expire(now);
         let rk = repo_key(repo);
         self.touches += 1;
         let touch = self.touches;
         let window = self.window;
         let ring = self.repos.entry(rk).or_default();
-        ring.keys.retain(|(k, at)| now.duration_since(*at) < window && *k != key);
-        ring.keys.push((key, now));
+        ring.keys.retain(|(k, at, _)| now.duration_since(*at) < window && *k != key);
+        ring.keys.push((key, now, ms));
         ring.touch = touch;
         self.order.push_back((rk, touch, now));
         while self.repos.len() > self.max_repos {
@@ -231,6 +257,9 @@ mod tests {
         let at = t + Duration::from_secs(4);
         assert!(!d.drops("did:plc:example2", &k, at), "the oldest repo went first");
         assert!(d.drops("did:plc:example1", &k, at) && d.drops("did:plc:example3", &k, at));
+        // The applied copy's stream time is kept for the delay.
+        d.insert_at("did:plc:example4", k, at, Some(1_000));
+        assert_eq!(d.dropped_by("did:plc:example4", &k, at), Some(Some(1_000)));
         // Expiry empties it.
         d.expire(t + Duration::from_secs(60));
         assert!(d.is_empty());

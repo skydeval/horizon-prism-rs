@@ -62,13 +62,16 @@ struct BoardState {
 }
 
 /// The consumer's writer, for status: its lanes, whether dedupe is on, the
-/// entries it processed since the start and the copies it dropped.
+/// entries it processed since the start and the copies it dropped, and the
+/// same over the last five minutes of batches read with dedupe on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriterFigures {
     pub lanes: u32,
     pub dedupe: bool,
     pub entries: u64,
     pub deduped: u64,
+    pub window_entries: u64,
+    pub window_deduped: u64,
 }
 
 /// What the consumer shares about relay tiers: each relay's current tier,

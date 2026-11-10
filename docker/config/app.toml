@@ -361,6 +361,10 @@ catch_up_max_pages = 8
 [db]
 # Backstop against lock waits (design §6.11.7); a timeout is a transient failure.
 lock_timeout_secs = 30
+# Database connections Prism opens at most. "auto": 16, plus one for each
+# [firehose] writer lane, [full_crawl] claimer and [backfill] worker; or a
+# number. Prism warns when it comes within 5 of the server's max_connections.
+pool_size = "auto"
 
 [admin]
 # Mutating admin commands are executed by `serve` (design §3.3); the CLI waits

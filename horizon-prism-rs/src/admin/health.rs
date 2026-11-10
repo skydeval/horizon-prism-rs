@@ -72,6 +72,7 @@ pub const WATCHED: &[&str] = &[
     PRIVATE_INGEST_SOURCE,
     crate::system_accounts::METRIC_STATE,
     crate::system_accounts::METRIC_PENDING,
+    crate::db::pool::METRIC_ACQUIRE,
 ];
 
 /// `private_read_content_total{form}`, emitted by the private tier.
@@ -717,6 +718,21 @@ pub fn checks(i: &Inputs, ring: &Ring) -> Vec<Check> {
     });
 
     out.push(budget_check(i.budget_bytes, latest.as_ref().and_then(|s| s.sum(crate::db::sampler::METRIC_DB_SIZE))));
+
+    // Writers waiting for a pooled connection.
+    let acquire_p95 = |s: &Snapshot| s.sum_where_all(crate::db::pool::METRIC_ACQUIRE, &[("quantile", "0.95")]);
+    out.push(match ring.held_for(FIVE_MIN, |s| acquire_p95(s).map(|v| v > 0.05)) {
+        Held::NoData => Check::no_data("Database connections", "no writer has waited for a connection yet, or Prism needs five minutes of readings first."),
+        Held::Yes => Check::new(
+            "Database connections",
+            Level::Amber,
+            format!(
+                "Writers have waited {} ms for a database connection (95th percentile) for five minutes. Raise db.pool_size, and the database server's max_connections with it.",
+                latest.as_ref().and_then(|s| acquire_p95(s)).map_or(0.0, |v| (v * 1000.0).round())
+            ),
+        ),
+        Held::No => Check::new("Database connections", Level::Ok, "Writers get a database connection without waiting."),
+    });
 
     out.push(account_ids_check(i.account_ids));
 

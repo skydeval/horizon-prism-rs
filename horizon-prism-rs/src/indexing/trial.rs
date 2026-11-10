@@ -904,6 +904,10 @@ pub fn confirm_text(from: ScopeValue, bounds: Bounds, warnings: &[String], last_
             ),
             None => "From kryphocron_only, S's community fill runs first; the time limit includes it.".to_string(),
         });
+        out.push(
+            "As a test of this server's capacity, a trial from community measures better: from kryphocron_only, the fill competes with the trial's writes for the database while it runs."
+                .to_string(),
+        );
     }
     out.extend(warnings.iter().cloned());
     if let Some(b) = first_bound {

@@ -396,6 +396,7 @@ pub async fn switch(State(state): State<AdminState>, ConnectInfo(peer): ConnectI
             let running = &state.settings.running;
             let mut warnings = crate::indexing::full::warnings(&running.full.kinds, used.and_then(|u| u64::try_from(u).ok()), free, running.storage.budget_bytes, running.firehose.writer_lanes);
             warnings.extend(writer_words(&state).await);
+            warnings.extend(crate::indexing::full::postgres_warnings(&state.pool).await);
             warnings.extend(crate::indexing::full::more_warnings(running, crate::indexing::full_check::last_words(&state.pool).await.ok().flatten()));
             Some((
                 "FULL",
@@ -502,6 +503,7 @@ pub async fn trial(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
     let volume = crate::indexing::trial::volume(&state.disks.data);
     let mut warnings = crate::indexing::full::warnings(&running.full.kinds, used.and_then(|u| u64::try_from(u).ok()), volume.map(|v| v.0), running.storage.budget_bytes, running.firehose.writer_lanes);
     warnings.extend(writer_words(&state).await);
+    warnings.extend(crate::indexing::full::postgres_warnings(&state.pool).await);
     let mut file = running.clone();
     file.full.label_backfill &= bounds.history;
     warnings.extend(crate::indexing::full::more_warnings(&file, crate::indexing::full_check::last_words(&state.pool).await.ok().flatten()));

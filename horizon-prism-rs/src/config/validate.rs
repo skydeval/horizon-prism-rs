@@ -652,6 +652,9 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
             out.push(format!("{key} must be greater than 0"));
         }
     }
+    if cfg.db.pool_size == crate::config::PoolSize::Fixed(0) {
+        out.push("db.pool_size must be \"auto\" or greater than 0".to_string());
+    }
     if cfg.full.pause_free_percent > 98 {
         out.push("full.pause_free_percent must be at most 98".to_string());
     }

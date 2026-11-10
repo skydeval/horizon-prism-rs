@@ -233,6 +233,7 @@ catch_up_max_pages = 8
 
 [db]
 lock_timeout_secs = 30
+pool_size = "auto"
 
 [admin]
 command_timeout_secs = 600

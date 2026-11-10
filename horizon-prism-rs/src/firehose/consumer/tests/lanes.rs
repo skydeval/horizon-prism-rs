@@ -292,3 +292,58 @@ async fn a_lane_failure_loses_nothing() {
     drop(failing);
     f.cleanup().await;
 }
+
+/// Three relays deliver the same commits: two copies of every three are
+/// dropped, each relay's copies and the applied (first) copies are counted,
+/// and status's share covers only the batches read with dedupe on.
+#[tokio::test]
+async fn three_relays_of_the_same_commits_drop_two_copies_of_three() {
+    const THIRD: &str = "wss://relay.third.example/xrpc/com.atproto.sync.subscribeRepos";
+    let (rec, handle) = recorder();
+    let _local = metrics::set_default_local_recorder(&rec);
+    let repos = repos_in_distinct_lanes(4, 3);
+    let opts = Options { members: repos.clone(), ..Options::default() };
+    let Some(mut f) = Fixture::new("fl_dedupe_three", opts).await else {
+        return;
+    };
+    f.cfg.writer_lanes = 4;
+    f.cfg.relay_labels.insert(THIRD.to_string(), "third".to_string());
+    f.cfg.dedupe = Dedupe::Off;
+    // Off: both copies of one commit apply, and status counts neither.
+    f.add(&post_commit(&repos[0], "3kaaaaaaaaab2", "3kaaaaaaaaab2", BSKY), None).await;
+    f.add(&post_commit(&repos[0], "3kaaaaaaaaab2", "3kaaaaaaaaab2", MICROCOSM), None).await;
+    let (mut c, _) = f.consumer().await;
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 2, Duration::from_secs(10)).await);
+    assert_eq!(c.throughput.deduped, 0);
+    // On: three commits, three copies each.
+    c.cfg.dedupe = Dedupe::On;
+    for (i, repo) in repos.iter().enumerate() {
+        let rev = format!("3kaaaaaaaaac{}", i + 2);
+        for relay in [BSKY, MICROCOSM, THIRD] {
+            f.add(&post_commit(repo, &rev, &rev, relay), None).await;
+        }
+    }
+    assert!(c.run_until(|c| c.throughput.processed >= 11, Duration::from_secs(10)).await);
+    assert_eq!(c.throughput.deduped, 6, "two of every three copies dropped");
+    assert_eq!(c.throughput.by_path, [6, 5, 0, 0], "five applied: two before dedupe, three after");
+    for (i, repo) in repos.iter().enumerate() {
+        let rkey = format!("3kaaaaaaaaac{}", i + 2);
+        assert!(posts::stored(&f.db.pool, &post_uri(repo, &rkey)).await);
+    }
+    let copies: f64 = ["bsky", "microcosm", "third"]
+        .iter()
+        .map(|r| rendered(&handle, crate::firehose::dedupe::METRIC_COPIES, &[&format!("relay=\"{r}\"")]).unwrap_or(0.0))
+        .sum();
+    assert_eq!(copies, 9.0, "every keyed copy is counted by its relay");
+    let first: f64 = ["bsky", "microcosm", "third"]
+        .iter()
+        .map(|r| rendered(&handle, crate::firehose::dedupe::METRIC_FIRST, &[&format!("relay=\"{r}\"")]).unwrap_or(0.0))
+        .sum();
+    assert_eq!(first, 3.0, "one applied copy per commit");
+    let w = c.tiers.board().writer();
+    assert_eq!((w.window_entries, w.window_deduped), (9, 6), "the share covers only the batches read with dedupe on");
+    assert_eq!((w.entries, w.deduped), (11, 6));
+    assert_eq!(pending(&mut f).await, 0);
+    f.cleanup().await;
+}

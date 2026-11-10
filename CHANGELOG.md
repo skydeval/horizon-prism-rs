@@ -11,6 +11,18 @@ released.
 
 ## [Unreleased]
 
+### Added
+
+- `[db] pool_size`: `"auto"` (the default) sizes the database pool from the
+  writer lanes, crawl claimers and backfill workers, in place of a fixed 20.
+  Prism warns when it comes within 5 of the server's `max_connections`, and
+  Health when writers wait for a connection.
+- Full's warnings, its confirm pages and `full-check` name the Postgres
+  settings left at Postgres's defaults that slow full down.
+- Metrics of where full's writers spend their time, of what Prism's own
+  database sessions wait on, and of each relay's copies; status's dedupe
+  share covers the last five minutes with dedupe on.
+
 ### Changed
 
 - **Published image.** `app` runs `ghcr.io/skydeval/horizon-prism-rs`, at the
@@ -19,6 +31,11 @@ released.
   only the relay sidecars. To keep building from source, add
   `COMPOSE_FILE=docker-compose.yml:compose.source.yml` to `.env`. A compose
   override that sets `app`'s image or build keeps working.
+- The shipped `docker-compose.yml` runs Postgres with `shared_buffers=512MB`
+  (`POSTGRES_SHARED_BUFFERS` in `.env`), `max_wal_size=4GB`
+  (`POSTGRES_MAX_WAL_SIZE`), `checkpoint_timeout=15min`,
+  `effective_io_concurrency=200` and `random_page_cost=1.1`. Recreate `db`
+  to apply.
 - The shipped relay sidecar configs (`docker/firehose/*.toml`) turn on
   `publish_sync` and `publish_resume`, which full indexing uses. A sidecar
   config of your own needs the same two lines under `[publisher]`; restart

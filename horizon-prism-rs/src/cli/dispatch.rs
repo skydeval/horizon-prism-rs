@@ -610,6 +610,7 @@ async fn confirm_scope(pool: &PgPool, cfg: &crate::config::AppConfig, value: Sco
         ));
         let last = crate::indexing::full_check::last_words(pool).await.map_err(|e| e.to_string())?;
         text.extend(crate::indexing::full::more_warnings(&cfg.file, last));
+        text.extend(crate::indexing::full::postgres_warnings(pool).await);
     } else {
         text.push(
             "Leaving full for community: the rows full added are deleted in the background, then S is refilled; public requests answer 501 during that refill."
@@ -656,6 +657,7 @@ async fn confirm_trial(pool: &PgPool, cfg: &crate::config::AppConfig, action: &F
             let mut file = cfg.file.clone();
             file.full.label_backfill &= bounds.history;
             warnings.extend(crate::indexing::full::more_warnings(&file, last));
+            warnings.extend(crate::indexing::full::postgres_warnings(pool).await);
             // How long the last fill took: its last finished job after its start.
             let last_fill: Option<i64> = sqlx::query_scalar(
                 "SELECT EXTRACT(EPOCH FROM (max(updated_at) - min(not_before)))::bigint FROM backfill_jobs WHERE depth = 'resync' AND state = 'done'",
