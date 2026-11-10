@@ -95,6 +95,15 @@ const REPOST_NOT_MEMBER_NOR_R: &str = "NOT EXISTS (SELECT 1 FROM members m JOIN 
 // Posts and their counts are keyed by the post's author id.
 const POST_NOT_R: &str =
     "NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace'))";
+// A post's counts stay while a member's stored like or repost names it: the
+// off rule keeps those, and the counts are read with them. The triggers of
+// the rows deleted before have already taken their share off.
+const COUNTS_NOT_R_NOR_MEMBER_NAMED: &str =
+    "NOT EXISTS (SELECT 1 FROM refract_dids r JOIN dids d ON d.did = r.did WHERE d.id = t.author AND r.state IN ('restored', 'grace')) \
+     AND NOT EXISTS (SELECT 1 FROM likes l JOIN dids d ON d.id = l.author JOIN members m ON m.did = d.did \
+                     WHERE l.subj_author = t.author AND l.subj_coll = 1 AND l.subj_rkey = t.rkey) \
+     AND NOT EXISTS (SELECT 1 FROM reposts l JOIN dids d ON d.id = l.author JOIN members m ON m.did = d.did \
+                     WHERE l.subj_author = t.author AND l.subj_coll = 1 AND l.subj_rkey = t.rkey)";
 
 const fn table(name: &'static str, key: Key, delete_when: &'static str, start: u64) -> SweepTable {
     SweepTable { name, key, delete_when, start }
@@ -130,8 +139,9 @@ pub const TABLES: [SweepTable; 18] = [
     // 5.
     table("follows", Key::AuthorRkey, NO_MEMBER_END_NOR_R, 10_000),
     // 6. Also removes the negative trend rows steps 2–3 created. The
-    // counts of R's posts stay, as `load_posts` falls back to them.
-    table("post_counts", Key::AuthorRkey, POST_NOT_R, 10_000),
+    // counts of R's posts stay, as `load_posts` falls back to them, and so
+    // do the counts of posts members' stored likes and reposts name.
+    table("post_counts", Key::AuthorRkey, COUNTS_NOT_R_NOR_MEMBER_NAMED, 10_000),
     table("tag_activity_hourly", Key::TagHour, ALL, 10_000),
     table("starter_pack_counts", Key::AuthorRkey, ALL, 10_000),
 ];

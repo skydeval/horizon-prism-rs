@@ -720,9 +720,19 @@ async fn the_sweep_empties_and_thins_every_table() {
     }
     assert_eq!(likes_windows, 3, "a kept window did not end the table");
     pi.end_sweep(2).await.expect("end");
-    for t in ["feed_items", "notifications", "posts", "threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts", "post_counts", "tag_activity_hourly", "starter_pack_counts"] {
+    for t in ["feed_items", "notifications", "posts", "threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts", "tag_activity_hourly", "starter_pack_counts"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t}")).await, 0, "{t} is emptied");
     }
+    // The counts of the post the member's kept likes and reposts name stay,
+    // with the deleted rows' share taken off; every other count row goes.
+    let left: Vec<(i32, i32)> = sqlx::query_as(&format!(
+        "SELECT c.like_count, c.repost_count FROM post_counts c JOIN dids d ON d.id = c.author WHERE d.did = '{B}'"
+    ))
+    .fetch_all(p)
+    .await
+    .expect("counts");
+    assert_eq!(left, [(1, 1)], "only the member counts for B's post now");
+    assert_eq!(count(p, "SELECT count(*) FROM post_counts").await, 1, "the sourceless count row goes");
     for t in ["likes", "reposts"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t} WHERE author <> (SELECT id FROM dids WHERE did = '{MEMBER}')")).await, 0, "{t} is thinned");
     }

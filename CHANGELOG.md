@@ -61,6 +61,8 @@ released.
 
 ### Fixed
 
+- Leaving community for `kryphocron_only` keeps the counts of posts that
+  members' stored likes and reposts name.
 - A full trial started from `kryphocron_only` keeps the post counts and tag
   activity from before the trial, and puts its fill's jobs back as they
   were. Its check now fails if any of these differ. **Upgrade:** migration
