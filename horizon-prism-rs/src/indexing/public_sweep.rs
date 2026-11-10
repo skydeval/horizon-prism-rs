@@ -830,7 +830,7 @@ mod tests {
                 assert_eq!(left, list == SweepList::TrialFull && matches!(t.name, "post_counts" | "tag_activity_hourly"), "{list:?} {}", t.name);
             }
         }
-        for step in [super::super::narrowing::TRIAL_ZERO_COUNTS, super::super::narrowing::TRIAL_ZERO_TRENDS] {
+        for step in [super::super::narrowing::TRIAL_ZERO_COUNTS, super::super::narrowing::TRIAL_ZERO_TRENDS, super::super::narrowing::TRIAL_ADDED_TRENDS] {
             assert!(super::super::narrowing::TRIAL_FULL_DRAIN_STEP_NAMES.contains(&step), "{step}");
             assert!(!super::super::narrowing::FULL_DRAIN_STEP_NAMES.contains(&step), "{step}");
         }

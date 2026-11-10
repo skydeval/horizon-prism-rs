@@ -177,6 +177,9 @@ struct StartHeld {
     counts_repaired: bool,
     trends_compared: bool,
     trend_rows_lost: i64,
+    /// Trend rows outside the baseline's keys (a trial from kryphocron_only
+    /// only), removed by the check.
+    trend_rows_added: i64,
     jobs_recorded: i64,
     jobs_held: i64,
 }
@@ -194,6 +197,9 @@ impl StartHeld {
         }
         if self.trend_rows_lost > 0 {
             out.push(format!("{} of {}'s trend rows from before the trial are gone", self.trend_rows_lost, from.as_str()));
+        }
+        if self.trend_rows_added > 0 {
+            out.push(format!("{} trend rows the trial added were still there; they are removed", self.trend_rows_added));
         }
         if self.jobs_held > 0 {
             out.push(format!("{} of the fill's {} jobs had not been put back; they are now", self.jobs_held, self.jobs_recorded));
@@ -213,6 +219,9 @@ impl StartHeld {
             (true, 0) => "trend hours as before".to_string(),
             (true, n) => format!("{} trend rows gone", n_words(u64::try_from(n).unwrap_or(0))),
         });
+        if self.trend_rows_added > 0 {
+            parts.push(format!("{} trend rows the trial added removed", n_words(u64::try_from(self.trend_rows_added).unwrap_or(0))));
+        }
         if self.jobs_recorded > 0 {
             parts.push(format!("the fill's {} jobs put back as they were", n_words(u64::try_from(self.jobs_recorded).unwrap_or(0))));
         }
@@ -223,6 +232,7 @@ impl StartHeld {
         json!({
             "post_counts_missing": { "start": self.missing_start, "now": self.missing_now, "repaired": self.counts_repaired },
             "trend_rows_lost": if self.trends_compared { json!(self.trend_rows_lost) } else { Value::Null },
+            "trend_rows_added": self.trend_rows_added,
             "fill_jobs": { "recorded": self.jobs_recorded, "not_put_back": self.jobs_held },
         })
     }
@@ -698,6 +708,15 @@ impl PublicIndexing {
                 if at >= cutoff {
                     held.trend_rows_lost += (n - now_hours.get(hour).copied().unwrap_or(0)).max(0);
                 }
+            }
+        }
+        // From kryphocron_only, every trend row outside the baseline's keys
+        // is the trial's.
+        if t.to == t.from {
+            let added = format!("FROM tag_activity_hourly ta WHERE {}", super::trial::TREND_ROW_ADDED);
+            held.trend_rows_added = sqlx::query_scalar(&format!("SELECT count(*) {added}")).fetch_one(&self.pool).await?;
+            if held.trend_rows_added > 0 {
+                sqlx::query(&format!("DELETE FROM tag_activity_hourly WHERE (tag, hour) IN (SELECT ta.tag, ta.hour {added})")).execute(&self.pool).await?;
             }
         }
         // An exit to community fills S again, so the jobs are its own.

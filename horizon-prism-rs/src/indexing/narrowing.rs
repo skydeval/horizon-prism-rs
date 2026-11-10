@@ -303,7 +303,7 @@ pub const TRIAL_STEP_NAMES: [&str; 39] = [
 /// cleared after the identity rows, and the count rows and trend hours the
 /// drain's deletes left at zero removed (the drain's own tables leave them
 /// to their triggers).
-pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 23] = [
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 24] = [
     "post_search",
     "blocks",
     "actor_self_records",
@@ -312,6 +312,7 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 23] = [
     "actor_counts",
     TRIAL_ZERO_COUNTS,
     TRIAL_ZERO_TRENDS,
+    TRIAL_ADDED_TRENDS,
     "constellation_counts",
     "record_tombstones",
     "did_cache",
@@ -335,6 +336,9 @@ pub const TRIAL_PROFILES: &str = "trial_profiles";
 pub const TRIAL_ZERO_COUNTS: &str = "trial_zero_counts";
 /// The step that removes trend hours the trial's removed rows left at zero.
 pub const TRIAL_ZERO_TRENDS: &str = "trial_zero_trends";
+/// The step that removes trend rows outside a kryphocron_only trial's
+/// baseline keys.
+pub const TRIAL_ADDED_TRENDS: &str = "trial_added_trends";
 
 /// The step names of `list`.
 fn names(list: SweepList) -> &'static [&'static str] {
@@ -397,6 +401,16 @@ fn trial_steps(labels: LabelsExit) -> Vec<Step> {
                 "ta.posts <= 0 AND ta.likes <= 0 AND ta.reposts <= 0 AND ta.replies <= 0",
                 Bind::None,
             )
+        },
+        Step {
+            table: TRIAL_ADDED_TRENDS,
+            sql: format!(
+                "DELETE FROM tag_activity_hourly WHERE (tag, hour) IN (SELECT ta.tag, ta.hour FROM tag_activity_hourly ta \
+                 WHERE {} LIMIT {BATCH_SIZE})",
+                super::trial::TREND_ROW_ADDED
+            ),
+            candidates: None,
+            bind: Bind::None,
         },
         Step {
             table: "record_tombstones",

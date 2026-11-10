@@ -395,21 +395,34 @@ async fn a_trial_from_kryphocron_only_leaves_counts_trends_and_jobs_as_they_were
     assert_eq!(count(p, &both).await, 2, "the member's and S's");
     assert_eq!(count(p, &format!("SELECT count(*) FROM full_trial_jobs WHERE did = '{OTHER}'")).await, 0, "not a fill job");
     // The trial: a stranger's like of the same post and a tagged post.
-    w.apply(STRANGER, &tid(2), &[like("3kaaaaaaaab32", &post_uri(STRANGER, "3kaaaaaaaab31")), tagged("3kaaaaaaaab33")], LIVE).await.expect("trial rows");
+    // And a reply to a tagged post of its own, which the drain removes
+    // after the parent, so the reply's trigger cannot take its count back.
+    let parent = op("app.bsky.feed.post", "3kaaaaaaaab34", json!({"$type": "app.bsky.feed.post", "text": "p", "tags": ["replytag"], "createdAt": created()}));
+    let child = reply("3kaaaaaaaab35", &post_uri(STRANGER, "3kaaaaaaaab34"), None);
+    w.apply(STRANGER, &tid(2), &[like("3kaaaaaaaab32", &post_uri(STRANGER, "3kaaaaaaaab31")), tagged("3kaaaaaaaab33"), parent, child], LIVE)
+        .await
+        .expect("trial rows");
     assert_eq!(count(p, &likes).await, 2);
     assert_eq!(count(p, TRIAL_TAG).await, 2);
+    let reply_tag = "SELECT count(*) FROM tag_activity_hourly WHERE tag = 'replytag'";
+    assert_eq!(count(p, reply_tag).await, 1);
     assert_eq!(pi.end_trial("manual").await.expect("end").expect("ended").action, "draining");
     settled(&scope).await;
     assert_eq!(scope.public_mode(), PublicMode::Off);
     assert_eq!(count(p, &likes).await, 1, "the member's like still counts");
     assert_eq!((count(p, PRE_TAG).await, count(p, TRIAL_TAG).await), (3, 1), "the trend hours from before the trial stay");
+    assert_eq!(count(p, reply_tag).await, 0, "a trend row the trial added is gone");
     assert_eq!(resync_job(p, MEMBER).await, Some(("done".into(), 4, true)), "the member's job is as it was");
     assert_eq!(resync_job(p, B).await, None, "the job the fill created is gone");
     assert_eq!(resync_job(p, OTHER).await, Some(("done".into(), 2, true)), "a job the fill did not touch");
     let (state, result) = last_trial(p).await;
     assert_eq!(state, "passed", "{result}");
     let held = &result["start_mode"];
-    assert_eq!((&held["post_counts_missing"]["now"], &held["trend_rows_lost"], &held["fill_jobs"]["recorded"]), (&json!(0), &json!(0), &json!(recorded)), "{result}");
+    assert_eq!(
+        (&held["post_counts_missing"]["now"], &held["trend_rows_lost"], &held["trend_rows_added"], &held["fill_jobs"]["recorded"]),
+        (&json!(0), &json!(0), &json!(0), &json!(recorded)),
+        "{result}"
+    );
     assert!(result["words"].as_str().unwrap_or_default().contains(&format!("the fill's {recorded} jobs put back")), "{result}");
     assert_eq!(count(p, "SELECT count(*) FROM full_trial_jobs").await, 0, "the record is dropped");
     db.drop_db().await;
@@ -436,6 +449,7 @@ async fn the_check_fails_on_lost_counts_trends_and_jobs() {
         p,
         &format!(
             "DELETE FROM post_counts; DELETE FROM tag_activity_hourly WHERE tag = 'pretag'; \
+             INSERT INTO tag_activity_hourly (tag, hour, replies) VALUES ('lefttag', date_trunc('hour', now(), 'UTC'), 2); \
              UPDATE backfill_jobs SET state = 'queued', generation = 5 WHERE did = '{MEMBER}' AND depth = 'resync';"
         ),
     )
@@ -445,10 +459,11 @@ async fn the_check_fails_on_lost_counts_trends_and_jobs() {
     let (state, result) = last_trial(p).await;
     assert_eq!(state, "failed", "{result}");
     let causes = result["causes"].to_string();
-    for part in ["had no count row", "trend rows from before the trial are gone", "jobs had not been put back"] {
+    for part in ["had no count row", "trend rows from before the trial are gone", "trend rows the trial added", "jobs had not been put back"] {
         assert!(causes.contains(part), "{part}: {causes}");
     }
     assert_eq!(count(p, &likes).await, 1, "the count row is repaired");
+    assert_eq!(count(p, "SELECT count(*) FROM tag_activity_hourly WHERE tag = 'lefttag'").await, 0, "the added trend row is removed");
     assert_eq!(resync_job(p, MEMBER).await, Some(("done".into(), 4, true)), "the job is put back");
     pi.recheck_trial().await.expect("check again");
     settled(&scope).await;

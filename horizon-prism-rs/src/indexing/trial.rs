@@ -606,6 +606,29 @@ pub async fn trend_hours(pool: &PgPool) -> Result<BTreeMap<String, i64>, sqlx::E
     Ok(rows.into_iter().map(|(h, n)| (rfc3339(&h), n)).collect())
 }
 
+/// The trend rows of a trial from kryphocron_only, as its baseline keeps
+/// them: `[[tag, hour as epoch seconds], …]`. That mode writes few, so the
+/// whole set is kept, and any row outside it afterwards is the trial's: its
+/// trigger could not take back a reply's count when the drain removed the
+/// reply's parent first.
+///
+/// # Errors
+///
+/// Database errors.
+pub async fn trend_keys(pool: &PgPool) -> Result<Value, sqlx::Error> {
+    sqlx::query_scalar("SELECT COALESCE(jsonb_agg(jsonb_build_array(tag, extract(epoch FROM hour)::bigint)), '[]'::jsonb) FROM tag_activity_hourly")
+        .fetch_one(pool)
+        .await
+}
+
+/// A trend row `ta` that is not in the running trial's baseline keys
+/// ([`trend_keys`]): false when the baseline has none (a trial from
+/// community), so nothing is taken then.
+pub const TREND_ROW_ADDED: &str = "EXISTS (SELECT 1 FROM full_trials tft \
+       WHERE tft.id = (SELECT (tw.value #>> '{trial,id}')::bigint FROM worker_state tw WHERE tw.key = 'public_transition') \
+         AND jsonb_typeof(tft.baseline->'trend_keys') = 'array' \
+         AND NOT tft.baseline->'trend_keys' @> jsonb_build_array(jsonb_build_array(ta.tag, extract(epoch FROM ta.hour)::bigint)))";
+
 /// How the trial treats a table of the schema.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -775,7 +798,7 @@ pub async fn database_bytes(pool: &PgPool) -> Result<u64, sqlx::Error> {
 /// # Errors
 ///
 /// Database errors.
-pub async fn baseline(pool: &PgPool, free: Option<(u64, u64)>) -> Result<Value, sqlx::Error> {
+pub async fn baseline(pool: &PgPool, free: Option<(u64, u64)>, from: ScopeValue) -> Result<Value, sqlx::Error> {
     let tables = table_figures(pool).await?;
     let db = database_bytes(pool).await?;
     let dids_max: Option<i32> = sqlx::query_scalar("SELECT max(id) FROM dids").fetch_one(pool).await?;
@@ -785,7 +808,9 @@ pub async fn baseline(pool: &PgPool, free: Option<(u64, u64)>) -> Result<Value, 
     let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM worker_state ORDER BY key").fetch_all(pool).await?;
     let missing_counts = missing_post_counts(pool).await?;
     let trends = trend_hours(pool).await?;
+    let keys_of_trends = if from == ScopeValue::KryphocronOnly { trend_keys(pool).await? } else { Value::Null };
     Ok(json!({
+        "trend_keys": keys_of_trends,
         "post_counts_missing": missing_counts,
         "trend_hours": trends,
         "tables": tables,
@@ -924,7 +949,7 @@ impl PublicIndexing {
             .map_err(db)?;
         self.pause("trial_measuring").await;
         let free = self.volume_now();
-        let base = baseline(&self.pool, free).await.map_err(db)?;
+        let base = baseline(&self.pool, free, from).await.map_err(db)?;
         let baseline_db = base["database_bytes"].as_u64().unwrap_or(0);
         let started_at = now();
         let trial = Trial {
