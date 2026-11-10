@@ -205,6 +205,9 @@ pub(super) struct PipelineEnv {
     /// `private_read.degraded_retry_min_secs` and `_max_secs` (§3.7).
     pub retry_min_secs: u64,
     pub retry_max_secs: u64,
+    /// The scope state, for the takedown relays a read applies in full
+    /// ([`Self::chain`]); none: no relay hides anyone.
+    pub scope: Option<crate::aggregations::ScopeState>,
 }
 
 /// `retryAfter` (degraded-mode design §3.7): a quarter of the private
@@ -231,6 +234,15 @@ pub struct Signals {
 }
 
 impl PipelineEnv {
+    /// The walk's cap with the takedown relays reads apply now.
+    pub(super) async fn chain(&self) -> super::schema::Chain {
+        let relays = match &self.scope {
+            Some(scope) => scope.hidden_relays().await,
+            None => Vec::new(),
+        };
+        super::schema::Chain::new(self.max_chain, relays)
+    }
+
     /// Step 5's test (§6.3): the private watermark is within
     /// `freshness_bound` of now. Global, and reads nothing.
     pub(super) fn watermark_fresh(&self) -> bool {
@@ -702,7 +714,7 @@ async fn read_inner(
             uri,
             last_synced: certified.as_ref().map_or(watermark, |c| c.last_synced),
             bound: env.freshness_bound,
-            max_chain: env.max_chain,
+            chain: env.chain().await,
             with_authors: certified.is_some(),
         },
     )

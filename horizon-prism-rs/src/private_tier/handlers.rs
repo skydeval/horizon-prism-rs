@@ -178,6 +178,7 @@ impl PrivateState {
         cursor_key: CursorKey,
     ) -> Self {
         let pool = app.hydrator.pool().clone();
+        let scope = app.hydrator.scope().clone();
         let bookmarks_max = app.hydrator.bookmarks_max();
         Self {
             app,
@@ -193,6 +194,7 @@ impl PrivateState {
                 head_fallback: cfg.head_fallback,
                 retry_min_secs: cfg.degraded_retry_min_secs,
                 retry_max_secs: cfg.degraded_retry_max_secs,
+                scope: Some(scope),
             },
             floors: Floors {
                 get_posts: Duration::from_millis(cfg.floor_ms.get_posts),
@@ -241,6 +243,13 @@ impl PrivateState {
     pub(crate) fn with_plaintext_refused(mut self, refused: bool) -> Self {
         self.env.plaintext_refused = refused;
         self
+    }
+}
+
+impl PrivateState {
+    /// The walk's cap with the takedown relays reads apply now.
+    async fn chain(&self) -> schema::Chain {
+        self.env.chain().await
     }
 }
 
@@ -441,7 +450,7 @@ async fn counts(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut Pri
     if uris.is_empty() {
         return Ok(());
     }
-    let counts = schema::counts(&s.env.pool, &caller.did, &uris, s.env.max_chain).await?;
+    let counts = schema::counts(&s.env.pool, &caller.did, &uris, s.chain().await).await?;
     for post in posts.iter_mut() {
         let c = view_uri(post).and_then(|u| counts.get(&u).copied()).unwrap_or_default();
         for (key, n) in COUNT_KEYS.into_iter().zip([c.reply, c.repost, c.like, c.quote]) {
@@ -511,7 +520,7 @@ async fn not_served(s: &PrivateState, caller: &VerifiedCaller, posts: &mut [&mut
     }
     own.sort_unstable();
     own.dedup();
-    let faults = schema::not_served(&s.env.pool, me, &own, s.env.max_chain).await?;
+    let faults = schema::not_served(&s.env.pool, me, &own, s.chain().await).await?;
     for post in posts.iter_mut() {
         let Some(uri) = view_uri(post).filter(|u| uri_author(u) == Some(me)) else {
             continue;
@@ -728,7 +737,7 @@ async fn decorate(
     let mut records: HashMap<String, Value> = HashMap::new();
     // By readable quoted post: the quoting URIs its postgate detaches.
     let mut detached: HashMap<String, Vec<String>> = HashMap::new();
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &private, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &private, s.chain().await).await?.into_iter().collect();
     private.retain(|u| passing.contains(u));
     if !private.is_empty() {
         let quoted_authors = profiles(hydration, &private).await?;
@@ -845,7 +854,7 @@ async fn posts_body(
             wanted.push(u.clone());
         }
     }
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.chain().await).await?.into_iter().collect();
     let candidates: Vec<String> = wanted.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
@@ -996,7 +1005,7 @@ async fn thread_body(
     if is_private_uri(&claimed) && !wanted.contains(&claimed) {
         wanted.push(claimed.clone());
     }
-    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.chain().await).await?.into_iter().collect();
     #[cfg(test)]
     crate::test_support::hooks::pause(crate::test_support::hooks::THREAD_AFTER_STRUCTURE, uri).await;
     // 3. The watermark, then readiness. An anchor that fails the
@@ -1288,6 +1297,7 @@ async fn expand(
     let mut replies: HashMap<String, Vec<PrivateEmit<Value>>> = HashMap::new();
     let mut expanded: HashSet<String> = HashSet::new();
     let mut reads_left = reads;
+    let relays = s.chain().await.relays;
     for _ in 0..depth {
         if level.is_empty() || *budget == 0 {
             break;
@@ -1299,7 +1309,7 @@ async fn expand(
                 break;
             }
             let room = *budget - batch.len();
-            let candidates = schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE, s.bounds).await?;
+            let candidates = schema::reply_candidates(&s.env.pool, &caller.did, parent, REPLIES_PER_NODE, s.bounds, &relays).await?;
             let wanted: Vec<String> = candidates.into_iter().filter(|c| !hidden.contains(c)).take(room).collect();
             if wanted.len() > reads_left {
                 capped = true;
@@ -1484,18 +1494,19 @@ async fn feed_body(
     let need = max_reads + 1;
     let hydration = private_hydration(s, caller, ip).await?;
     let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let chain = s.chain().await;
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |c: &schema::FeedCandidate| (c.created_at, c.key.clone());
     let mut candidates = match of {
         FeedOf::Author { actor, filter } => {
             schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
-                schema::author_batch(pool, me, actor, filter, after, n, bounds.max_chain)
+                schema::author_batch(pool, me, actor, filter, after, n, chain.clone())
             })
             .await?
         }
         FeedOf::Timeline => {
             schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
-                schema::timeline_batch(pool, me, after, n, bounds.max_chain)
+                schema::timeline_batch(pool, me, after, n, chain.clone())
             })
             .await?
         }
@@ -1619,7 +1630,7 @@ async fn reply_context(
         }
     }
     wanted.truncate(2 * limit);
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.chain().await).await?.into_iter().collect();
     wanted.retain(|u| passing.contains(u));
     let mut read: HashMap<String, PrivateEmit<Value>> = HashMap::new();
     if !wanted.is_empty() {
@@ -1765,7 +1776,7 @@ async fn bookmarks_body(
         .flatten();
     // SQL narrows; the pipeline decides each post (§2 rule 1).
     let uris: Vec<String> = rows.iter().map(|(uri, ..)| uri.clone()).collect();
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &uris, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &uris, s.chain().await).await?.into_iter().collect();
     let candidates: Vec<String> = uris.into_iter().filter(|u| passing.contains(u)).collect();
     let hydration = private_hydration(s, caller, ip).await?;
     let authors = profiles(&hydration, &candidates).await?;
@@ -1969,10 +1980,11 @@ async fn quotes_body(
     let max_reads = limit * s.reads_factor;
     let need = max_reads + 1;
     let (pool, me, bounds) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let chain = s.chain().await;
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |c: &schema::QuoteCandidate| (c.created_at, c.uri.clone());
     let mut candidates = schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
-        schema::quote_batch(pool, me, uri, after, n, bounds.max_chain)
+        schema::quote_batch(pool, me, uri, after, n, chain.clone())
     })
     .await?;
     let beyond = candidates.len() > max_reads;
@@ -2094,7 +2106,7 @@ async fn replies_anchor(
     if claimed != uri && is_private_uri(&claimed) {
         wanted.push(claimed.clone());
     }
-    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(pool, &caller.did, &wanted, s.chain().await).await?.into_iter().collect();
     let anchor_row = if stored.is_some() && passing.contains(uri) && !rs.degraded() {
         Covered::of(s, uri).await?
     } else {
@@ -2169,8 +2181,9 @@ async fn replies_body(
     let first = i64::try_from(need).unwrap_or(i64::MAX);
     let key = |(u, at): &(String, DateTime<Utc>)| (*at, u.clone());
     let hidden_ref = &hidden_list;
+    let chain = s.chain().await;
     let mut candidates = schema::passing(need, first, bounds.batch_max, after, key, move |after, n| {
-        schema::reply_page_batch(pool, me, uri, hidden_ref, after, n, bounds.max_chain)
+        schema::reply_page_batch(pool, me, uri, hidden_ref, after, n, chain.clone())
     })
     .await?;
     let beyond = candidates.len() > max_reads;
@@ -2366,12 +2379,13 @@ async fn search_body(
     // The next `scan_candidates` rows that pass the prefilter, in batches
     // (private-threads design §3.2.1).
     let (pool, me, read) = (&s.env.pool, caller.did.as_str(), s.bounds);
+    let chain = s.chain().await;
     let need = usize::try_from(bounds.scan_candidates).unwrap_or(usize::MAX);
     let start_at = (pos.at, pos.uri.clone());
     let key = |(u, at): &(String, DateTime<Utc>)| (*at, u.clone());
     let candidates = schema::passing(need, bounds.scan_candidates, read.batch_max, Some(start_at.clone()), key, move |after, n| {
         let from = after.unwrap_or_else(|| start_at.clone());
-        schema::search_batch(pool, me, from, lower, n, read.max_chain)
+        schema::search_batch(pool, me, from, lower, n, chain.clone())
     })
     .await?;
     let scanned_all = i64::try_from(candidates.len()).unwrap_or(i64::MAX) >= bounds.scan_candidates;
@@ -2490,7 +2504,7 @@ async fn notifications_body(
     // Rows from a private post: each post read for the caller, after the
     // prefilter narrows them (§2 rule 1).
     let post_uris: Vec<String> = rows.iter().filter(|r| r.is_from_private_post()).map(|r| r.record_uri.clone()).collect();
-    let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(pool, me, &post_uris, s.chain().await).await?.into_iter().collect();
     let candidates: Vec<String> = post_uris.into_iter().filter(|u| passing.contains(u)).collect();
     let authors = profiles(&hydration, &candidates).await?;
     let mut posts: Vec<PrivateEmit<Value>> = read_many(s, rs, caller, &candidates, &authors, start).await.into_iter().flatten().collect();
@@ -2585,7 +2599,7 @@ async fn notification_subjects(
             wanted.push(subject.clone());
         }
     }
-    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.env.max_chain).await?.into_iter().collect();
+    let passing: HashSet<String> = schema::prefilter_uris(&s.env.pool, &caller.did, &wanted, s.chain().await).await?.into_iter().collect();
     wanted.retain(|u| passing.contains(u));
     if wanted.is_empty() {
         return Ok(HashMap::new());
@@ -2615,7 +2629,7 @@ pub async fn get_unread_count(
     let caller = prepare_private(&s.app, &headers, peer, GET_UNREAD_COUNT).await?;
     let gate = start.elapsed();
     let reasons = Params::parse(q.as_deref()).all("reasons");
-    let (result, timed) = stages::run(schema::unread_count_for(&s.env.pool, &caller.did, s.env.max_chain, &reasons)).await;
+    let (result, timed) = stages::run(schema::unread_count_for(&s.env.pool, &caller.did, s.chain().await, &reasons)).await;
     floor("getUnreadCount", start, gate, &timed, s.floors.get_unread_count).await;
     Ok(ok(PrivateResponse::unread_count(result?)))
 }

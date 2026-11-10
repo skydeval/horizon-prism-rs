@@ -558,3 +558,46 @@ async fn pre_s12_count_query_counts_each_kind() {
     assert_eq!(owner, (1, 0, 1));
     w.finish().await;
 }
+
+/// In full, the gates honour a takedown relay's suspension as the public
+/// reads do: a non-member writer that relay suspended fails the gate, and a
+/// reply walked through that writer's row fails the walk, in the
+/// prefilter, fact 8 and the reply count; with no relays, or another
+/// relay's rows, nothing changes, and a member is exempt.
+#[tokio::test]
+async fn the_gates_hide_a_writer_a_takedown_relay_suspended() {
+    let Some(w) = Walk::new_in("gates-relay", PublicMode::On, Layout::SamePds, Some("followers"), &[], &[], Arc::new(NoHeads)).await else {
+        return;
+    };
+    let b = w.reply(BOB, "3kgaterelay2", &w.root).await;
+    let c = w.reply(CAROL, "3kgaterelay3", &b).await;
+    w.f.ready_all().await;
+    let pool = &w.f.pool;
+    exec(pool, &format!("DELETE FROM members WHERE did = '{BOB}'")).await;
+    exec(pool, &format!("INSERT INTO relay_account_status (account, relay, status) SELECT id, 'bsky', 'takendown' FROM dids WHERE did = '{BOB}'")).await;
+    let suspended = schema::Chain::new(CAP, vec!["bsky".into()]);
+    let both = vec![b.clone(), c.clone()];
+    let passing = |chain: schema::Chain| {
+        let both = both.clone();
+        async move {
+            let mut got = schema::prefilter_uris(pool, DAVE, &both, chain).await.expect("prefilter");
+            got.sort();
+            got
+        }
+    };
+    let mut all = both.clone();
+    all.sort();
+    assert_eq!(passing(CAP.into()).await, all, "no relays: the status alone");
+    assert_eq!(passing(schema::Chain::new(CAP, vec!["other".into()])).await, all, "another relay's rows hide nobody");
+    assert_eq!(passing(suspended.clone()).await, Vec::<String>::new(), "the writer's post, and the reply walked through it");
+    assert!(!schema::fact8(pool, DAVE, &b, suspended.clone()).await.expect("fact 8").verdict);
+    assert!(schema::fact8(pool, DAVE, &b, CAP).await.expect("fact 8").verdict);
+    let replies = |chain: schema::Chain| {
+        let root = w.root.clone();
+        async move { schema::counts(pool, DAVE, std::slice::from_ref(&root), chain).await.expect("counts").get(&root).map_or(0, |c| c.reply) }
+    };
+    assert_eq!((replies(CAP.into()).await, replies(suspended.clone()).await), (1, 0), "the root's reply count");
+    exec(pool, &format!("INSERT INTO members (did, source, ready_at) VALUES ('{BOB}', 'admin', now())")).await;
+    assert_eq!(passing(suspended).await, all, "a member is exempt");
+    w.finish().await;
+}

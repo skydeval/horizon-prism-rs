@@ -30,6 +30,8 @@ released.
   activity from before the trial, and puts its fill's jobs back as they
   were. Its check now fails if any of these differ. **Upgrade:** migration
   0066.
+- In full, kryphocron reads and counts hide an account a takedown relay
+  suspended, as public reads do.
 
 ## [0.2.0] (2026-11-09)
 

@@ -802,11 +802,7 @@ impl Hydrator {
     /// SQL read ([`crate::moderation::hidden_status_sql`]): empty outside
     /// full and under `suspended_accounts = "all"`.
     pub(crate) async fn hidden_relays(&self) -> Vec<String> {
-        if self.scope().public_breadth() != crate::indexing::Breadth::Full {
-            return Vec::new();
-        }
-        let sets = self.scope().read_guard().await;
-        if sets.public.breadth == crate::indexing::Breadth::Full { sets.full.takedown_relays.clone() } else { Vec::new() }
+        self.scope().hidden_relays().await
     }
 
     /// The moderation gate for `subjects` (§II-7.10), with `account_status`

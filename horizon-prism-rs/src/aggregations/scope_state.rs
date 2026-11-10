@@ -471,6 +471,17 @@ impl ScopeState {
         Breadth::from_u8(self.breadth_mirror.load(Ordering::Acquire))
     }
 
+    /// The takedown relays whose non-active statuses hide an account in an
+    /// SQL read ([`crate::moderation::hidden_status_sql`]): empty outside
+    /// full and under `suspended_accounts = "all"`.
+    pub async fn hidden_relays(&self) -> Vec<String> {
+        if self.public_breadth() != Breadth::Full {
+            return Vec::new();
+        }
+        let sets = self.read_guard().await;
+        if sets.public.breadth == Breadth::Full { sets.full.takedown_relays.clone() } else { Vec::new() }
+    }
+
     /// Load the sets from the database at startup (§9.3).
     ///
     /// # Errors

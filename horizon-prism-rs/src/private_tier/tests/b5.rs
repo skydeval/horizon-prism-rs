@@ -1290,7 +1290,7 @@ async fn b5_thread_expansion_trace() {
         let t = Instant::now();
         candidates = 0;
         for node in &nodes {
-            candidates += schema::reply_candidates(&pool, DAVE, node, per_node, bounds).await.expect("candidates").len();
+            candidates += schema::reply_candidates(&pool, DAVE, node, per_node, bounds, &std::sync::Arc::default()).await.expect("candidates").len();
         }
         statements.push(t.elapsed());
     }

@@ -84,8 +84,9 @@ pub(super) struct SnapshotInputs<'a> {
     /// watermark yet) is infinitely stale.
     pub last_synced: Option<SystemTime>,
     pub bound: Duration,
-    /// `private_read.max_chain`, the walk's cap (private-threads §2.3).
-    pub max_chain: u32,
+    /// `private_read.max_chain`, the walk's cap (private-threads §2.3),
+    /// with the takedown relays the read applies.
+    pub chain: schema::Chain,
     /// Read fact 8 with its walk's authors (`schema::fact8_with_authors`):
     /// only while degraded with the head fallback on.
     pub with_authors: bool,
@@ -110,9 +111,9 @@ impl OracleSnapshot {
         let (f8, walk_authors) = if input.with_authors {
             #[cfg(test)]
             crate::test_support::hooks::pause(crate::test_support::hooks::FALLBACK_BEFORE_FACT8, input.uri).await;
-            schema::fact8_with_authors(pool, input.requester, input.uri, input.max_chain).await?
+            schema::fact8_with_authors(pool, input.requester, input.uri, input.chain.clone()).await?
         } else {
-            (schema::fact8(pool, input.requester, input.uri, input.max_chain).await?, Vec::new())
+            (schema::fact8(pool, input.requester, input.uri, input.chain.clone()).await?, Vec::new())
         };
         // Fact 2 and the relation facts, bound to fact 8's G and O, loaded
         // on every load whatever the mode, so that the mode adds no

@@ -133,11 +133,26 @@ pub struct RelaySuspensions<'a> {
 /// decides. `relays` appears once, so a query builder can bind it in place.
 #[must_use]
 pub fn hidden_status_sql(status_hidden: &str, id: &str, did: &str, relays: &str) -> String {
+    format!("({status_hidden} OR {})", relay_suspended_sql(id, did, relays))
+}
+
+/// [`hidden_status_sql`] for a statement that carries the relays as a
+/// literal list (`relays_literal`, an SQL `text[]` constant) instead of a
+/// bound parameter: the suspension test runs only when the list is not
+/// empty, which PostgreSQL decides when it plans the statement, so with no
+/// relays the read costs what its status test costs.
+#[must_use]
+pub fn hidden_status_sql_listed(status_hidden: &str, id: &str, did: &str, relays_literal: &str) -> String {
+    format!("({status_hidden} OR (cardinality({relays_literal}) > 0 AND {}))", relay_suspended_sql(id, did, relays_literal))
+}
+
+/// A non-active status from one of `relays`, unless the account is a member
+/// or Refract lists it.
+fn relay_suspended_sql(id: &str, did: &str, relays: &str) -> String {
     format!(
-        "({status_hidden} \
-          OR EXISTS (SELECT 1 FROM relay_account_status hs WHERE hs.account = {id} AND hs.relay = ANY({relays}::text[]) \
-                       AND NOT EXISTS (SELECT 1 FROM members hm WHERE hm.did = {did}) \
-                       AND NOT EXISTS (SELECT 1 FROM refract_dids hr WHERE hr.did = {did} AND hr.state IN ('restored', 'grace'))))"
+        "EXISTS (SELECT 1 FROM relay_account_status hs WHERE hs.account = {id} AND hs.relay = ANY({relays}::text[]) \
+                   AND NOT EXISTS (SELECT 1 FROM members hm WHERE hm.did = {did}) \
+                   AND NOT EXISTS (SELECT 1 FROM refract_dids hr WHERE hr.did = {did} AND hr.state IN ('restored', 'grace')))"
     )
 }
 

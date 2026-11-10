@@ -1007,7 +1007,7 @@ async fn oracle_admits_capped(pool: &PgPool, reader: &str, uri: &str, cap: u32) 
             uri,
             last_synced: Some(SystemTime::now()),
             bound: Duration::from_secs(120),
-            max_chain: cap,
+            chain: cap.into(),
             with_authors: false,
         },
     )

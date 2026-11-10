@@ -407,7 +407,8 @@ impl Fanout {
                 return Ok(Attempt::PostDeferred("head"));
             }
         }
-        let served = schema::not_served_rows(&env.pool, author, &[uri.to_string()], env.max_chain)
+        let chain = env.chain().await;
+        let served = schema::not_served_rows(&env.pool, author, &[uri.to_string()], chain.clone())
             .await?
             .get(uri)
             .is_some_and(|r| r.served);
@@ -433,7 +434,7 @@ impl Fanout {
                 deferred.push(did);
                 continue;
             }
-            if schema::fact8(&env.pool, &did, uri, env.max_chain).await?.verdict {
+            if schema::fact8(&env.pool, &did, uri, chain.clone()).await?.verdict {
                 passed.push(did);
             } else {
                 lock(progress).refused.push(did);

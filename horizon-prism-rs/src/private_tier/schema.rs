@@ -219,11 +219,12 @@ const HIDING_STATUSES: &str = "('deactivated', 'takendown', 'suspended', 'delete
 /// this form, which PostgreSQL probes through `labels`' subject index inside
 /// the recursion; stage 1 uses [`gate`]. Since the shared walk, the one-row
 /// form ([`walked_one`]) and HEAD's builders.
-fn gate_shows(uri: &str, author: &str, status: &str) -> String {
+fn gate_shows(uri: &str, author: &str, status: &str, who: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM labels l WHERE (l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
                                               OR (l.subject = {author} AND l.val = '!takedown')) \
-         AND COALESCE({status}, 'active') NOT IN {HIDING_STATUSES}"
+         AND NOT {}",
+        status_hides(status, who)
     )
 }
 
@@ -235,8 +236,64 @@ fn gate(uri: &str, author: &str, status: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = {uri} AND l.val IN ('!takedown', '!hide')) \
          AND NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = {author} AND l.val = '!takedown') \
-         AND COALESCE({status}, 'active') NOT IN {HIDING_STATUSES}"
+         AND NOT {}",
+        status_hides(status, author)
     )
+}
+
+/// The takedown relays whose suspensions hide an account in these
+/// statements, as the literal the builders write: none. A read in full
+/// replaces it with the current list ([`Chain::apply`]), so the statement
+/// text, and with it the plan, changes only while there are relays.
+pub(super) const HIDDEN_RELAYS: &str = "/*hidden relays*/'{}'::text[]";
+
+/// The gate's account rule for the account `who` (a DID expression; NULL
+/// tests nothing but `status`): its status `status` hides it, or a takedown
+/// relay in [`HIDDEN_RELAYS`] suspended it and it is not a member or
+/// Refract-listed. The account's own status checks elsewhere (an owner's
+/// `= 'active'`) stay on the status alone.
+fn status_hides(status: &str, who: &str) -> String {
+    crate::moderation::hidden_status_sql_listed(
+        &format!("COALESCE({status}, 'active') IN {HIDING_STATUSES}"),
+        &format!("(SELECT hd.id FROM dids hd WHERE hd.did = {who})"),
+        who,
+        HIDDEN_RELAYS,
+    )
+}
+
+/// The walk's cap with the takedown relays a read applies: none for the
+/// community rule, and for every read built from a cap alone.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Chain {
+    /// `private_read.max_chain`.
+    pub hops: u32,
+    /// The takedown relays whose suspensions hide an account (empty outside
+    /// full and under `suspended_accounts = "all"`).
+    pub relays: std::sync::Arc<Vec<String>>,
+}
+
+impl Chain {
+    #[must_use]
+    pub(crate) fn new(hops: u32, relays: Vec<String>) -> Self {
+        Self { hops, relays: std::sync::Arc::new(relays) }
+    }
+
+    /// `sql` with [`HIDDEN_RELAYS`] replaced by these relays, quoted as
+    /// SQL string literals.
+    #[must_use]
+    pub(crate) fn apply(&self, sql: String) -> String {
+        if self.relays.is_empty() {
+            return sql;
+        }
+        let list: Vec<String> = self.relays.iter().map(|r| format!("'{}'", r.replace('\'', "''"))).collect();
+        sql.replace(HIDDEN_RELAYS, &format!("/*hidden relays*/ARRAY[{}]::text[]", list.join(", ")))
+    }
+}
+
+impl From<u32> for Chain {
+    fn from(hops: u32) -> Self {
+        Self { hops, relays: std::sync::Arc::default() }
+    }
 }
 
 /// A follow by `owner` naming `subject` is stored (SQL expressions;
@@ -312,7 +369,7 @@ fn step_ok(owner: &str, mode: &str, members: &str, reader: &str) -> String {
                      ELSE false END))",
         author_follows_owner = follow_edge("s.author_did", owner),
         reader_author = blocked(reader, "s.author_did"),
-        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did)"),
+        gate = gate_shows("s.uri", "s.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did)", "s.author_did"),
         author_owner = blocked("s.author_did", owner),
         owner_follows_author = owner_follows(owner, "s.author_did"),
         verified = follows_verified(owner),
@@ -679,7 +736,8 @@ fn walk_step() -> String {
         gate = gate_shows(
             "s.uri",
             "s.author_did",
-            "CASE WHEN s.author_did = k.owner THEN NULL ELSE (SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did) END"
+            "CASE WHEN s.author_did = k.owner THEN NULL ELSE (SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = s.author_did) END",
+            "CASE WHEN s.author_did = k.owner THEN NULL ELSE s.author_did END"
         ),
         reader_author = blocked("$1", "s.author_did"),
         author_owner = blocked("s.author_did", "k.owner"),
@@ -936,7 +994,7 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
            SELECT q.d, q.o, q.g, COALESCE( \
              NOT EXISTS (SELECT 1 FROM labels l WHERE l.subject = q.d AND l.val = '!takedown') \
              AND (q.d = q.o OR ( \
-               COALESCE((SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = q.d), 'active') NOT IN {HIDING_STATUSES} \
+               NOT {am_hidden} \
                AND NOT {reader_author} \
                AND NOT {author_owner} \
                AND {standing})), false) AS ok \
@@ -992,6 +1050,7 @@ fn walked_with(c: &str, s1_filter: &str, final_: &str, cap: u32, stage1: &str) -
         wk_thread = thread_root("k"),
         tcl = climb("tcl", "tk", true, cap),
         tkids = kids("tcl"),
+        am_hidden = status_hides("(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = q.d)", "q.d"),
         reader_author = blocked("$1", "q.d"),
         author_owner = blocked("q.d", "q.o"),
         standing = standing("q.d", "q.o", "COALESCE(fv.ok, false)", false),
@@ -1107,9 +1166,10 @@ pub(super) fn fact8_final() -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> Result<Fact8, sqlx::Error> {
+pub(super) async fn fact8(pool: &PgPool, reader: &str, uri: &str, cap: impl Into<Chain>) -> Result<Fact8, sqlx::Error> {
     type Row = (Option<String>, Option<String>, bool, bool, bool);
-    let row: Option<Row> = sqlx::query_as(&fact8_statement(cap)).bind(reader).bind(uri).fetch_optional(pool).await?;
+    let chain = cap.into();
+    let row: Option<Row> = sqlx::query_as(&chain.apply(fact8_statement(chain.hops))).bind(reader).bind(uri).fetch_optional(pool).await?;
     Ok(row.map_or_else(Fact8::default, |(owner, gov, s1ok, verdict, anchored)| Fact8 {
         owner,
         gov,
@@ -1152,11 +1212,12 @@ fn fact8_with_authors_final() -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn fact8_with_authors(pool: &PgPool, reader: &str, uri: &str, cap: u32) -> Result<(Fact8, Vec<String>), sqlx::Error> {
+pub(super) async fn fact8_with_authors(pool: &PgPool, reader: &str, uri: &str, cap: impl Into<Chain>) -> Result<(Fact8, Vec<String>), sqlx::Error> {
+    let chain = cap.into();
     type Row = (Option<String>, Option<String>, bool, bool, bool, Vec<String>);
     #[cfg(test)]
     crate::test_support::noted::note("fact8_with_authors");
-    let row: Option<Row> = sqlx::query_as(&fact8_with_authors_statement(cap)).bind(reader).bind(uri).fetch_optional(pool).await?;
+    let row: Option<Row> = sqlx::query_as(&chain.apply(fact8_with_authors_statement(chain.hops))).bind(reader).bind(uri).fetch_optional(pool).await?;
     Ok(row.map_or_else(Default::default, |(owner, gov, s1ok, verdict, anchored, authors)| {
         (Fact8 { owner, gov, s1ok, verdict, anchored }, authors)
     }))
@@ -1398,9 +1459,11 @@ pub(super) async fn not_served_rows(
     pool: &PgPool,
     author: &str,
     uris: &[String],
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<HashMap<String, NotServedRow>, sqlx::Error> {
-    not_served_rows_sliced(pool, author, uris, cap, climb_keys(cap)).await
+    let chain = cap.into();
+    let k = climb_keys(chain.hops);
+    not_served_rows_sliced(pool, author, uris, chain, k).await
 }
 
 /// [`not_served_rows`] with K given: past `k` URIs, in slices of `k` inside
@@ -1413,7 +1476,7 @@ pub(super) async fn not_served_rows_sliced(
     pool: &PgPool,
     author: &str,
     uris: &[String],
-    cap: u32,
+    cap: impl Into<Chain>,
     k: usize,
 ) -> Result<HashMap<String, NotServedRow>, sqlx::Error> {
     type Row = (String, bool, bool, bool, bool);
@@ -1421,7 +1484,8 @@ pub(super) async fn not_served_rows_sliced(
     if uris.is_empty() {
         return Ok(out);
     }
-    let sql = not_served_statement(cap);
+    let chain = cap.into();
+    let sql = chain.apply(not_served_statement(chain.hops));
     let rows: Vec<Row> = if uris.len() <= k {
         sqlx::query_as(&sql).bind("").bind(uris).bind(author).fetch_all(pool).await?
     } else {
@@ -1451,7 +1515,7 @@ pub(super) async fn not_served_rows_sliced(
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn not_served(pool: &PgPool, author: &str, uris: &[String], cap: u32) -> Result<HashMap<String, ThreadFault>, sqlx::Error> {
+pub(super) async fn not_served(pool: &PgPool, author: &str, uris: &[String], cap: impl Into<Chain>) -> Result<HashMap<String, ThreadFault>, sqlx::Error> {
     let rows = not_served_rows(pool, author, uris, cap).await?;
     Ok(rows
         .into_iter()
@@ -1571,7 +1635,7 @@ pub(super) fn head_prefilter() -> String {
                     AND {walk})))))",
         viewer_follows_owner = follow_edge("$1", "a.owner_did"),
         author_follows_owner = follow_edge("p.author_did", "a.owner_did"),
-        gate = gate_shows("p.uri", "p.author_did", "po.account_status"),
+        gate = gate_shows("p.uri", "p.author_did", "po.account_status", "p.author_did"),
         viewer_author = blocked("$1", "p.author_did"),
         viewer_owner = blocked("$1", "a.owner_did"),
         author_owner = blocked("p.author_did", "a.owner_did"),
@@ -1834,7 +1898,7 @@ pub(super) fn pre_s12_count_sql() -> String {
         format!(
             "(a0.uri IS NOT NULL AND {gate} AND (a0.owner_did = p.author_did OR (ao0.account_status = 'active' \
                AND NOT {author_owner} AND {head_may_write} AND {walk})))",
-            gate = gate_shows("p.uri", "p.author_did", "po0.account_status"),
+            gate = gate_shows("p.uri", "p.author_did", "po0.account_status", "p.author_did"),
             author_owner = blocked("p.author_did", "a0.owner_did"),
             walk = anchored_with_cap("p.reply_parent_uri", "p.audience_uri", "a0.owner_did", "a0.mode", "a0.members", "''", cap),
         )
@@ -1866,10 +1930,10 @@ pub(super) fn pre_s12_count_sql() -> String {
             none_root = is_private("s1.reply_root_uri"),
             role = role_kind("s1", "an"),
             anchor_owned = owned("an.audience_uri", "an.author_did"),
-            anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)"),
+            anchor_gate = gate_shows("an.uri", "an.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = an.author_did)", "an.author_did"),
             post_owned = owned("s1.audience_uri", "an.author_did"),
             thread_reply = is_thread_reply("s1"),
-            parent_gate = gate_shows("pp.uri", "pp.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = pp.author_did)"),
+            parent_gate = gate_shows("pp.uri", "pp.author_did", "(SELECT x.account_status FROM dids xd JOIN actors x ON x.id = xd.id WHERE xd.did = pp.author_did)", "pp.author_did"),
         ),
         16,
         &stage1,
@@ -1954,8 +2018,10 @@ pub(super) fn prefilter_uris_statement(cap: u32) -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String], cap: u32) -> Result<Vec<String>, sqlx::Error> {
-    prefilter_uris_sliced(pool, requester, uris, cap, climb_keys(cap)).await
+pub(super) async fn prefilter_uris(pool: &PgPool, requester: &str, uris: &[String], cap: impl Into<Chain>) -> Result<Vec<String>, sqlx::Error> {
+    let chain = cap.into();
+    let k = climb_keys(chain.hops);
+    prefilter_uris_sliced(pool, requester, uris, chain, k).await
 }
 
 /// [`prefilter_uris`] with K given (shared-walk §2.5): an input of more
@@ -1968,13 +2034,14 @@ pub(super) async fn prefilter_uris_sliced(
     pool: &PgPool,
     requester: &str,
     uris: &[String],
-    cap: u32,
+    cap: impl Into<Chain>,
     k: usize,
 ) -> Result<Vec<String>, sqlx::Error> {
     if uris.is_empty() {
         return Ok(Vec::new());
     }
-    let sql = prefilter_uris_statement(cap);
+    let chain = cap.into();
+    let sql = chain.apply(prefilter_uris_statement(chain.hops));
     if uris.len() <= k {
         return sqlx::query_scalar(&sql).bind(requester).bind(uris).fetch_all(pool).await;
     }
@@ -2026,10 +2093,11 @@ pub(super) async fn reply_page_batch(
     hidden: &[String],
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
-    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&reply_page_statement(cap))
+    let chain = cap.into();
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&chain.apply(reply_page_statement(chain.hops)))
         .bind(requester)
         .bind(parent)
         .bind(hidden)
@@ -2070,9 +2138,10 @@ pub(super) async fn search_batch(
     (at, uri): (DateTime<Utc>, String),
     lower: DateTime<Utc>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
-    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&search_statement(cap))
+    let chain = cap.into();
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&chain.apply(search_statement(chain.hops)))
         .bind(requester)
         .bind(at)
         .bind(uri)
@@ -2111,10 +2180,11 @@ pub(super) async fn reply_candidates_batch(
     parent: &str,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<((String, DateTime<Utc>), bool)>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
-    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&reply_candidates_statement(cap))
+    let chain = cap.into();
+    let rows: Vec<(String, DateTime<Utc>, bool)> = sqlx::query_as(&chain.apply(reply_candidates_statement(chain.hops)))
         .bind(requester)
         .bind(parent)
         .bind(at)
@@ -2137,10 +2207,12 @@ pub(super) async fn reply_candidates(
     parent: &str,
     limit: usize,
     bounds: ReadBounds,
+    relays: &std::sync::Arc<Vec<String>>,
 ) -> Result<Vec<String>, sqlx::Error> {
     let first = i64::try_from(limit).unwrap_or(i64::MAX);
+    let chain = Chain { hops: bounds.max_chain, relays: relays.clone() };
     let rows = passing(limit, first, bounds.batch_max, None, |(u, at): &(String, DateTime<Utc>)| (*at, u.clone()), move |after, n| {
-        reply_candidates_batch(pool, requester, parent, after, n, bounds.max_chain)
+        reply_candidates_batch(pool, requester, parent, after, n, chain.clone())
     })
     .await?;
     Ok(rows.into_iter().map(|(u, _)| u).collect())
@@ -2834,10 +2906,11 @@ pub(super) async fn author_batch(
     filter: AuthorFilter,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<(FeedCandidate, bool)>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
-    let rows: Vec<FeedRow> = sqlx::query_as(&author_statement(filter, cap))
+    let chain = cap.into();
+    let rows: Vec<FeedRow> = sqlx::query_as(&chain.apply(author_statement(filter, chain.hops)))
         .bind(requester)
         .bind(author)
         .bind(at)
@@ -2897,10 +2970,11 @@ pub(super) async fn timeline_batch(
     requester: &str,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<(FeedCandidate, bool)>, sqlx::Error> {
     let (at, key) = after.map_or((None, String::new()), |(a, k)| (Some(a), k));
-    let rows: Vec<FeedRow> = sqlx::query_as(&timeline_statement(cap))
+    let chain = cap.into();
+    let rows: Vec<FeedRow> = sqlx::query_as(&chain.apply(timeline_statement(chain.hops)))
         .bind(requester)
         .bind(at)
         .bind(key)
@@ -2973,8 +3047,10 @@ fn counted_quote_ref() -> String {
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: u32) -> Result<HashMap<String, Counts>, sqlx::Error> {
-    counts_sliced(pool, reader, uris, cap, climb_keys(cap), None).await
+pub(super) async fn counts(pool: &PgPool, reader: &str, uris: &[String], cap: impl Into<Chain>) -> Result<HashMap<String, Counts>, sqlx::Error> {
+    let chain = cap.into();
+    let k = climb_keys(chain.hops);
+    counts_sliced(pool, reader, uris, chain, k, None).await
 }
 
 /// [`counts`] with K given (shared-walk §2.5). `replyCount` reads `uris`
@@ -2990,7 +3066,7 @@ pub(super) async fn counts_sliced(
     pool: &PgPool,
     reader: &str,
     uris: &[String],
-    cap: u32,
+    cap: impl Into<Chain>,
     k: usize,
     between: Option<&str>,
 ) -> Result<HashMap<String, Counts>, sqlx::Error> {
@@ -2999,7 +3075,9 @@ pub(super) async fn counts_sliced(
         return Ok(out);
     }
     let k = k.max(1);
-    let reply_sql = reply_counts_statement(cap);
+    let chain = cap.into();
+    let cap = chain.hops;
+    let reply_sql = chain.apply(reply_counts_statement(cap));
     let replies: Vec<(String, i64)> = if uris.len() <= k {
         sqlx::query_as(&reply_sql).bind(reader).bind(uris).fetch_all(pool).await?
     } else {
@@ -3044,7 +3122,7 @@ pub(super) async fn counts_sliced(
     }
     // At most K keys: one statement, one snapshot, no slice.
     let bounded: Vec<(Option<String>, i64, bool)> =
-        sqlx::query_as(&quote_counts_bounded_statement(cap, k)).bind(reader).bind(uris).fetch_all(pool).await?;
+        sqlx::query_as(&chain.apply(quote_counts_bounded_statement(cap, k))).bind(reader).bind(uris).fetch_all(pool).await?;
     if !bounded.iter().any(|(_, _, over)| *over) {
         for (uri, n, _) in bounded {
             if let Some(uri) = uri {
@@ -3055,7 +3133,7 @@ pub(super) async fn counts_sliced(
     }
     let mut tx = pool.begin_with(SLICED).await?;
     let keys: Vec<String> = sqlx::query_scalar(QUOTE_KEYS).bind(uris).fetch_all(&mut *tx).await?;
-    let slice_sql = quote_counts_slice_statement(cap);
+    let slice_sql = chain.apply(quote_counts_slice_statement(cap));
     let mut quotes: HashMap<String, i64> = HashMap::new();
     for (i, slice) in keys.chunks(k).enumerate() {
         let rows: Vec<(String, i64)> = sqlx::query_as(&slice_sql).bind(reader).bind(uris).bind(slice).fetch_all(&mut *tx).await?;
@@ -3315,10 +3393,11 @@ pub(super) async fn quote_batch(
     quoted: &str,
     after: Option<(DateTime<Utc>, String)>,
     limit: i64,
-    cap: u32,
+    cap: impl Into<Chain>,
 ) -> Result<Vec<(QuoteCandidate, bool)>, sqlx::Error> {
     let (at, uri) = after.map_or((None, String::new()), |(a, u)| (Some(a), u));
-    let rows: Vec<(String, DateTime<Utc>, Option<String>, bool)> = sqlx::query_as(&quote_statement(cap))
+    let chain = cap.into();
+    let rows: Vec<(String, DateTime<Utc>, Option<String>, bool)> = sqlx::query_as(&chain.apply(quote_statement(chain.hops)))
         .bind(reader)
         .bind(quoted)
         .bind(at)
@@ -3673,9 +3752,11 @@ pub(super) async fn unread_count(pool: &PgPool, recipient: &str, cap: u32) -> Re
 /// # Errors
 ///
 /// Database errors.
-pub(super) async fn unread_count_for(pool: &PgPool, recipient: &str, cap: u32, reasons: &[String]) -> Result<i64, sqlx::Error> {
+pub(super) async fn unread_count_for(pool: &PgPool, recipient: &str, cap: impl Into<Chain>, reasons: &[String]) -> Result<i64, sqlx::Error> {
+    let chain = cap.into();
+    let k = climb_keys(chain.hops);
     match reasons_clause(reasons) {
-        Some(filter) => unread_count_sliced_for(pool, recipient, cap, climb_keys(cap), None, &filter).await,
+        Some(filter) => unread_count_sliced_for(pool, recipient, chain, k, None, &filter).await,
         None => Ok(0),
     }
 }
@@ -3721,19 +3802,21 @@ pub(super) async fn unread_count_sliced(
 async fn unread_count_sliced_for(
     pool: &PgPool,
     recipient: &str,
-    cap: u32,
+    cap: impl Into<Chain>,
     k: usize,
     between: Option<&str>,
     filter: &str,
 ) -> Result<i64, sqlx::Error> {
+    let chain = cap.into();
+    let cap = chain.hops;
     // At most K candidates: one statement, one snapshot, no slice.
-    let bounded: Option<i64> = sqlx::query_scalar(&unread_bounded_statement_for(cap, k, filter)).bind(recipient).fetch_one(pool).await?;
+    let bounded: Option<i64> = sqlx::query_scalar(&chain.apply(unread_bounded_statement_for(cap, k, filter))).bind(recipient).fetch_one(pool).await?;
     if let Some(n) = bounded {
         return Ok(n);
     }
     let mut tx = pool.begin_with(SLICED).await?;
     let ids: Vec<i64> = sqlx::query_scalar(&unread_keys_statement_for(filter)).bind(recipient).fetch_all(&mut *tx).await?;
-    let slice_sql = unread_slice_statement_for(cap, filter);
+    let slice_sql = chain.apply(unread_slice_statement_for(cap, filter));
     let mut total = 0i64;
     for (i, slice) in ids.chunks(k.max(1)).enumerate() {
         let n: i64 = sqlx::query_scalar(&slice_sql).bind(recipient).bind(slice).fetch_one(&mut *tx).await?;
@@ -4017,4 +4100,39 @@ pub(super) async fn appearance_retained_count(pool: &PgPool) -> Result<i64, sqlx
     sqlx::query_scalar("SELECT count(*) FROM private_appearance WHERE retained_until IS NOT NULL")
         .fetch_one(pool)
         .await
+}
+
+#[cfg(test)]
+mod relay_tests {
+    use super::*;
+
+    /// The gates test an account through the one fragment: every hiding
+    /// status test sits in [`status_hides`], and both gate forms carry the
+    /// relay suspension test with the relay list; owner checks stay on the
+    /// status alone.
+    #[test]
+    fn the_gates_test_status_through_the_one_fragment() {
+        let code = include_str!("schema.rs");
+        let code = code.split("#[cfg(test)]\nmod relay_tests").next().unwrap_or(code);
+        let uses: Vec<usize> = code.match_indices("{HIDING_STATUSES}").map(|(i, _)| i).collect();
+        let at = code.find("fn status_hides(").expect("status_hides");
+        let end = at + code[at..].find("\n}\n").expect("its end");
+        assert!(uses.iter().all(|i| (at..end).contains(i)), "a hiding status test outside status_hides");
+        for sql in [gate("c.uri", "c.author_did", "po.account_status"), gate_shows("c.uri", "c.author_did", "po.account_status", "c.author_did")] {
+            assert!(sql.contains("relay_account_status") && sql.contains(HIDDEN_RELAYS), "{sql}");
+        }
+        assert!(walked("SELECT 1", "", "SELECT 1", 16).contains(HIDDEN_RELAYS));
+        assert!(stage1_ok().contains("= 'active'"), "the owner's own check stays");
+    }
+
+    /// The relay list replaces every literal, quoted; with no relays the
+    /// statement is unchanged.
+    #[test]
+    fn a_chain_writes_its_relays_into_the_statement() {
+        let sql = prefilter_uris_statement(16);
+        assert_eq!(Chain::from(16).apply(sql.clone()), sql);
+        let applied = Chain::new(16, vec!["bsky".into(), "o'neil".into()]).apply(sql.clone());
+        assert!(!applied.contains(HIDDEN_RELAYS));
+        assert_eq!(applied.matches("ARRAY['bsky', 'o''neil']::text[]").count(), sql.matches(HIDDEN_RELAYS).count());
+    }
 }
