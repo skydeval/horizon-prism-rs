@@ -518,6 +518,9 @@ pub struct FirehoseConfig {
     /// The most commits a writer lane applies in one transaction; 1 is one
     /// transaction per commit. A lane never waits to fill one.
     pub lane_batch: u32,
+    /// Write quiet full-arm likes, reposts and follows of a transaction in
+    /// multi-row statements.
+    pub bulk_arm: bool,
 }
 
 /// `[firehose] dedupe`.
@@ -599,6 +602,7 @@ impl Default for FirehoseConfig {
             writer_lanes: 1,
             lane_queue: 2000,
             lane_batch: 64,
+            bulk_arm: true,
         }
     }
 }

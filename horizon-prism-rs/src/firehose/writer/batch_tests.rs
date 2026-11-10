@@ -385,3 +385,238 @@ async fn a_failure_inside_a_batch_commits_none_of_it() {
     drop(failing);
     db.drop_db().await;
 }
+
+const MEMBER_F: &str = "did:plc:equivmemberaaaaaaaaaaaa";
+const S_AUTHOR: &str = "did:plc:equivsauthoraaaaaaaaaaa";
+const X: &str = "did:plc:equivxxxxxxxxxxxxxxxxxxxx";
+const Y: &str = "did:plc:equivyyyyyyyyyyyyyyyyyyyy";
+const Z: &str = "did:plc:equivzzzzzzzzzzzzzzzzzzzz";
+
+/// A writer indexing the full network, with every group, one member and
+/// one account in S; the bulk arm on or off.
+async fn full_writer(pool: &PgPool, bulk: bool) -> Writer {
+    let mut sets = ScopeSets::default();
+    sets.full.kinds = crate::config::FullGroup::ALL.to_vec();
+    sets.full.takedown_relays = vec!["bsky".to_string()];
+    sets.full.status_relays = vec!["bsky".to_string()];
+    sets.members.insert(MEMBER_F.to_string());
+    for d in [MEMBER_F, S_AUTHOR] {
+        sets.scope.insert(d.to_string());
+    }
+    let scope = ScopeState::new(sets, ScopePolicy::MembersAndOneHop, 10_000);
+    {
+        let mut guard = scope.write_guard().await;
+        scope.set_public(&mut guard, PublicState { mode: PublicMode::On, breadth: crate::indexing::Breadth::Full, generation: 1, ..PublicState::default() });
+    }
+    sqlx::query("INSERT INTO members (did, source, ready_at) VALUES ($1, 'admin', now())").bind(MEMBER_F).execute(pool).await.expect("member");
+    Writer::new(pool.clone(), scope, Arc::new(crate::private_tier::DisabledPrivateTier)).with_bulk_arm(bulk)
+}
+
+/// One commit of the equivalence corpus: repo, rev, since, ops, tier.
+type Commit = (String, String, Option<String>, Vec<RawOp>, super::super::tier::CopyTier);
+
+/// The corpus: S's and a member's posts; strangers' likes, reposts and
+/// follows (the bulk arm's); a member-involved like; a like through a
+/// member's repost; a like of a private post; a create, delete and create
+/// of one record; a like, unlike and like by one account; two copies of one
+/// commit; an odd reference, then the same like made whole; a like a
+/// tombstone refuses; an Aside copy.
+fn equivalence_corpus() -> Vec<Commit> {
+    use super::super::tier::CopyTier::{Aside, Whole};
+    let mut revs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut n = 1000;
+    let mut out: Vec<Commit> = Vec::new();
+    let mut push = |out: &mut Vec<Commit>, repo: &str, ops: Vec<RawOp>, tier| {
+        n += 1;
+        let rev = tid(n);
+        let since = revs.insert(repo.to_string(), rev.clone());
+        out.push((repo.to_string(), rev, since, ops, tier));
+    };
+    let post = |rkey: i64| create("app.bsky.feed.post", &tid(rkey), json!({"$type": "app.bsky.feed.post", "text": "equivalence #equivtag", "tags": ["equivtag"], "createdAt": now()}));
+    let like = |rkey: i64, subject: String| create("app.bsky.feed.like", &tid(rkey), json!({"$type": "app.bsky.feed.like", "subject": {"uri": subject, "cid": "bafyeq"}, "createdAt": now()}));
+    let repost = |rkey: i64, subject: String| create("app.bsky.feed.repost", &tid(rkey), json!({"$type": "app.bsky.feed.repost", "subject": {"uri": subject, "cid": "bafyeq"}, "createdAt": now()}));
+    let follow = |rkey: i64, subject: &str| create("app.bsky.graph.follow", &tid(rkey), json!({"$type": "app.bsky.graph.follow", "subject": subject, "createdAt": now()}));
+    let p1 = post_uri(S_AUTHOR, 1);
+    push(&mut out, S_AUTHOR, vec![post(1)], Whole);
+    push(&mut out, MEMBER_F, vec![post(2)], Whole);
+    push(&mut out, X, vec![like(10, p1.clone())], Whole);
+    push(&mut out, Y, vec![like(11, p1.clone())], Whole);
+    push(&mut out, X, vec![repost(12, p1.clone())], Whole);
+    push(&mut out, Z, vec![follow(13, X)], Whole);
+    // A member's post liked by a stranger: member-involved.
+    push(&mut out, Y, vec![like(14, post_uri(MEMBER_F, 2))], Whole);
+    // A member's repost, and a stranger's like through it.
+    push(&mut out, MEMBER_F, vec![repost(15, p1.clone())], Whole);
+    let via = json!({"$type": "app.bsky.feed.like", "subject": {"uri": p1, "cid": "bafyeq"}, "via": {"uri": format!("at://{MEMBER_F}/app.bsky.feed.repost/{}", tid(15)), "cid": "bafyeq"}, "createdAt": now()});
+    push(&mut out, Z, vec![create("app.bsky.feed.like", &tid(16), via)], Whole);
+    // A like of a non-member's private post.
+    push(&mut out, X, vec![like(17, format!("at://{Y}/app.bsky.feed.postPrivate/{}", tid(3)))], Whole);
+    // Create, delete, create of one like.
+    push(&mut out, X, vec![like(18, p1.clone())], Whole);
+    push(&mut out, X, vec![delete("app.bsky.feed.like", &tid(18))], Whole);
+    push(&mut out, X, vec![like(18, p1.clone())], Whole);
+    // Like, unlike, like again by one account.
+    push(&mut out, Z, vec![like(19, p1.clone())], Whole);
+    push(&mut out, Z, vec![delete("app.bsky.feed.like", &tid(19))], Whole);
+    push(&mut out, Z, vec![like(20, p1.clone())], Whole);
+    // Two copies of one commit.
+    push(&mut out, Y, vec![follow(21, Z)], Whole);
+    let copy = out.last().cloned().expect("commit");
+    out.push(copy);
+    // An odd reference, then the same like made whole.
+    push(&mut out, Y, vec![like(22, "at://not-a-did.example/app.bsky.feed.post/3kaaaaaaaaa22".to_string())], Whole);
+    let mut update = like(22, p1.clone());
+    update.action = Action::Update;
+    push(&mut out, Y, vec![update], Whole);
+    // A like a tombstone at a newer rev refuses (the delete runs first).
+    push(&mut out, Z, vec![like(23, p1.clone())], Whole);
+    // An Aside copy of a stranger's like.
+    push(&mut out, X, vec![like(24, p1.clone())], Aside);
+    out
+}
+
+fn equivalence_items(corpus: &[Commit]) -> Vec<LiveCommit<'_>> {
+    corpus
+        .iter()
+        .enumerate()
+        .map(|(i, (repo, rev, since, ops, tier))| LiveCommit {
+            relay: Some("bsky"),
+            repo,
+            rev,
+            since: since.as_deref(),
+            ops,
+            options: ApplyOptions { advance_applied_rev: *tier == super::super::tier::CopyTier::Whole, ..OPTIONS },
+            tier: *tier,
+            stream: Some(LiveStream { ms: 1_700_000_000_000 + i64::try_from(i).unwrap_or(0), stamped: true }),
+        })
+        .collect()
+}
+
+/// Every table the corpus writes, by natural key: account ids through
+/// `dids.did`; generated serials and clock columns left out (`id`,
+/// `indexed_at`, `deleted_at`, `next_at`, `updated_at`).
+async fn tables(pool: &PgPool) -> Vec<(String, Vec<String>)> {
+    let queries: [(&str, &str); 14] = [
+        ("likes", "SELECT concat_ws('|', da.did, l.rkey, ds.did, l.subj_coll, l.subj_rkey, encode(l.subj_cid, 'hex'), l.rev, l.created_at, dv.did, l.via_coll, l.via_rkey) FROM likes l JOIN dids da ON da.id = l.author LEFT JOIN dids ds ON ds.id = l.subj_author LEFT JOIN dids dv ON dv.id = l.via_author"),
+        ("reposts", "SELECT concat_ws('|', da.did, l.rkey, ds.did, l.subj_coll, l.subj_rkey, l.rev, l.created_at, dv.did, l.via_coll) FROM reposts l JOIN dids da ON da.id = l.author LEFT JOIN dids ds ON ds.id = l.subj_author LEFT JOIN dids dv ON dv.id = l.via_author"),
+        ("follows", "SELECT concat_ws('|', da.did, f.rkey, ds.did, f.rev, f.created_at) FROM follows f JOIN dids da ON da.id = f.author JOIN dids ds ON ds.id = f.subject"),
+        ("posts", "SELECT concat_ws('|', da.did, p.rkey, p.rev, p.created_at, dp.did, p.parent_coll, p.parent_rkey) FROM posts p JOIN dids da ON da.id = p.author LEFT JOIN dids dp ON dp.id = p.parent_author"),
+        ("post_counts", "SELECT concat_ws('|', d.did, c.rkey, c.like_count, c.repost_count, c.reply_count, c.quote_count) FROM post_counts c JOIN dids d ON d.id = c.author WHERE c.like_count + c.repost_count + c.reply_count + c.quote_count > 0"),
+        ("actor_counts", "SELECT concat_ws('|', d.did, c.posts_count, c.follows_count, c.followers_count) FROM actor_counts c JOIN dids d ON d.id = c.id WHERE c.posts_count + c.follows_count + c.followers_count > 0"),
+        ("feed_items", "SELECT concat_ws('|', d.did, f.is_repost, f.src_rkey, f.kind, dp.did, f.post_rkey, f.sort_at) FROM feed_items f JOIN dids d ON d.id = f.originator JOIN dids dp ON dp.id = f.post_author"),
+        ("record_tombstones", "SELECT concat_ws('|', d.did, t.coll, t.rkey, t.rev) FROM record_tombstones t JOIN dids d ON d.id = t.author"),
+        ("odd_refs", "SELECT concat_ws('|', o.tbl, d.did, o.rkey, o.slot, o.raw) FROM odd_refs o JOIN dids d ON d.id = o.author"),
+        ("notifications", "SELECT concat_ws('|', recipient_did, author_did, reason, reason_subject, record_uri) FROM notifications"),
+        ("full_crawl", "SELECT concat_ws('|', d.did, f.generation, f.state, f.epoch, f.last_rev, f.chain_rev, f.chain_from, f.chain_generation, f.aside_rev, f.uncovered, f.groups::text) FROM full_crawl f JOIN dids d ON d.id = f.account"),
+        ("full_chain_links", "SELECT concat_ws('|', d.did, l.since, l.rev) FROM full_chain_links l JOIN dids d ON d.id = l.account"),
+        ("tag_activity_hourly", "SELECT concat_ws('|', tag, hour, posts, likes, reposts, replies) FROM tag_activity_hourly WHERE posts + likes + reposts + replies > 0"),
+        ("sync_state", "SELECT concat_ws('|', did, applied_rev, firehose_rev, chain_rev) FROM sync_state"),
+    ];
+    let mut out = Vec::new();
+    for (name, sql) in queries {
+        let mut rows: Vec<String> = sqlx::query_scalar(sql).fetch_all(pool).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+        rows.sort();
+        out.push((name.to_string(), rows));
+    }
+    out
+}
+
+/// The bulk arm's proof: the corpus applied one commit per transaction
+/// without the bulk arm, and 64 to a transaction with it, leaves the same
+/// rows in every table it writes and the same outcomes per commit.
+#[tokio::test]
+async fn a_corpus_leaves_the_same_rows_one_at_a_time_and_in_batches_with_the_bulk_arm() {
+    let Some(one) = fresh_db("equiv_one").await else {
+        return;
+    };
+    let Some(batched) = fresh_db("equiv_batched").await else {
+        return;
+    };
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let _local = metrics::set_default_local_recorder(&recorder);
+    let corpus = equivalence_corpus();
+    let items = equivalence_items(&corpus);
+    let mut outcomes: Vec<Vec<Vec<OpOutcome>>> = Vec::new();
+    for (db, bulk, max) in [(&one, false, 1usize), (&batched, true, 64)] {
+        let w = full_writer(&db.pool, bulk).await;
+        // A tombstone of Z's later like, at a newer rev, before the corpus.
+        w.apply_live(Some("bsky"), Z, &tid(5000), None, &[delete("app.bsky.feed.like", &tid(23))], OPTIONS, super::super::tier::CopyTier::Whole, None).await.expect("tombstone");
+        let mut reports = Vec::new();
+        let mut pos = 0;
+        while pos < items.len() {
+            let r = w.apply_batch(&items[pos..], max).await.expect("apply");
+            pos += r.len();
+            reports.extend(r);
+        }
+        outcomes.push(reports.into_iter().map(|r| r.outcomes).collect());
+    }
+    assert_eq!(outcomes[0], outcomes[1], "the same outcomes per commit");
+    let bulk = |table: &str| crate::test_support::series(&handle.render(), METRIC_BULK_OPS, &[&format!("table=\"{table}\"")]).unwrap_or(0.0);
+    assert!(bulk("likes") >= 2.0 && bulk("reposts") >= 1.0 && bulk("follows") >= 1.0, "the batched run took the bulk arm: {} {} {}", bulk("likes"), bulk("reposts"), bulk("follows"));
+    let (a, b) = (tables(&one.pool).await, tables(&batched.pool).await);
+    for ((name, ra), (_, rb)) in a.iter().zip(&b) {
+        assert_eq!(ra, rb, "{name}");
+    }
+    // The corpus exercised what it says it does.
+    let get = |name: &str| a.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone()).unwrap_or_default();
+    assert!(!get("odd_refs").iter().any(|o| o.starts_with(&format!("2|{Y}|"))), "the odd like was made whole: {:?}", get("odd_refs"));
+    assert!(get("notifications").iter().any(|n| n.contains("|like-via-repost|")), "{:?}", get("notifications"));
+    assert!(get("feed_items").iter().any(|f| f.starts_with(X)), "a stranger's repost has its feed item");
+    assert!(get("full_crawl").len() >= 4, "{:?}", get("full_crawl"));
+    let p1 = crate::db::ids::rkey_value(&tid(1)).expect("tid").to_string();
+    assert!(get("post_counts").iter().any(|c| c.starts_with(&format!("{S_AUTHOR}|{p1}|"))), "{:?}", get("post_counts"));
+    one.drop_db().await;
+    batched.drop_db().await;
+}
+
+/// The bulk arm's own rules: an older rev is not written; a tombstone at a
+/// newer rev refuses; two ops of one key in a batch keep the higher rev; a
+/// constraint error falls back to the per-op path.
+#[tokio::test]
+async fn the_bulk_arm_keeps_last_writer_wins_and_falls_back_on_an_error() {
+    let Some(db) = fresh_db("bulk_rules").await else {
+        return;
+    };
+    let w = full_writer(&db.pool, true).await;
+    let p1 = post_uri(S_AUTHOR, 1);
+    let like = |rkey: i64, subject: &str| create("app.bsky.feed.like", &tid(rkey), json!({"$type": "app.bsky.feed.like", "subject": {"uri": subject, "cid": "bafyeq"}, "createdAt": now()}));
+    let stored_rev = |rkey: i64| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT l.rev FROM likes l JOIN dids d ON d.id = l.author WHERE d.did = $1 AND l.rkey = $2")
+                .bind(X)
+                .bind(crate::db::ids::rkey_value(&tid(rkey)).expect("tid"))
+                .fetch_optional(&pool)
+                .await
+                .expect("rev")
+        }
+    };
+    let corpus: Vec<Commit> = vec![
+        (X.into(), tid(2000), None, vec![like(30, &p1)], super::super::tier::CopyTier::Whole),
+        (X.into(), tid(2002), Some(tid(2000)), vec![{ let mut u = like(30, &p1); u.action = Action::Update; u }], super::super::tier::CopyTier::Whole),
+    ];
+    let items = equivalence_items(&corpus);
+    assert_eq!(w.apply_batch(&items, 64).await.expect("batch").len(), 2);
+    assert_eq!(stored_rev(30).await, Some(crate::db::ids::rev_value(&tid(2002))), "the higher rev of one key");
+    // An older rev of the same like is not written.
+    let older: Vec<Commit> = vec![(X.into(), tid(2001), None, vec![{ let mut u = like(30, &p1); u.action = Action::Update; u }], super::super::tier::CopyTier::Whole)];
+    let r = w.apply_batch(&equivalence_items(&older), 64).await.expect("older");
+    assert_eq!(r[0].outcomes, [OpOutcome::Unchanged]);
+    assert_eq!(stored_rev(30).await, Some(crate::db::ids::rev_value(&tid(2002))));
+    // A tombstone at a newer rev refuses.
+    w.apply_live(Some("bsky"), X, &tid(3000), None, &[delete("app.bsky.feed.like", &tid(31))], OPTIONS, super::super::tier::CopyTier::Whole, None).await.expect("tombstone");
+    let refused: Vec<Commit> = vec![(X.into(), tid(2500), None, vec![like(31, &p1)], super::super::tier::CopyTier::Whole)];
+    let r = w.apply_batch(&equivalence_items(&refused), 64).await.expect("refused");
+    assert_eq!(r[0].outcomes, [OpOutcome::Unchanged]);
+    assert_eq!(stored_rev(31).await, None);
+    // A failing bulk statement falls back to the per-op path.
+    let fails = hooks::arm_times(hooks::WRITER_BULK_FAILS, &format!("{}/*", db.pool.connect_options().get_database().unwrap_or_default()), 1);
+    let fallback: Vec<Commit> = vec![(X.into(), tid(2600), None, vec![like(32, &p1)], super::super::tier::CopyTier::Whole)];
+    let r = w.apply_batch(&equivalence_items(&fallback), 64).await.expect("fallback");
+    assert_eq!(fails.hits(), 1);
+    assert_eq!(r[0].outcomes, [OpOutcome::Written]);
+    assert!(stored_rev(32).await.is_some());
+    drop(fails);
+    db.drop_db().await;
+}

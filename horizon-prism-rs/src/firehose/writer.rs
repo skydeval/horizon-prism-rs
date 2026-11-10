@@ -27,7 +27,7 @@ use super::records::{GraphRecord, PostRecord, ProfileRecord, RecordError, Subjec
 use super::rows::{self, Cell, Layout, Row, RowKey};
 use crate::aggregations::growth::{self, GrowthPlan};
 use crate::aggregations::{Admission, AdmissionInput, AdmitRule, PurgeKind, RecordKind, RejectReason, ScopeSets, ScopeState, admit};
-use crate::db::ids::{AccountId, COLL_LIST, COLL_POST, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
+use crate::db::ids::{AccountId, COLL_LIKE, COLL_LIST, COLL_POST, COLL_REPOST, Ids, OddTable, Slot, StoredRef, cid_to_db, ref_did, ref_rkey, rev_value, stored_ref};
 use crate::db::posts::{FEED_POST, FEED_REPLY, FEED_REPOST, embed_kind};
 use crate::db::records;
 use crate::db::tombstones::{self, Put};
@@ -48,6 +48,14 @@ pub const METRIC_SKIPPED: &str = "firehose_ops_skipped_total";
 pub const METRIC_LWW_SKIPPED: &str = "lww_skipped";
 /// Metric: full-arm ops of Aside copies that were dropped, by relay.
 pub const METRIC_ASIDE_DROPPED: &str = "firehose_aside_dropped_total";
+
+/// Metric: transactions whose bulk statements failed, their ops then
+/// written one at a time.
+pub const METRIC_BULK_FALLBACK: &str = "firehose_bulk_arm_fallback_total";
+/// Metric: ops the bulk arm wrote or found unchanged, by table.
+pub const METRIC_BULK_OPS: &str = "firehose_bulk_arm_ops_total";
+/// `collections.id` of `app.bsky.graph.follow`.
+const COLL_FOLLOW: i16 = 4;
 
 /// Metric: the time a writer lane's transactions spend in each phase.
 pub const METRIC_PHASE: &str = "firehose_lane_phase_seconds";
@@ -976,6 +984,9 @@ pub struct Writer {
     /// Accounts full indexing saw for the first time live, for their
     /// takedown relays' status.
     first_sight: Option<Arc<crate::indexing::crawl::FirstSight>>,
+    /// Quiet full-arm likes, reposts and follows of a transaction are
+    /// written in multi-row statements.
+    bulk_arm: bool,
 }
 
 /// The live feed's view of one call's ops (admin-ui-live-feed design
@@ -1032,7 +1043,16 @@ impl Writer {
             feed: None,
             outline: false,
             first_sight: None,
+            bulk_arm: true,
         }
+    }
+
+    /// Write quiet full-arm likes, reposts and follows in multi-row
+    /// statements (on by default).
+    #[must_use]
+    pub fn with_bulk_arm(mut self, on: bool) -> Self {
+        self.bulk_arm = on;
+        self
     }
 
     /// Tell `queue` about every account full indexing sees for the first
@@ -1295,7 +1315,7 @@ impl Writer {
         let mut phases = Phases::new(first.options.source == WriteSource::Firehose);
         // 3. Ids for the whole batch, in their own statements before the
         // transaction, so a rollback leaves no cached id that does not exist.
-        let mut keyed = self.batch_ids(&preps, &writing).await?;
+        let keyed = self.batch_ids(&preps, &writing).await?;
         phases.mark(Phase::Ids);
 
         let mut tx = self.pool.begin().await?;
@@ -1339,9 +1359,15 @@ impl Writer {
         }
         phases.mark(Phase::Locks);
 
-        // 7. Ops, commit by commit in order. A trial's record probe sees the
+        // 7. Ops, commit by commit in order, but for the bulk arm's, which
+        // follow in multi-row statements. A trial's record probe sees the
         // batch's pending entries before `full_trial_rows`.
         let recording = sets.recording().is_some();
+        let bulk = if self.bulk_arm { bulk_ops(&preps, &writing, &keyed, sets) } else { Vec::new() };
+        let mut in_bulk: Vec<Vec<bool>> = preps.iter().map(|p| vec![false; p.prepared.len()]).collect();
+        for b in &bulk {
+            in_bulk[b.commit][b.op] = true;
+        }
         let mut entries: Vec<crate::indexing::trial::Entry> = Vec::new();
         let mut outs: Vec<Option<CommitOut>> = (0..preps.len()).map(|_| None).collect();
         for &i in &writing {
@@ -1349,10 +1375,53 @@ impl Writer {
             if crate::test_support::hooks::injected_in(crate::test_support::hooks::WRITER_FAIL_IN_BATCH, &self.pool, preps[i].item.repo) {
                 return Err(Transient::new("injected failure inside a writer transaction"));
             }
-            let ids = std::mem::take(&mut keyed[i].0);
-            let mut out = self.commit_ops(&mut tx, &preps[i], &ids, sets, if recording { &entries } else { &[] }).await?;
+            let mut out = self.commit_ops(&mut tx, &preps[i], &keyed[i].0, &in_bulk[i], sets, if recording { &entries } else { &[] }).await?;
             entries.extend(std::mem::take(&mut out.effects.trial));
             outs[i] = Some(out);
+        }
+        if !bulk.is_empty() {
+            match self.bulk_write(&mut tx, &preps, &bulk, &keyed, sets).await? {
+                Some(written) => {
+                    for (b, w) in written.written {
+                        let table = match &preps[b.commit].prepared[b.op] {
+                            Prepared::Upsert(u) => trial_table_name(&u.body).unwrap_or("other"),
+                            _ => "other",
+                        };
+                        metrics::counter!(METRIC_BULK_OPS, "table" => table).increment(1);
+                        if !w {
+                            metrics::counter!(METRIC_LWW_SKIPPED, "reason" => "older_rev").increment(1);
+                        }
+                        if let Some(out) = &mut outs[b.commit] {
+                            out.report.outcomes[b.op] = if w { OpOutcome::Written } else { OpOutcome::Unchanged };
+                        }
+                    }
+                    entries.extend(written.entries);
+                }
+                // The bulk statements failed: the per-op path takes the ops.
+                None => {
+                    for b in &bulk {
+                        let p = &preps[b.commit];
+                        let Prepared::Upsert(u) = &p.prepared[b.op] else {
+                            continue;
+                        };
+                        let ctx = OpCtx { options: p.item.options, repo: p.item.repo, rev: p.item.rev, sets, pending: if recording { &entries } else { &[] } };
+                        let mut eff = MemoryEffects::default();
+                        let target = OpTarget::Upsert(u, &p.plans[b.op], keyed[b.commit].0.get(b.op).and_then(Option::as_ref));
+                        let outcome = self.run_with_attempts(&mut tx, &ctx, target, &mut eff).await?;
+                        entries.extend(std::mem::take(&mut eff.trial));
+                        if let Some(out) = &mut outs[b.commit] {
+                            if let OpOutcome::Failed(error) = &outcome {
+                                let op = &p.item.ops[b.op];
+                                out.failed_enabled |= crate::indexing::full::group_of(&op.collection).is_some_and(|g| sets.full.kinds.contains(&g));
+                                out.report.failed.push(FailedOp { index: b.op, action: op.action, path: op.path(), error: error.clone(), matters: true });
+                                out.report.failed.sort_by_key(|f| f.index);
+                            }
+                            out.report.outcomes[b.op] = outcome;
+                            out.effects.merge(eff);
+                        }
+                    }
+                }
+            }
         }
         phases.mark(Phase::Ops);
         // 8. Counts, once, in key order.
@@ -1579,6 +1648,7 @@ impl Writer {
         tx: &mut PgConnection,
         p: &Prepped<'_>,
         keyed: &[Option<OpIds>],
+        bulk: &[bool],
         sets: &ScopeSets,
         pending: &[crate::indexing::trial::Entry],
     ) -> Result<CommitOut, Transient> {
@@ -1600,6 +1670,11 @@ impl Writer {
         for (i, (prep, op)) in prepared.iter().zip(ops).enumerate() {
             if p.owner_side {
                 self.owner_side(&mut *tx, repo, rev, op, sets, &mut copied).await?;
+            }
+            // The bulk arm writes it after the batch's other ops.
+            if bulk.get(i).copied().unwrap_or(false) {
+                report.outcomes.push(OpOutcome::Unchanged);
+                continue;
             }
             // The trial's pending entries: the batch's earlier commits' and
             // this commit's own earlier ops'.
@@ -2784,6 +2859,443 @@ impl Writer {
             *n = n.saturating_sub(1);
         }
     }
+}
+
+/// Whether an admitted upsert is a quiet full-arm op: admitted by full's
+/// arm from a Whole or Covered copy, of a repo Refract does not restore, and
+/// it writes only its row: no member notification, no via-repost reason for
+/// a member, and no subject in the private tier. Decided from the prepared
+/// op and the guarded sets, with no SQL.
+fn quiet_full_arm(u: &Upsert, admission: Option<Admission>, tier: super::tier::CopyTier, sets: &ScopeSets) -> bool {
+    if admission != Some(Admission::Admit(AdmitRule::Full)) || tier == super::tier::CopyTier::Aside || sets.is_restored(&u.input.author) {
+        return false;
+    }
+    let author = u.input.author.as_str();
+    if !notifications_for(author, &u.body, sets).is_empty() {
+        return false;
+    }
+    match &u.body {
+        Body::Like(s) | Body::Repost(s) => {
+            let via_member = s.via.as_ref().is_some_and(|via| {
+                via.uri.contains("/app.bsky.feed.repost/") && uri_author(&via.uri).is_some_and(|r| r != author && sets.is_member(r))
+            });
+            !via_member && !is_private_uri(&s.subject.uri)
+        }
+        Body::Follow(_) => true,
+        _ => false,
+    }
+}
+
+/// An op the bulk arm writes: its commit's place in the batch and its own
+/// place in the commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BulkOp {
+    commit: usize,
+    op: usize,
+}
+
+/// The ops of a batch the bulk arm writes: creates and updates of likes,
+/// reposts and follows that are quiet full-arm ops with their ids, on the
+/// final admissions, each the only op of its record key in the batch. A
+/// record key with any other op in the batch takes the per-op path for all
+/// its ops.
+fn bulk_ops(preps: &[Prepped<'_>], writing: &[usize], keyed: &[(Vec<Option<OpIds>>, Option<AccountId>)], sets: &ScopeSets) -> Vec<BulkOp> {
+    let mut eligible: Vec<BulkOp> = Vec::new();
+    let mut refused: std::collections::HashSet<(&str, &str, &str)> = std::collections::HashSet::new();
+    for &i in writing {
+        let p = &preps[i];
+        if !p.batchable {
+            continue;
+        }
+        for (j, prep) in p.prepared.iter().enumerate() {
+            let op = &p.item.ops[j];
+            let key = (p.item.repo, op.collection.as_str(), op.rkey.as_str());
+            let ok = match prep {
+                Prepared::Upsert(u) => {
+                    matches!(u.body, Body::Like(_) | Body::Repost(_) | Body::Follow(_))
+                        && keyed[i].0.get(j).is_some_and(|ids| matches!(ids, Some(OpIds::Subject(_) | OpIds::Graph(_))))
+                        && quiet_full_arm(u, p.admissions[j], p.item.tier, sets)
+                }
+                _ => false,
+            };
+            // A test's injected follow failure is the per-op path's.
+            #[cfg(test)]
+            let ok = ok && !matches!(prep, Prepared::Upsert(u) if crate::test_support::hooks::armed(crate::test_support::hooks::FOLLOW_WRITE_FAILS, &u.uri));
+            if ok {
+                eligible.push(BulkOp { commit: i, op: j });
+            } else {
+                refused.insert(key);
+            }
+        }
+    }
+    // A key written more than once in the batch takes the per-op path too,
+    // so each op's outcome is the one it has in order.
+    let mut seen: std::collections::HashMap<(&str, &str, &str), usize> = std::collections::HashMap::new();
+    for b in &eligible {
+        let p = &preps[b.commit];
+        let op = &p.item.ops[b.op];
+        *seen.entry((p.item.repo, op.collection.as_str(), op.rkey.as_str())).or_default() += 1;
+    }
+    eligible.retain(|b| {
+        let p = &preps[b.commit];
+        let op = &p.item.ops[b.op];
+        let key = (p.item.repo, op.collection.as_str(), op.rkey.as_str());
+        !refused.contains(&key) && seen.get(&key).copied().unwrap_or(0) == 1
+    });
+    eligible
+}
+
+/// What the bulk arm wrote, per op it took: whether the row was written.
+struct BulkWritten {
+    written: Vec<(BulkOp, bool)>,
+    /// A full trial's entries of the rows written.
+    entries: Vec<crate::indexing::trial::Entry>,
+}
+
+impl Writer {
+    /// Write the bulk arm's ops in multi-row statements, one per table, each
+    /// key's highest rev only, with the per-op path's values, tombstone test
+    /// and last-writer-wins rule, odd references in the same statement, and
+    /// a repost's feed item. Under a savepoint: any error rolls it back and
+    /// `None` is returned, for the per-op path to take the ops.
+    async fn bulk_write(&self, conn: &mut PgConnection, preps: &[Prepped<'_>], ops: &[BulkOp], keyed: &[(Vec<Option<OpIds>>, Option<AccountId>)], sets: &ScopeSets) -> Result<Option<BulkWritten>, Transient> {
+        let mut sp = conn.begin().await?;
+        match self.bulk_statements(&mut sp, preps, ops, keyed, sets).await {
+            Ok(written) => {
+                sp.commit().await?;
+                Ok(Some(written))
+            }
+            Err(error) => {
+                tracing::debug!(event = "firehose_bulk_arm_failed", %error, "the bulk arm failed; its ops take the per-op path");
+                metrics::counter!(METRIC_BULK_FALLBACK).increment(1);
+                sp.rollback().await?;
+                Ok(None)
+            }
+        }
+    }
+
+    async fn bulk_statements(&self, conn: &mut PgConnection, preps: &[Prepped<'_>], ops: &[BulkOp], keyed: &[(Vec<Option<OpIds>>, Option<AccountId>)], sets: &ScopeSets) -> Result<BulkWritten, sqlx::Error> {
+        #[cfg(test)]
+        if crate::test_support::hooks::injected_in(crate::test_support::hooks::WRITER_BULK_FAILS, &self.pool, "*") {
+            return Err(sqlx::Error::Protocol("injected bulk arm failure".into()));
+        }
+        let upsert = |b: &BulkOp| -> &Upsert {
+            match &preps[b.commit].prepared[b.op] {
+                Prepared::Upsert(u) => u,
+                _ => unreachable!("the bulk arm takes upserts only"),
+            }
+        };
+        let rev_of = |b: &BulkOp| rev_value(preps[b.commit].item.rev);
+        // Collapse: each record key's op with the highest rev.
+        let mut best: std::collections::BTreeMap<(i16, AccountId, i64), BulkOp> = std::collections::BTreeMap::new();
+        for b in ops {
+            let (table, author, rkey) = match &keyed[b.commit].0[b.op] {
+                Some(OpIds::Subject(s)) => (if matches!(upsert(b).body, Body::Like(_)) { COLL_LIKE } else { COLL_REPOST }, s.author, s.rkey),
+                Some(OpIds::Graph(g)) => (COLL_FOLLOW, g.author, g.rkey),
+                _ => continue,
+            };
+            best.entry((table, author, rkey)).and_modify(|kept| {
+                if rev_of(b) > rev_of(kept) {
+                    *kept = *b;
+                }
+            }).or_insert(*b);
+        }
+        let mut written: std::collections::HashMap<(i16, AccountId, i64), bool> = std::collections::HashMap::new();
+        let mut updated: Vec<(i16, AccountId, i64)> = Vec::new();
+        let mut entries = Vec::new();
+        let recording = sets.recording();
+        for table in [COLL_LIKE, COLL_REPOST, COLL_FOLLOW] {
+            let rows: Vec<&BulkOp> = best.iter().filter(|((t, ..), _)| *t == table).map(|(_, b)| b).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let returned: Vec<(AccountId, i64, bool)> = if table == COLL_FOLLOW {
+                bulk_follows(conn, &rows.iter().map(|b| (keyed[b.commit].0[b.op].as_ref(), upsert(b), rev_of(b))).collect::<Vec<_>>()).await?
+            } else {
+                bulk_subjects(conn, table, &rows.iter().map(|b| (keyed[b.commit].0[b.op].as_ref(), upsert(b), rev_of(b))).collect::<Vec<_>>()).await?
+            };
+            for (author, rkey, inserted) in returned {
+                written.insert((table, author, rkey), true);
+                if !inserted {
+                    updated.push((table, author, rkey));
+                }
+            }
+            // Side effects of the rows written: a repost's feed item, and a
+            // trial's entries.
+            let mut feed: Vec<(AccountId, i64, AccountId, i64, DateTime<Utc>)> = Vec::new();
+            let mut unfed: Vec<(AccountId, i64)> = Vec::new();
+            for b in &rows {
+                let u = upsert(b);
+                let ids = keyed[b.commit].0[b.op].as_ref();
+                let key = match ids {
+                    Some(OpIds::Subject(s)) => (s.author, s.rkey),
+                    Some(OpIds::Graph(g)) => (g.author, g.rkey),
+                    _ => continue,
+                };
+                if !written.contains_key(&(table, key.0, key.1)) {
+                    continue;
+                }
+                let shadow = recording.as_ref().map(|r| crate::aggregations::admit_as(&u.input, sets, r.mode, r.breadth));
+                let trial_row = shadow.is_some_and(|a| !matches!(a, Admission::Admit(rule) if rule != AdmitRule::PublicRootGate));
+                if trial_row {
+                    entries.extend(trial_entries(u, ids, preps[b.commit].item.rev));
+                }
+                if table == COLL_REPOST && !sets.public.mode.off_rule() && full_feed(sets, &u.body)
+                    && let (Body::Repost(s), Some(OpIds::Subject(k))) = (&u.body, ids)
+                {
+                    match k.subject {
+                        StoredRef::Whole { author: post_author, coll: COLL_POST, rkey: post_rkey } => {
+                            feed.push((k.author, k.rkey, post_author, post_rkey, s.created_at));
+                            let start_feed = recording.as_ref().is_none_or(|r| !r.mode.off_rule() && sets.in_scope(&u.input.author));
+                            if !start_feed {
+                                entries.push(crate::indexing::trial::Entry::new(crate::indexing::trial::TrialTable::FeedItems, k.author, k.rkey, 1));
+                            }
+                        }
+                        _ => unfed.push((k.author, k.rkey)),
+                    }
+                }
+            }
+            if !feed.is_empty() {
+                let o: Vec<AccountId> = feed.iter().map(|f| f.0).collect();
+                let r: Vec<i64> = feed.iter().map(|f| f.1).collect();
+                let pa: Vec<AccountId> = feed.iter().map(|f| f.2).collect();
+                let pr: Vec<i64> = feed.iter().map(|f| f.3).collect();
+                let at: Vec<DateTime<Utc>> = feed.iter().map(|f| f.4).collect();
+                sqlx::query(
+                    "INSERT INTO feed_items (originator, is_repost, src_rkey, kind, post_author, post_rkey, sort_at) \
+                     SELECT o, true, r, $6, pa, pr, at FROM unnest($1::int[], $2::bigint[], $3::int[], $4::bigint[], $5::timestamptz[]) AS t(o, r, pa, pr, at) \
+                     ORDER BY o, r \
+                     ON CONFLICT (originator, is_repost, src_rkey) DO UPDATE SET kind = EXCLUDED.kind, \
+                       post_author = EXCLUDED.post_author, post_rkey = EXCLUDED.post_rkey, sort_at = EXCLUDED.sort_at",
+                )
+                .bind(&o)
+                .bind(&r)
+                .bind(&pa)
+                .bind(&pr)
+                .bind(&at)
+                .bind(FEED_REPOST)
+                .execute(&mut *conn)
+                .await?;
+            }
+            if !unfed.is_empty() {
+                let (o, r): (Vec<AccountId>, Vec<i64>) = unfed.into_iter().unzip();
+                sqlx::query("DELETE FROM feed_items f USING unnest($1::int[], $2::bigint[]) AS t(o, r) WHERE f.originator = t.o AND f.is_repost AND f.src_rkey = t.r")
+                    .bind(&o)
+                    .bind(&r)
+                    .execute(&mut *conn)
+                    .await?;
+            }
+        }
+        // An updated row's odd references that its new version no longer has.
+        let mut stale: (Vec<i16>, Vec<AccountId>, Vec<i64>, Vec<i16>) = Default::default();
+        for (table, author, rkey) in &updated {
+            let Some(b) = best.get(&(*table, *author, *rkey)) else {
+                continue;
+            };
+            let (odd_table, slots): (OddTable, Vec<(Slot, bool)>) = match &keyed[b.commit].0[b.op] {
+                Some(OpIds::Subject(s)) => (
+                    if *table == COLL_LIKE { OddTable::Likes } else { OddTable::Reposts },
+                    vec![(Slot::Subject, s.subject.odd_raw().is_some()), (Slot::Via, s.via.as_ref().and_then(|(r, _)| r.odd_raw()).is_some())],
+                ),
+                Some(OpIds::Graph(g)) => (OddTable::Follows, vec![(Slot::Via, g.via.as_ref().and_then(|(r, _)| r.odd_raw()).is_some())]),
+                _ => continue,
+            };
+            for (slot, odd) in slots {
+                if !odd {
+                    stale.0.push(odd_table.id());
+                    stale.1.push(*author);
+                    stale.2.push(*rkey);
+                    stale.3.push(slot.id());
+                }
+            }
+        }
+        if !stale.0.is_empty() {
+            sqlx::query(
+                "DELETE FROM odd_refs o USING unnest($1::smallint[], $2::int[], $3::bigint[], $4::smallint[]) AS d(tbl, author, rkey, slot) \
+                 WHERE o.tbl = d.tbl AND o.author = d.author AND o.rkey = d.rkey AND o.slot = d.slot",
+            )
+            .bind(&stale.0)
+            .bind(&stale.1)
+            .bind(&stale.2)
+            .bind(&stale.3)
+            .execute(&mut *conn)
+            .await?;
+        }
+        // Each op's outcome: its key's, as the per-op path in order would
+        // leave it.
+        let out = ops
+            .iter()
+            .map(|b| {
+                let key = match &keyed[b.commit].0[b.op] {
+                    Some(OpIds::Subject(s)) => (if matches!(upsert(b).body, Body::Like(_)) { COLL_LIKE } else { COLL_REPOST }, s.author, s.rkey),
+                    Some(OpIds::Graph(g)) => (COLL_FOLLOW, g.author, g.rkey),
+                    _ => (0, 0, 0),
+                };
+                (*b, written.contains_key(&key))
+            })
+            .collect();
+        Ok(BulkWritten { written: out, entries })
+    }
+}
+
+/// Columns of the subject tables' rows, one array each.
+#[derive(Default)]
+struct SubjectRows {
+    author: Vec<AccountId>,
+    rkey: Vec<i64>,
+    subj_author: Vec<Option<AccountId>>,
+    subj_coll: Vec<i16>,
+    subj_rkey: Vec<Option<i64>>,
+    subj_cid: Vec<Option<Vec<u8>>>,
+    rev: Vec<i64>,
+    created_at: Vec<DateTime<Utc>>,
+    via_author: Vec<Option<AccountId>>,
+    via_coll: Vec<Option<i16>>,
+    via_rkey: Vec<Option<i64>>,
+    via_cid: Vec<Option<Vec<u8>>>,
+    odd_subject: Vec<Option<String>>,
+    odd_via: Vec<Option<String>>,
+}
+
+/// Likes or reposts (`coll`) in one statement: the rows written, and
+/// whether each was inserted.
+async fn bulk_subjects(conn: &mut PgConnection, coll: i16, rows: &[(Option<&OpIds>, &Upsert, i64)]) -> Result<Vec<(AccountId, i64, bool)>, sqlx::Error> {
+    let (table, odd) = if coll == COLL_LIKE { ("likes", OddTable::Likes) } else { ("reposts", OddTable::Reposts) };
+    let mut c: SubjectRows = Default::default();
+    for (ids, u, rev) in rows {
+        let (Some(OpIds::Subject(ids)), Body::Like(s) | Body::Repost(s)) = (ids, &u.body) else {
+            continue;
+        };
+        let (sa, sc, sr) = ids.subject.columns();
+        let (va, vc, vr) = match &ids.via {
+            Some((r, _)) => {
+                let (a, c, k) = r.columns();
+                (a, Some(c), k)
+            }
+            None => (None, None, None),
+        };
+        c.author.push(ids.author);
+        c.rkey.push(ids.rkey);
+        c.subj_author.push(sa);
+        c.subj_coll.push(sc);
+        c.subj_rkey.push(sr);
+        c.subj_cid.push(ids.subject_cid.clone());
+        c.rev.push(*rev);
+        c.created_at.push(s.created_at);
+        c.via_author.push(va);
+        c.via_coll.push(vc);
+        c.via_rkey.push(vr);
+        c.via_cid.push(ids.via.as_ref().and_then(|(_, cid)| cid.clone()));
+        c.odd_subject.push(ids.subject.odd_raw().map(str::to_string));
+        c.odd_via.push(ids.via.as_ref().and_then(|(r, _)| r.odd_raw()).map(str::to_string));
+    }
+    sqlx::query_as(&format!(
+        "WITH t AS (SELECT * FROM unnest($1::int[], $2::bigint[], $3::int[], $4::smallint[], $5::bigint[], $6::bytea[], $7::bigint[], $8::timestamptz[], \
+                                         $9::int[], $10::smallint[], $11::bigint[], $12::bytea[], $13::text[], $14::text[]) \
+                    AS t(author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at, via_author, via_coll, via_rkey, via_cid, odd_subject, odd_via)), \
+         up AS ( \
+           INSERT INTO {table} (author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at, via_author, via_coll, via_rkey, via_cid) \
+           SELECT author, rkey, subj_author, subj_coll, subj_rkey, subj_cid, rev, created_at, via_author, via_coll, via_rkey, via_cid FROM t \
+           WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.author = t.author AND rt.coll = $15 AND rt.rkey = t.rkey AND rt.rev >= t.rev) \
+           ORDER BY author, rkey \
+           ON CONFLICT (author, rkey) DO UPDATE SET subj_author = EXCLUDED.subj_author, subj_coll = EXCLUDED.subj_coll, \
+             subj_rkey = EXCLUDED.subj_rkey, subj_cid = EXCLUDED.subj_cid, rev = EXCLUDED.rev, \
+             created_at = EXCLUDED.created_at, via_author = EXCLUDED.via_author, via_coll = EXCLUDED.via_coll, \
+             via_rkey = EXCLUDED.via_rkey, via_cid = EXCLUDED.via_cid \
+           WHERE {table}.rev < EXCLUDED.rev \
+           RETURNING author, rkey, (xmax = 0) AS inserted), \
+         odd AS ( \
+           INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
+           SELECT $16, up.author, up.rkey, v.slot, v.raw FROM up JOIN t ON t.author = up.author AND t.rkey = up.rkey \
+           CROSS JOIN LATERAL (VALUES ($17::smallint, t.odd_subject), ($18::smallint, t.odd_via)) AS v(slot, raw) \
+           WHERE v.raw IS NOT NULL \
+           ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw) \
+         SELECT author, rkey, inserted FROM up"
+    ))
+    .bind(&c.author)
+    .bind(&c.rkey)
+    .bind(&c.subj_author)
+    .bind(&c.subj_coll)
+    .bind(&c.subj_rkey)
+    .bind(&c.subj_cid)
+    .bind(&c.rev)
+    .bind(&c.created_at)
+    .bind(&c.via_author)
+    .bind(&c.via_coll)
+    .bind(&c.via_rkey)
+    .bind(&c.via_cid)
+    .bind(&c.odd_subject)
+    .bind(&c.odd_via)
+    .bind(coll)
+    .bind(odd.id())
+    .bind(Slot::Subject.id())
+    .bind(Slot::Via.id())
+    .fetch_all(conn)
+    .await
+}
+
+/// Follows in one statement: the rows written, and whether each was
+/// inserted.
+async fn bulk_follows(conn: &mut PgConnection, rows: &[(Option<&OpIds>, &Upsert, i64)]) -> Result<Vec<(AccountId, i64, bool)>, sqlx::Error> {
+    #[allow(clippy::type_complexity)]
+    let mut c: (Vec<AccountId>, Vec<i64>, Vec<AccountId>, Vec<i64>, Vec<DateTime<Utc>>, Vec<Option<AccountId>>, Vec<Option<i16>>, Vec<Option<i64>>, Vec<Option<Vec<u8>>>, Vec<Option<String>>) = Default::default();
+    for (ids, u, rev) in rows {
+        let (Some(OpIds::Graph(ids)), Body::Follow(g)) = (ids, &u.body) else {
+            continue;
+        };
+        let (va, vc, vr) = match &ids.via {
+            Some((r, _)) => {
+                let (a, c, k) = r.columns();
+                (a, Some(c), k)
+            }
+            None => (None, None, None),
+        };
+        c.0.push(ids.author);
+        c.1.push(ids.rkey);
+        c.2.push(ids.subject);
+        c.3.push(*rev);
+        c.4.push(g.created_at);
+        c.5.push(va);
+        c.6.push(vc);
+        c.7.push(vr);
+        c.8.push(ids.via.as_ref().and_then(|(_, cid)| cid.clone()));
+        c.9.push(ids.via.as_ref().and_then(|(r, _)| r.odd_raw()).map(str::to_string));
+    }
+    sqlx::query_as(
+        "WITH t AS (SELECT * FROM unnest($1::int[], $2::bigint[], $3::int[], $4::bigint[], $5::timestamptz[], $6::int[], $7::smallint[], $8::bigint[], $9::bytea[], $10::text[]) \
+                    AS t(author, rkey, subject, rev, created_at, via_author, via_coll, via_rkey, via_cid, odd_via)), \
+         up AS ( \
+           INSERT INTO follows (author, rkey, subject, rev, created_at, via_author, via_coll, via_rkey, via_cid) \
+           SELECT author, rkey, subject, rev, created_at, via_author, via_coll, via_rkey, via_cid FROM t \
+           WHERE NOT EXISTS (SELECT 1 FROM record_tombstones rt WHERE rt.author = t.author AND rt.coll = $11 AND rt.rkey = t.rkey AND rt.rev >= t.rev) \
+           ORDER BY author, rkey \
+           ON CONFLICT (author, rkey) DO UPDATE SET subject = EXCLUDED.subject, rev = EXCLUDED.rev, \
+             created_at = EXCLUDED.created_at, via_author = EXCLUDED.via_author, via_coll = EXCLUDED.via_coll, \
+             via_rkey = EXCLUDED.via_rkey, via_cid = EXCLUDED.via_cid \
+           WHERE follows.rev < EXCLUDED.rev \
+           RETURNING author, rkey, (xmax = 0) AS inserted), \
+         odd AS ( \
+           INSERT INTO odd_refs (tbl, author, rkey, slot, raw) \
+           SELECT $12, up.author, up.rkey, $13, t.odd_via FROM up JOIN t ON t.author = up.author AND t.rkey = up.rkey \
+           WHERE t.odd_via IS NOT NULL \
+           ON CONFLICT (tbl, author, rkey, slot) DO UPDATE SET raw = EXCLUDED.raw) \
+         SELECT author, rkey, inserted FROM up",
+    )
+    .bind(&c.0)
+    .bind(&c.1)
+    .bind(&c.2)
+    .bind(&c.3)
+    .bind(&c.4)
+    .bind(&c.5)
+    .bind(&c.6)
+    .bind(&c.7)
+    .bind(&c.8)
+    .bind(&c.9)
+    .bind(COLL_FOLLOW)
+    .bind(OddTable::Follows.id())
+    .bind(Slot::Via.id())
+    .fetch_all(conn)
+    .await
 }
 
 /// One commit as the stream delivered it, for [`Writer::apply_batch`].

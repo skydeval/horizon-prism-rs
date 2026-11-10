@@ -268,6 +268,9 @@ pub enum IndexingAction {
         /// Commits per writer transaction; firehose.lane_batch when not given.
         #[arg(long)]
         lane_batch: Option<u32>,
+        /// Write every op one at a time, without the bulk arm.
+        #[arg(long)]
+        no_bulk_arm: bool,
         /// Keep the scratch database afterwards.
         #[arg(long)]
         keep: bool,
@@ -818,7 +821,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                     commands::refract::render_list(&commands::pool(&cfg).await?, state.as_deref()).await
                 }
                 AdminCmd::Refract { action: RefractAction::Show { did } } => commands::refract::render_show(&commands::pool(&cfg).await?, did).await,
-                AdminCmd::Indexing { action: IndexingAction::FullCheck { accounts, posts, likes, follows, commits, lanes, lane_batch, keep } } => {
+                AdminCmd::Indexing { action: IndexingAction::FullCheck { accounts, posts, likes, follows, commits, lanes, lane_batch, no_bulk_arm, keep } } => {
                     let params = crate::indexing::full_check::Params {
                         accounts: *accounts,
                         posts: *posts,
@@ -827,6 +830,7 @@ async fn read_only(cmd: &AdminCmd) -> Option<Result<String, String>> {
                         commits: *commits,
                         lanes: lanes.clone(),
                         lane_batch: lane_batch.unwrap_or(cfg.file.firehose.lane_batch).max(1),
+                        bulk_arm: !*no_bulk_arm && cfg.file.firehose.bulk_arm,
                         keep: *keep,
                         ..crate::indexing::full_check::Params::default()
                     };

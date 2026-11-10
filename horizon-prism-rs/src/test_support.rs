@@ -323,6 +323,8 @@ pub mod hooks {
     /// Batched writes: a writer transaction fails transiently when it comes
     /// to this repo's commit. Key: `<database>/<repo>`.
     pub const WRITER_FAIL_IN_BATCH: &str = "tb_writer_fail_in_batch";
+    /// The bulk arm's statements fail. Key: `<database>/*`.
+    pub const WRITER_BULK_FAILS: &str = "tb_writer_bulk_fails";
     /// The keyset counts repair holds a range's count rows locked, before
     /// it recomputes them. Key: the database.
     pub const KEYSET_AFTER_LOCK: &str = "fl_keyset_after_lock";
@@ -568,6 +570,12 @@ pub mod hooks {
     #[must_use]
     pub fn holding(name: &'static str, key: &str) -> bool {
         lookup(name, key).is_some_and(|point| *point.hits.borrow() > 0 && !point.gate.is_closed())
+    }
+
+    /// Whether `name` is armed for `key`, without counting a hit.
+    #[must_use]
+    pub fn armed(name: &'static str, key: &str) -> bool {
+        lookup(name, key).is_some()
     }
 
     /// An error site: whether `name` is armed for `key`, so the site fails

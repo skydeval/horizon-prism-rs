@@ -394,7 +394,10 @@ pub async fn run() -> Result<Stopped, StartupError> {
             cfg.file.full_crawl.skip_older_than_days > 0 || cfg.file.retention.max_age_days > 0,
         )
         .await;
-    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private)).with_ids(ids).with_first_sight(Arc::clone(&first_sight));
+    let writer = Writer::new(pool.clone(), scope.clone(), Arc::clone(&private))
+        .with_ids(ids)
+        .with_first_sight(Arc::clone(&first_sight))
+        .with_bulk_arm(cfg.file.firehose.bulk_arm);
     let writer = match &live_hub {
         Some(hub) => writer.with_feed(hub.tap()),
         None => writer,

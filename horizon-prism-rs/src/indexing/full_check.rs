@@ -41,6 +41,8 @@ pub struct Params {
     pub lanes: Vec<u32>,
     /// Commits per writer transaction.
     pub lane_batch: u32,
+    /// The bulk arm writes quiet likes, reposts and follows.
+    pub bulk_arm: bool,
     /// How long the relays' rate is sampled for.
     pub sample_secs: u32,
     /// Keep the scratch database for a look afterwards.
@@ -49,7 +51,7 @@ pub struct Params {
 
 impl Default for Params {
     fn default() -> Self {
-        Self { accounts: 200_000, posts: 500_000, likes: 2_000_000, follows: 500_000, commits: 20_000, lanes: vec![1, 2, 4, 8], lane_batch: 64, sample_secs: 10, keep: false }
+        Self { accounts: 200_000, posts: 500_000, likes: 2_000_000, follows: 500_000, commits: 20_000, lanes: vec![1, 2, 4, 8], lane_batch: 64, bulk_arm: true, sample_secs: 10, keep: false }
     }
 }
 
@@ -171,7 +173,7 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
     let seeded = Instant::now();
     seed(&pool, params).await.map_err(|e| format!("seeding: {e}"))?;
     let seed_secs = seeded.elapsed().as_secs_f64();
-    let writer = full_writer(&pool).await;
+    let writer = full_writer(&pool).await.with_bulk_arm(params.bulk_arm);
     let mut runs = Vec::new();
     let handle = recorder();
     for (i, lanes) in params.lanes.iter().copied().filter(|l| *l > 0).enumerate() {
@@ -477,8 +479,8 @@ fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, siz
     let mb = size as f64 / 1e6;
     let _ = writeln!(
         out,
-        "Full check, advice only. Seeded {} accounts, {} posts, {} likes and {} follows in {seed_secs:.0} s ({mb:.0} MB), then applied {} commits per run with full admission and triggers on, up to {} in one transaction.",
-        p.accounts, p.posts, p.likes, p.follows, p.commits, p.lane_batch
+        "Full check, advice only. Seeded {} accounts, {} posts, {} likes and {} follows in {seed_secs:.0} s ({mb:.0} MB), then applied {} commits per run with full admission and triggers on, up to {} in one transaction, the bulk arm {}.",
+        p.accounts, p.posts, p.likes, p.follows, p.commits, p.lane_batch, if p.bulk_arm { "on" } else { "off" }
     );
     let need = input.map(|i| i.per_sec * i.unique_share);
     if let Some(i) = input {
@@ -562,7 +564,7 @@ mod tests {
         let Some(db) = crate::test_support::fresh_db("full_check_scratch").await else {
             return;
         };
-        let p = Params { accounts: 500, posts: 1000, likes: 3000, follows: 1000, commits: 400, lanes: vec![1, 4], lane_batch: 64, sample_secs: 1, keep: false };
+        let p = Params { accounts: 500, posts: 1000, likes: 3000, follows: 1000, commits: 400, lanes: vec![1, 4], lane_batch: 64, bulk_arm: true, sample_secs: 1, keep: false };
         let writer = {
             seed(&db.pool, &p).await.expect("seed");
             full_writer(&db.pool).await

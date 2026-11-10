@@ -19,6 +19,8 @@ released.
   Health when writers wait for a connection.
 - Full's warnings, its confirm pages and `full-check` name the Postgres
   settings left at Postgres's defaults that slow full down.
+- Full's writer transactions write strangers' likes, reposts and follows
+  that notify no member in multi-row statements (`[firehose] bulk_arm`).
 - Metrics of where full's writers spend their time, of what Prism's own
   database sessions wait on, and of each relay's copies; status's dedupe
   share covers the last five minutes with dedupe on.
