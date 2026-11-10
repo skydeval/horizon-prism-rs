@@ -311,7 +311,7 @@ impl Crawler {
             }
         }
         let (newest, any_blocking): (Option<i64>, bool) =
-            sqlx::query_as("SELECT max(id), COALESCE(bool_or(blocking), false) FROM full_gaps WHERE resolved_at IS NULL").fetch_one(&self.pool).await?;
+            sqlx::query_as("SELECT max(id), COALESCE(bool_or(blocking), false) FROM full_gaps WHERE resolved_at IS NULL AND kind <> 'shed'").fetch_one(&self.pool).await?;
         let Some(newest) = newest else {
             return Ok(());
         };
@@ -383,7 +383,7 @@ impl Crawler {
         if paged && !left {
             let started = pass.started_at.clone().unwrap_or_default();
             let resolved = sqlx::query(
-                "UPDATE full_gaps SET resolved_at = now() WHERE resolved_at IS NULL AND id <= $1 \
+                "UPDATE full_gaps SET resolved_at = now() WHERE resolved_at IS NULL AND id <= $1 AND kind <> 'shed' \
                    AND (kind <> 'continuity' OR (caught_up_at IS NOT NULL AND caught_up_at < $2::timestamptz))",
             )
             .bind(pass.upto)

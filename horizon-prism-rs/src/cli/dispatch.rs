@@ -295,6 +295,13 @@ pub enum FullTrialAction {
         /// Crawl history too, as `[full_crawl]` says.
         #[arg(long)]
         history: bool,
+        /// Run on when live ingest falls far behind, instead of ending.
+        #[arg(long)]
+        no_end_on_lag: bool,
+        /// End when live ingest's backlog would be trimmed within this many
+        /// minutes; `[full_trial] trim_margin_minutes` when not given.
+        #[arg(long)]
+        trim_margin_minutes: Option<u32>,
         /// The confirm word: FULL.
         #[arg(long)]
         confirm: Option<String>,
@@ -551,11 +558,13 @@ impl AdminCmd {
                 AdminCommand::FullComplete { group: group.clone() }
             }
             Self::Indexing { action: IndexingAction::FullTrial { action } } => match action {
-                FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, .. } => AdminCommand::FullTrialStart {
+                FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, no_end_on_lag, trim_margin_minutes, .. } => AdminCommand::FullTrialStart {
                     hours: hours.map(crate::config::Float),
                     max_added_gb: max_added_gb.map(crate::config::Float),
                     end_below_free_percent: *end_below_free_percent,
                     history: *history,
+                    end_on_lag: no_end_on_lag.then_some(false),
+                    trim_margin_minutes: *trim_margin_minutes,
                 },
                 FullTrialAction::End { .. } => AdminCommand::FullTrialEnd,
                 FullTrialAction::Keep { .. } => AdminCommand::FullTrialKeep,
@@ -641,13 +650,15 @@ async fn confirm_trial(pool: &PgPool, cfg: &crate::config::AppConfig, action: &F
         return Ok(());
     }
     let text = match action {
-        FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, .. } => {
+        FullTrialAction::Start { hours, max_added_gb, end_below_free_percent, history, no_end_on_lag, trim_margin_minutes, .. } => {
             let d = &cfg.file.full_trial;
             let bounds = crate::indexing::trial::Bounds {
                 hours: hours.unwrap_or(d.hours.0),
                 max_added_gb: max_added_gb.unwrap_or(d.max_added_gb.0),
                 end_below_free_percent: end_below_free_percent.unwrap_or(d.end_below_free_percent),
                 history: *history,
+                end_on_lag: !*no_end_on_lag && d.end_on_lag,
+                trim_margin_minutes: trim_margin_minutes.unwrap_or(d.trim_margin_minutes),
             };
             let phase: Option<String> = sqlx::query_scalar("SELECT value->>'phase' FROM worker_state WHERE key = 'public_transition'")
                 .fetch_optional(pool)

@@ -39,7 +39,7 @@ fn settings() -> PublicModeSettings {
 }
 
 fn bounds() -> Bounds {
-    Bounds { hours: 24.0, max_added_gb: 50.0, end_below_free_percent: 10, history: false }
+    Bounds { hours: 24.0, max_added_gb: 50.0, end_below_free_percent: 10, history: false, end_on_lag: true, trim_margin_minutes: 15 }
 }
 
 fn file(scope: ScopeValue) -> IndexingConfig {
@@ -1147,4 +1147,61 @@ async fn every_table_is_classified() {
     assert_eq!(class_of("full_crawl"), Some(Class::FullOnly));
     assert_eq!(class_of("a_new_table"), None, "an unclassified table fails");
     db.drop_db().await;
+}
+
+/// A trial whose live ingest would be trimmed within its margin ends with
+/// cause `lag`, from a projection that has its rates; one with
+/// `end_on_lag` off runs on; the startup path never judges lag.
+#[tokio::test]
+async fn a_trial_ends_itself_when_live_ingest_falls_too_far_behind() {
+    let Some(db) = fresh_db("trial_lag_bound").await else {
+        return;
+    };
+    let p = &db.pool;
+    let (pi, scope, _w) = stack(p, ScopeValue::Community, None).await;
+    let behind = crate::firehose::projection::Projection {
+        at: std::time::Instant::now(),
+        input_per_sec: 1000.0,
+        processed_per_sec: 400.0,
+        lag: 900_000,
+        pending: 0,
+        length: 1_000_000,
+        time_to_trim: Some(100_000.0 / 600.0),
+    };
+    // Off: runs on.
+    pi.hooks.checker_stopped.store(true, Ordering::SeqCst);
+    pi.start_trial(Bounds { end_on_lag: false, ..bounds() }, "cli").await.expect("start");
+    *pi.hooks.projection.lock().expect("hooks") = Some(behind);
+    assert_eq!(pi.check_trial_bounds("checker").await.expect("check"), None);
+    assert!(pi.end_trial("manual").await.expect("end").is_some());
+    settled(&scope).await;
+    // On: the startup path does not judge it; the checker ends it.
+    pi.start_trial(bounds(), "cli").await.expect("start");
+    *pi.hooks.projection.lock().expect("hooks") = Some(crate::firehose::projection::Projection { time_to_trim: None, ..behind });
+    assert_eq!(pi.check_trial_bounds("checker").await.expect("check"), None, "keeping up ends nothing");
+    *pi.hooks.projection.lock().expect("hooks") = Some(behind);
+    assert_eq!(pi.check_trial_bounds("checker").await.expect("check"), Some("lag"));
+    settled(&scope).await;
+    assert_eq!(sqlx::query_scalar::<_, String>("SELECT ended_by FROM full_trials ORDER BY id DESC LIMIT 1").fetch_one(p).await.expect("cause"), "lag");
+    db.drop_db().await;
+}
+
+/// The capacity words: the first five minutes left out, a saturated run's
+/// median, a run that kept up with its ceiling estimate, the fill's minutes
+/// apart, and the largest wait class named.
+#[test]
+fn a_trials_capacity_is_said_in_words() {
+    use crate::indexing::trial::{Sample, capacity_words};
+    let s = |input: f64, processed: f64, applied: f64, busy: f64, filling: bool| Sample { input: Some(input), processed, deduped: input * 0.6, applied, lanes_busy: Some(busy), filling };
+    assert_eq!(capacity_words(&[s(1.0, 1.0, 1.0, 0.1, false); 5], false, None), None, "five minutes say nothing");
+    let mut kept: Vec<Sample> = vec![s(1300.0, 1300.0, 500.0, 0.9, false); 5];
+    kept.extend(vec![s(1300.0, 1300.0, 430.0, 0.41, false); 20]);
+    let w = capacity_words(&kept, false, None).expect("words");
+    assert!(w.contains("the relays sent 1300 entries a second; 780 were copies") && w.contains("applied 430 a second with its writer lanes 41 % busy: it kept up"), "{w}");
+    assert!(w.contains("ceiling near 1049 a second (an estimate)"), "{w}");
+    let mut behind: Vec<Sample> = vec![s(1300.0, 300.0, 300.0, 1.0, true); 15];
+    behind.extend(vec![s(1300.0, 400.0, 410.0, 1.0, false); 10]);
+    let w = capacity_words(&behind, true, Some(crate::db::waits::WaitClass::DiskRead)).expect("words");
+    assert!(w.contains("While community's fill ran, this server applied 300 a second") && w.contains("This server applied 410 a second"), "{w}");
+    assert!(w.contains("could not keep up") && w.contains("ended itself") && w.contains("waiting for disk reads"), "{w}");
 }

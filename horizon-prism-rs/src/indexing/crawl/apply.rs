@@ -1,8 +1,10 @@
 //! One claimed account's crawl: its directory entry, its repository (whole,
 //! or per collection when too large), verification against its signing
 //! key, the records of the claimed groups applied as
-//! [`WriteSource::Crawl`] in transactions of at most 50 ops, the reconcile
-//! of stored rows the repository no longer holds, and the guarded `done`.
+//! [`WriteSource::Crawl`] in transactions of `[full_crawl] batch_ops`, the
+//! reconcile of stored rows the repository no longer holds, and the guarded
+//! `done`. Every account and record key the records name is interned first;
+//! a claimer starts no transaction while live ingest is far behind.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -20,8 +22,12 @@ use crate::firehose::classifier::{
 };
 use crate::firehose::writer::{Action, ApplyOptions, OpOutcome, RawOp, WriteSource};
 
-/// Ops per writer transaction.
-pub const BATCH_OPS: usize = 50;
+/// Accounts or record keys interned in one statement, before applying.
+pub const INTERN_CHUNK: usize = 5_000;
+/// How often a claimer that waits for live ingest renews its lease, at most.
+pub const YIELD_RENEW: std::time::Duration = std::time::Duration::from_secs(60);
+/// Metric: seconds claimers waited for live ingest.
+pub const METRIC_YIELD_SECONDS: &str = "full_crawl_yield_seconds_total";
 
 /// How one account's crawl ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,12 +181,71 @@ impl Crawler {
         Ok(Outcome::Failed(reason.to_string()))
     }
 
-    /// Apply `ops` at `rev` in batches, renewing the lease after each. Returns
-    /// `false` when the claim stopped holding.
+    /// Live ingest's projection; a test may set its own.
+    fn live_projection(&self) -> Option<crate::firehose::projection::Projection> {
+        #[cfg(test)]
+        if let Some(p) = *self.projection.lock().expect("projection") {
+            return Some(p);
+        }
+        crate::firehose::projection::published().get()
+    }
+
+    fn batch_ops(&self) -> usize {
+        usize::try_from(self.crawl.batch_ops).unwrap_or(1).max(1)
+    }
+
+    /// Wait while live ingest is far behind: no transaction starts while its
+    /// backlog is above `yield_above_lag_secs` seconds of input, and none
+    /// until it falls below a third of that once waiting. The lease is
+    /// renewed while waiting. Returns `false` when the claim stopped
+    /// holding.
+    pub(super) async fn yield_to_live(&self, c: &Claim) -> Result<bool, sqlx::Error> {
+        let high = f64::from(self.crawl.yield_above_lag_secs);
+        let renew_every = YIELD_RENEW.min(std::time::Duration::from_secs(u64::from(self.crawl.claim_lease_secs / 3).max(1)));
+        let mut renewed = std::time::Instant::now();
+        let started = std::time::Instant::now();
+        loop {
+            let waiting = self.progress().waiting_for_live;
+            let limit = if waiting { high / 3.0 } else { high };
+            let behind = self.live_projection().and_then(|p| p.backlog_secs()).is_some_and(|b| b > limit);
+            if !behind {
+                if waiting {
+                    self.note(|p| p.waiting_for_live = false);
+                    tracing::info!(event = "full_crawl_resumed", "live ingest caught up; the crawl goes on");
+                }
+                metrics::gauge!(METRIC_YIELD_SECONDS).increment(started.elapsed().as_secs_f64());
+                return Ok(true);
+            }
+            if !waiting {
+                self.note(|p| p.waiting_for_live = true);
+                tracing::info!(event = "full_crawl_yields", "live ingest is behind; the crawl waits for it");
+            }
+            if renewed.elapsed() >= renew_every {
+                if !state::renew(&self.pool, c, self.crawl.claim_lease_secs).await? {
+                    return Ok(false);
+                }
+                renewed = std::time::Instant::now();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
+    /// Apply `ops` at `rev` in batches, renewing the lease after each. Every
+    /// account and key the records name is interned first. Returns `false`
+    /// when the claim stopped holding.
     async fn write(&self, c: &Claim, rev: &str, ops: &[RawOp]) -> Result<bool, sqlx::Error> {
-        for batch in ops.chunks(BATCH_OPS) {
+        if let Err(e) = self.writer.prime_ids(&c.did, ops, INTERN_CHUNK).await {
+            tracing::warn!(event = "full_crawl_write_failed", did = %c.did, error = %e, "interning a crawl's ids failed; the account is retried");
+            state::failed(&self.pool, c, "write", self.crawl.max_attempts).await?;
+            return Ok(false);
+        }
+        for batch in ops.chunks(self.batch_ops()) {
+            if !self.yield_to_live(c).await? {
+                return Ok(false);
+            }
             match self.writer.apply(&c.did, rev, batch, self.options()).await {
                 Ok(report) => {
+                    crate::firehose::projection::totals().crawl_records.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     let failed = report.outcomes.iter().filter(|o| matches!(o, OpOutcome::Failed(_))).count();
                     if failed > 0 {
                         tracing::debug!(event = "full_crawl_ops_failed", did = %c.did, failed, "crawled records failed deterministically and were skipped");
@@ -232,7 +297,10 @@ impl Crawler {
                 gone.push((nsid.to_string(), rkey, uri));
             }
         }
-        for batch in gone.chunks(BATCH_OPS) {
+        for batch in gone.chunks(self.batch_ops()) {
+            if !self.yield_to_live(c).await? {
+                break;
+            }
             let ops: Vec<RawOp> = batch.iter().map(|(nsid, rkey, _)| RawOp { action: Action::Delete, collection: nsid.clone(), rkey: rkey.clone(), cid: None, record: None }).collect();
             match self.writer.apply(&c.did, rev, &ops, self.options()).await {
                 Ok(report) => deleted += report.outcomes.iter().filter(|o| **o == OpOutcome::Written).count(),

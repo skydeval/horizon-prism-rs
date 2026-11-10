@@ -1492,6 +1492,71 @@ impl Writer {
         Ok(reports)
     }
 
+    /// Intern every account and record key `repo`'s `ops` would write
+    /// with, as the ops are admitted now, in statements of at most `chunk`
+    /// names: a crawl's transactions then find them cached. Ids that end
+    /// unused are kept.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub async fn prime_ids(&self, repo: &str, ops: &[RawOp], chunk: usize) -> Result<(), sqlx::Error> {
+        let now = Utc::now();
+        let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
+        let admissions: Vec<Option<Admission>> = {
+            let sets = self.scope.read_guard().await;
+            prepared
+                .iter()
+                .map(|p| match p {
+                    Prepared::Upsert(u) => Some(admit(&u.input, &sets)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let Some(names) = op_names(repo, &prepared, &admissions) else {
+            return Ok(());
+        };
+        let mut dids = names.dids.clone();
+        dids.sort();
+        dids.dedup();
+        let mut accounts = std::collections::HashMap::new();
+        for part in dids.chunks(chunk.max(1)) {
+            accounts.extend(self.ids.account_ids(part).await?);
+        }
+        let mut keys = op_keys(repo, &names, &accounts);
+        keys.sort();
+        keys.dedup();
+        for part in keys.chunks(chunk.max(1)) {
+            self.ids.rkey_ids(part).await?;
+        }
+        Ok(())
+    }
+
+    /// For a commit full may shed while live ingest is far behind, its
+    /// thread outline ops; `None` when it must apply. A commit is shed only
+    /// in breadth Full, when at least one op is a quiet full-arm create or
+    /// update and every other op is of a collection full does not store; its
+    /// repo is not tracked, no owner-side rule applies and no op is a delete
+    /// or the private tier's. Decided under the read guard, with no SQL.
+    pub async fn shed_outline(&self, repo: &str, rev: &str, ops: &[RawOp], tier: super::tier::CopyTier) -> Option<Vec<crate::thread_outline::ops::Op>> {
+        let now = Utc::now();
+        let sets = self.scope.read_guard().await;
+        if sets.public.breadth != crate::indexing::Breadth::Full || tier == super::tier::CopyTier::Aside || sets.is_tracked(repo) || sets.subscribed.tracks(repo) {
+            return None;
+        }
+        let prepared: Vec<Prepared> = ops.iter().map(|op| prepare(repo, op, now)).collect();
+        let mut quiet = 0;
+        for p in &prepared {
+            match p {
+                Prepared::Skip(_) => {}
+                Prepared::Upsert(u) if matches!(u.body, Body::Like(_) | Body::Repost(_) | Body::Follow(_)) && quiet_full_arm(u, Some(admit(&u.input, &sets)), tier, &sets) => quiet += 1,
+                _ => return None,
+            }
+        }
+        drop(sets);
+        (quiet > 0).then(|| if self.outline { outline_from_prepared(repo, rev, ops, &prepared) } else { Vec::new() })
+    }
+
     /// The writer's test hooks for one commit of `repo`.
     #[cfg(test)]
     async fn test_hooks(&self, repo: &str) -> Result<(), Transient> {

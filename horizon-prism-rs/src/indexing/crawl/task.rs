@@ -40,6 +40,8 @@ pub struct Progress {
     pub crawled: u64,
     pub failed: u64,
     pub last_error: Option<String>,
+    /// The claimers wait for live ingest to catch up.
+    pub waiting_for_live: bool,
 }
 
 /// Everything the crawl needs. Cheap to clone.
@@ -74,6 +76,9 @@ pub struct Crawler {
     /// read it from.
     pub(super) fixed_tail: Option<i64>,
     progress: Arc<std::sync::Mutex<Progress>>,
+    /// The projection the claimers' yield reads, in place of the process's.
+    #[cfg(test)]
+    pub(super) projection: Arc<std::sync::Mutex<Option<crate::firehose::projection::Projection>>>,
     /// A counts repair after a group turned complete is running.
     repairing: Arc<AtomicBool>,
     /// The directory export's follower (`identity_source = "plc_export"`).
@@ -128,6 +133,8 @@ impl Crawler {
             claimers: true,
             fixed_tail: None,
             progress: Arc::default(),
+            #[cfg(test)]
+            projection: Arc::default(),
             repairing: Arc::default(),
             export,
             export_pace,
@@ -272,7 +279,7 @@ impl Crawler {
         self.progress.lock().map(|p| p.clone()).unwrap_or_default()
     }
 
-    fn note(&self, f: impl FnOnce(&mut Progress)) {
+    pub(super) fn note(&self, f: impl FnOnce(&mut Progress)) {
         if let Ok(mut p) = self.progress.lock() {
             f(&mut p);
         }

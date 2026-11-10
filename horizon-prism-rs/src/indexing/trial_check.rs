@@ -377,7 +377,29 @@ impl PublicIndexing {
         }
         causes.extend(held.causes(t.from));
         let passed = causes.is_empty();
-        let words = result_words(&t, &counts, (posts, accounts, repaired, &held.words(t.from)), &full_left, (labels_start, labels_exit), &report, &causes);
+        let mut words = result_words(&t, &counts, (posts, accounts, repaired, &held.words(t.from)), &full_left, (labels_start, labels_exit), &report, &causes);
+        // What the trial says of this server's capacity.
+        #[allow(clippy::type_complexity)]
+        let samples: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, bool)> =
+            sqlx::query_as("SELECT input, processed, deduped, applied, lanes_busy, filling FROM full_trial_samples WHERE trial = $1 ORDER BY at")
+                .bind(t.id)
+                .fetch_all(&self.pool)
+                .await?;
+        let samples: Vec<super::trial::Sample> = samples
+            .into_iter()
+            .map(|(input, processed, deduped, applied, lanes_busy, filling)| super::trial::Sample {
+                input,
+                processed: processed.unwrap_or(0.0),
+                deduped: deduped.unwrap_or(0.0),
+                applied: applied.unwrap_or(0.0),
+                lanes_busy,
+                filling,
+            })
+            .collect();
+        let waits = super::trial::trial_largest_wait();
+        if let Some(capacity) = super::trial::capacity_words(&samples, t.ended_by.as_deref() == Some("lag"), waits) {
+            words = format!("{capacity} {words}");
+        }
         let faults = Counts::total(&counts.missed) + Counts::total(&counts.unexplained);
         for (result, n) in [
             ("removed", counts.removed),
@@ -835,6 +857,7 @@ fn cause_words(c: Option<&str>) -> &'static str {
         Some("manual") => "ended by hand",
         Some("startup") => "a bound passed while Prism was down",
         Some("switch") => "a switch to another mode",
+        Some("lag") => "live ingest fell too far behind",
         _ => "ended",
     }
 }

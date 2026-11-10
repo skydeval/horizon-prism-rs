@@ -86,6 +86,10 @@ pub struct Trial {
     pub max_added_bytes: u64,
     pub end_below_free_percent: u32,
     pub history: bool,
+    /// It ends when live ingest's backlog would be trimmed within
+    /// `trim_margin_minutes`.
+    pub end_on_lag: bool,
+    pub trim_margin_minutes: u32,
     pub baseline_db_bytes: u64,
     /// The transition's `last_fill_since` before the switch.
     pub start_last_fill_since: Option<DateTime<Utc>>,
@@ -114,6 +118,8 @@ impl Trial {
             "max_added_bytes": self.max_added_bytes,
             "end_below_free_percent": self.end_below_free_percent,
             "history": self.history,
+            "end_on_lag": self.end_on_lag,
+            "trim_margin_minutes": self.trim_margin_minutes,
             "baseline_db_bytes": self.baseline_db_bytes,
             "start_last_fill_since": self.start_last_fill_since.as_ref().map(rfc3339),
             "ended_by": self.ended_by,
@@ -156,6 +162,9 @@ impl Trial {
             max_added_bytes: v.get("max_added_bytes")?.as_u64()?,
             end_below_free_percent: u32::try_from(v.get("end_below_free_percent")?.as_u64()?).ok().filter(|p| *p <= 100)?,
             history: v.get("history")?.as_bool()?,
+            // A trial stored before these existed ends on lag by default.
+            end_on_lag: v.get("end_on_lag").and_then(Value::as_bool).unwrap_or(true),
+            trim_margin_minutes: v.get("trim_margin_minutes").and_then(Value::as_u64).and_then(|m| u32::try_from(m).ok()).filter(|m| *m > 0).unwrap_or(15),
             baseline_db_bytes: v.get("baseline_db_bytes")?.as_u64()?,
             start_last_fill_since,
             ended_by,
@@ -677,12 +686,103 @@ pub fn class_of(table: &str) -> Option<Class> {
         "post_counts" | "actor_counts" | "starter_pack_counts" | "odd_refs" | "post_search" | "tag_activity_hourly" => Class::Derived,
         "did_cache" | "constellation_counts" | "identity_refresh" | "learned_inbound_blocks" | "refract_record_reads" => Class::Cache,
         "dids" | "rkey_aliases" | "collections" | "record_dicts" => Class::Kept,
-        "_sqlx_migrations" | "full_trials" | "full_trial_rows" | "full_trial_jobs" | "members" | "scope_dids" | "operator_settings" | "operator_settings_history"
+        "_sqlx_migrations" | "full_trials" | "full_trial_rows" | "full_trial_jobs" | "full_trial_samples" | "members" | "scope_dids" | "operator_settings" | "operator_settings_history"
         | "worker_state" | "backfill_jobs" | "sync_state" | "sync_chain_links" | "purging_dids" | "labels" | "mutes" | "list_mutes"
         | "thread_mutes" | "bookmarks" | "drafts" | "activity_subscriptions" | "notifications" | "purging" => Class::ModeIndependent,
         _ if prefixed.iter().any(|p| table.starts_with(p)) => Class::ModeIndependent,
         _ => return None,
     })
+}
+
+/// How often a running trial writes a capacity sample.
+pub const SAMPLE_EVERY: Duration = Duration::from_secs(60);
+
+/// The database's wait tally when the running trial's sampling began.
+fn trial_waits() -> &'static std::sync::Mutex<std::collections::BTreeMap<crate::db::waits::WaitClass, u64>> {
+    static START: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<crate::db::waits::WaitClass, u64>>> = std::sync::LazyLock::new(Default::default);
+    &START
+}
+
+/// The database's largest wait class since the trial's sampling began,
+/// when one is over half.
+#[must_use]
+pub fn trial_largest_wait() -> Option<crate::db::waits::WaitClass> {
+    let start = trial_waits().lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    crate::db::waits::tally().largest_since(&start)
+}
+
+fn trial_waits_start() {
+    *trial_waits().lock().unwrap_or_else(std::sync::PoisonError::into_inner) = crate::db::waits::tally().snapshot();
+}
+
+/// One minute's sample, as the capacity words read it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample {
+    pub input: Option<f64>,
+    pub processed: f64,
+    pub deduped: f64,
+    pub applied: f64,
+    pub lanes_busy: Option<f64>,
+    pub filling: bool,
+}
+
+/// What a trial says of the server's capacity, from its samples (the first
+/// five minutes left out), the fill's minutes apart from the rest, and the
+/// database's largest wait class when one is over half. `None` without
+/// samples.
+#[must_use]
+pub fn capacity_words(samples: &[Sample], ended_on_lag: bool, waits: Option<crate::db::waits::WaitClass>) -> Option<String> {
+    let steady: Vec<&Sample> = samples.iter().skip(5).collect();
+    if steady.is_empty() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let mean = |v: &[f64]| if v.is_empty() { 0.0 } else { v.iter().sum::<f64>() / v.len() as f64 };
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
+    };
+    let all_input: Vec<f64> = steady.iter().filter_map(|s| s.input).collect();
+    let deduped: Vec<f64> = steady.iter().map(|s| s.deduped).collect();
+    let (input, dup) = (mean(&all_input), mean(&deduped));
+    let mut out = vec![format!(
+        "Capacity: the relays sent {:.0} entries a second; {:.0} were copies of the same commits from other relays, so {:.0} needed applying.",
+        input,
+        dup,
+        (input - dup).max(0.0)
+    )];
+    let window = |filling: bool| -> Option<String> {
+        let w: Vec<&&Sample> = steady.iter().filter(|s| s.filling == filling).collect();
+        if w.is_empty() {
+            return None;
+        }
+        let behind = w.iter().filter(|s| s.input.is_some_and(|i| s.processed < i * 0.98)).count();
+        let applied: Vec<f64> = w.iter().map(|s| s.applied).collect();
+        let busy: Vec<f64> = w.iter().filter_map(|s| s.lanes_busy).collect();
+        let busy_share = mean(&busy);
+        let while_ = if filling { "While community's fill ran, this server" } else { "This server" };
+        Some(if behind * 2 > w.len() {
+            format!("{while_} applied {:.0} a second with its writer lanes {:.0} % busy and could not keep up.", median(applied), busy_share * 100.0)
+        } else if busy_share > 0.0 {
+            let rate = mean(&applied);
+            format!(
+                "{while_} applied {rate:.0} a second with its writer lanes {:.0} % busy: it kept up, and the lanes' load suggests a ceiling near {:.0} a second (an estimate).",
+                busy_share * 100.0,
+                rate / busy_share
+            )
+        } else {
+            format!("{while_} applied {:.0} a second: it kept up.", mean(&applied))
+        })
+    };
+    out.extend(window(true));
+    out.extend(window(false));
+    if ended_on_lag {
+        out.push("It ended itself when the backlog would have reached the stream's limit within its margin.".to_string());
+    }
+    if let Some(class) = waits {
+        out.push(format!("The database spent most of its time {} (see Health).", class.words()));
+    }
+    Some(out.join(" "))
 }
 
 /// The bounds of a new trial.
@@ -692,12 +792,21 @@ pub struct Bounds {
     pub max_added_gb: f64,
     pub end_below_free_percent: u32,
     pub history: bool,
+    pub end_on_lag: bool,
+    pub trim_margin_minutes: u32,
 }
 
 impl Bounds {
     #[must_use]
     pub fn from_config(c: &crate::config::FullTrialConfig) -> Self {
-        Self { hours: c.hours.0, max_added_gb: c.max_added_gb.0, end_below_free_percent: c.end_below_free_percent, history: c.history }
+        Self {
+            hours: c.hours.0,
+            max_added_gb: c.max_added_gb.0,
+            end_below_free_percent: c.end_below_free_percent,
+            history: c.history,
+            end_on_lag: c.end_on_lag,
+            trim_margin_minutes: c.trim_margin_minutes,
+        }
     }
 
     #[must_use]
@@ -714,7 +823,14 @@ impl Bounds {
 
     #[must_use]
     pub fn to_json(self) -> Value {
-        json!({ "hours": self.hours, "max_added_gb": self.max_added_gb, "end_below_free_percent": self.end_below_free_percent, "history": self.history })
+        json!({
+            "hours": self.hours,
+            "max_added_gb": self.max_added_gb,
+            "end_below_free_percent": self.end_below_free_percent,
+            "history": self.history,
+            "end_on_lag": self.end_on_lag,
+            "trim_margin_minutes": self.trim_margin_minutes,
+        })
     }
 }
 
@@ -967,6 +1083,8 @@ impl PublicIndexing {
             max_added_bytes: bounds.max_added_bytes(),
             end_below_free_percent: bounds.end_below_free_percent,
             history: bounds.history,
+            end_on_lag: bounds.end_on_lag,
+            trim_margin_minutes: bounds.trim_margin_minutes,
             baseline_db_bytes: baseline_db,
             start_last_fill_since: None,
             ended_by: None,
@@ -1029,6 +1147,15 @@ impl PublicIndexing {
         })
     }
 
+    /// The live ingest projection the lag cause reads; a test may set it.
+    pub(super) fn lag_projection(&self) -> Option<crate::firehose::projection::Projection> {
+        #[cfg(test)]
+        if let Some(p) = *self.hooks.projection.lock().expect("hooks") {
+            return Some(p);
+        }
+        crate::firehose::projection::published().get()
+    }
+
     /// The database volume's free and total bytes; a test may set them.
     pub(super) fn volume_now(&self) -> Option<(u64, u64)> {
         #[cfg(test)]
@@ -1052,7 +1179,10 @@ impl PublicIndexing {
         let db = database_bytes(&self.pool).await?;
         #[allow(clippy::cast_precision_loss)]
         metrics::gauge!(METRIC_GROWTH).set(db.saturating_sub(t.baseline_db_bytes) as f64);
-        let Some(cause) = bound_passed(&t, now(), Some(db), self.volume_now()) else {
+        // The lag cause is judged only while Prism runs, from a projection
+        // that has its rates: never at startup.
+        let lagging = path != "startup" && t.end_on_lag && self.lag_projection().is_some_and(|p| p.trims_within(Duration::from_secs(60 * u64::from(t.trim_margin_minutes))));
+        let Some(cause) = bound_passed(&t, now(), Some(db), self.volume_now()).or(lagging.then_some("lag")) else {
             return Ok(None);
         };
         let cause = if path == "startup" { "startup" } else { cause };
@@ -1156,9 +1286,23 @@ impl PublicIndexing {
     }
 
     async fn trial_bounds_loop(self) {
+        let mut last: Option<(std::time::Instant, crate::firehose::projection::TotalsNow)> = None;
         loop {
             if !self.trial_running().await {
                 return;
+            }
+            // A capacity sample a minute.
+            if last.is_none_or(|(at, _)| at.elapsed() >= SAMPLE_EVERY) {
+                let now_totals = crate::firehose::projection::totals().now();
+                if let Some((at, before)) = last
+                    && let Err(error) = self.sample_trial(at.elapsed(), before, now_totals).await
+                {
+                    tracing::warn!(event = "full_trial_sample_failed", %error, "writing the trial's capacity sample failed");
+                }
+                if last.is_none() {
+                    trial_waits_start();
+                }
+                last = Some((std::time::Instant::now(), now_totals));
             }
             #[cfg(test)]
             if self.hooks.checker_panics.swap(false, Ordering::SeqCst) {
@@ -1181,6 +1325,43 @@ impl PublicIndexing {
             }
             tokio::time::sleep(self.settings.trial_check_every).await;
         }
+    }
+
+    /// One capacity sample of the running trial over `span`, from the
+    /// ingest totals `before` and `now`.
+    async fn sample_trial(&self, span: Duration, before: crate::firehose::projection::TotalsNow, now_totals: crate::firehose::projection::TotalsNow) -> Result<(), sqlx::Error> {
+        let Some(t) = self.trial().await.filter(|t| t.state == TrialState::Running) else {
+            return Ok(());
+        };
+        let secs = span.as_secs_f64().max(1.0);
+        #[allow(clippy::cast_precision_loss)]
+        let rate = |a: u64, b: u64| b.saturating_sub(a) as f64 / secs;
+        let projection = crate::firehose::projection::published().get();
+        #[allow(clippy::cast_precision_loss)]
+        let busy = {
+            let cap = now_totals.lanes_capacity_us.saturating_sub(before.lanes_capacity_us);
+            (cap > 0).then(|| (now_totals.lanes_busy_us.saturating_sub(before.lanes_busy_us) as f64 / cap as f64).min(1.0))
+        };
+        let filling = self.scope.read_guard().await.public.mode == PublicMode::Filling;
+        sqlx::query(
+            "INSERT INTO full_trial_samples (trial, at, input, processed, deduped, shed, applied, lag, pending, time_to_trim, lanes_busy, crawl_records, filling) \
+             VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT DO NOTHING",
+        )
+        .bind(t.id)
+        .bind(projection.map(|p| p.input_per_sec))
+        .bind(rate(before.processed, now_totals.processed))
+        .bind(rate(before.deduped, now_totals.deduped))
+        .bind(rate(before.shed, now_totals.shed))
+        .bind(rate(before.applied, now_totals.applied))
+        .bind(projection.map(|p| i64::try_from(p.lag).unwrap_or(i64::MAX)))
+        .bind(projection.map(|p| i64::try_from(p.pending).unwrap_or(i64::MAX)))
+        .bind(projection.and_then(|p| p.time_to_trim))
+        .bind(busy)
+        .bind(rate(before.crawl_records, now_totals.crawl_records))
+        .bind(filling)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// `full_trial_state{state}`.

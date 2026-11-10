@@ -177,6 +177,23 @@ pub struct FullConfig {
     pub label_backfill: bool,
     /// How long a labeler's answer for a subject is kept.
     pub label_cache_secs: u32,
+    /// What full does when live ingest would lose unread entries within
+    /// `shed_margin_minutes`.
+    pub at_lag: AtLag,
+    pub shed_margin_minutes: u32,
+}
+
+/// `[full] at_lag`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AtLag {
+    /// Strangers' quiet commits are acked unapplied, and their accounts
+    /// fetched again whole; members', S's and everything that involves
+    /// them always apply.
+    #[default]
+    Shed,
+    /// Nothing; a stream trim is handled as a gap.
+    None,
 }
 
 /// Bluesky's moderation labeler.
@@ -237,6 +254,8 @@ impl Default for FullConfig {
             label_sources: vec![BLUESKY_MODERATION_LABELER.to_string()],
             label_backfill: false,
             label_cache_secs: 60,
+            at_lag: AtLag::Shed,
+            shed_margin_minutes: 10,
         }
     }
 }
@@ -299,6 +318,11 @@ pub struct FullCrawlConfig {
     /// How long a claimed repository is held before another claim may
     /// take it.
     pub claim_lease_secs: u32,
+    /// Records applied in one crawl transaction.
+    pub batch_ops: u32,
+    /// A claimer starts no transaction while live ingest is this many
+    /// seconds of input behind, and resumes below a third of it.
+    pub yield_above_lag_secs: u32,
 }
 
 impl Default for FullCrawlConfig {
@@ -315,6 +339,8 @@ impl Default for FullCrawlConfig {
             verify_signatures: true,
             max_attempts: 10,
             claim_lease_secs: 1800,
+            batch_ops: 500,
+            yield_above_lag_secs: 30,
         }
     }
 }
@@ -335,11 +361,15 @@ pub struct FullTrialConfig {
     pub end_below_free_percent: u32,
     /// Crawl history during the trial; live only when false.
     pub history: bool,
+    /// The trial ends when live ingest's backlog would reach the stream's
+    /// bound within `trim_margin_minutes`.
+    pub end_on_lag: bool,
+    pub trim_margin_minutes: u32,
 }
 
 impl Default for FullTrialConfig {
     fn default() -> Self {
-        Self { hours: Float(24.0), max_added_gb: Float(50.0), end_below_free_percent: 10, history: false }
+        Self { hours: Float(24.0), max_added_gb: Float(50.0), end_below_free_percent: 10, history: false, end_on_lag: true, trim_margin_minutes: 15 }
     }
 }
 

@@ -92,6 +92,8 @@ relist_every_days = 7
 relist_pages_per_sec = 5
 status_pass_pages_per_sec = 5
 weekly_count_repair = false
+at_lag = "shed"
+shed_margin_minutes = 10
 
 [full_crawl]
 enabled = true
@@ -105,12 +107,16 @@ plc_rate_per_sec = 10
 verify_signatures = true
 max_attempts = 10
 claim_lease_secs = 1800
+batch_ops = 500
+yield_above_lag_secs = 30
 
 [full_trial]
 hours = 24.0
 max_added_gb = 50.0
 end_below_free_percent = 10
 history = false
+end_on_lag = true
+trim_margin_minutes = 15
 
 [scope]
 policy = "members_and_one_hop"

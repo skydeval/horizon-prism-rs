@@ -21,6 +21,17 @@ released.
   settings left at Postgres's defaults that slow full down.
 - Full's writer transactions write strangers' likes, reposts and follows
   that notify no member in multi-row statements (`[firehose] bulk_arm`).
+- The history crawl applies `[full_crawl] batch_ops` (500) records a
+  transaction, interns a repository's accounts and keys first, and waits
+  while live ingest is more than `yield_above_lag_secs` (30) behind.
+- Full ingest projects when the stream would drop unread entries. A trial
+  ends itself with cause `lag` within `[full_trial] trim_margin_minutes`
+  (15; `end_on_lag`, or `--no-end-on-lag` per trial), and full sheds
+  strangers' quiet commits within `[full] shed_margin_minutes` (10,
+  `at_lag = "shed"`), fetching those accounts again whole later; members',
+  S's and anything involving them always apply. A trial writes a capacity
+  sample a minute and its result says what the server kept up with. Health
+  shows full ingest. **Upgrade:** migration 0068.
 - Metrics of where full's writers spend their time, of what Prism's own
   database sessions wait on, and of each relay's copies; status's dedupe
   share covers the last five minutes with dedupe on.

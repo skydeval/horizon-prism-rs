@@ -637,7 +637,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     .with_system_accounts(system_accounts.clone())
     .with_full_kinds(&cfg.file.full.kinds)
     .with_tier_board(public.tier_board())
-    .with_back_on_primary(Arc::clone(&back_on_primary));
+    .with_back_on_primary(Arc::clone(&back_on_primary))
+    .with_shedding(cfg.file.full.at_lag == crate::config::AtLag::Shed, std::time::Duration::from_secs(60 * u64::from(cfg.file.full.shed_margin_minutes)));
     let consumer = match outline_sender {
         Some(sender) => consumer.with_outline(sender),
         None => consumer,

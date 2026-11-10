@@ -45,7 +45,7 @@ Only these stop a start (exit 78):
 | `[http]`, `[metrics]` | Listen addresses; the one proxy address trusted for client IPs. |
 | `[net]` | DNS resolvers for public and background lookups. |
 | `[indexing]` | What is indexed: `kryphocron_only`, `community` or `full`. |
-| `[full]`, `[full_crawl]`, `[full_trial]` | Full network indexing: its record groups, where blocks, counts and labels come from, suspended accounts, the history crawl, and a trial's limits. See [indexing-and-scope.md](design/indexing-and-scope.md#full-network). |
+| `[full]`, `[full_crawl]`, `[full_trial]` | Full network indexing: its record groups, where blocks, counts and labels come from, suspended accounts, what full does when live ingest falls behind, the history crawl, and a trial's limits. See [indexing-and-scope.md](design/indexing-and-scope.md#full-network). |
 | `[scope]` | Which accounts beyond members are indexed, and for how long. |
 | `[community]` | Auto-enroll, member cap, readiness retry hints. |
 | `[firehose]` | Stream names, batch size, dead letters, which relays are private relays; for full indexing, writer lanes and the commits they apply in one transaction, dedupe of relay copies, relays whose old reader runs a filter, and fallback URLs of relays. |

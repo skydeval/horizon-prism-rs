@@ -894,3 +894,43 @@ async fn a_takedown_relay_back_on_its_primary_url_is_read_again() {
     assert_eq!(st["again"], json!({}), "the pass ended");
     db.drop_db().await;
 }
+
+/// A claimer starts no transaction while live ingest is more than
+/// `yield_above_lag_secs` behind, waits until it is under a third of that,
+/// renews its claim while it waits, and Health's figures say it waits.
+#[tokio::test]
+async fn the_crawl_waits_for_live_ingest_and_keeps_its_claim() {
+    let Some(db) = crate::test_support::fresh_db("crawl_yield").await else {
+        return;
+    };
+    let crawl = FullCrawlConfig { yield_above_lag_secs: 30, claim_lease_secs: 3, ..crawl_config() };
+    let s = stack(&db.pool, FullConfig::default(), crawl, &[("bsky", RELAY_A)]).await;
+    s.seed(&[STRANGER]).await;
+    let claim = s.claim().await;
+    let at = |lag: u64| crate::firehose::projection::Projection {
+        at: std::time::Instant::now(),
+        input_per_sec: 1000.0,
+        processed_per_sec: 1000.0,
+        lag,
+        pending: 0,
+        length: 1_000_000,
+        time_to_trim: None,
+    };
+    *s.crawler.projection.lock().expect("projection") = Some(at(60_000));
+    let task = {
+        let crawler = s.crawler.clone();
+        let claim = claim.clone();
+        tokio::spawn(async move { crawler.yield_to_live(&claim).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!task.is_finished(), "60 s behind: the claimer waits");
+    assert!(s.crawler.progress().waiting_for_live);
+    // 20 s behind: under the bound, but not under a third of it.
+    *s.crawler.projection.lock().expect("projection") = Some(at(20_000));
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert!(!task.is_finished(), "it waits until a third of the bound");
+    *s.crawler.projection.lock().expect("projection") = Some(at(5_000));
+    assert!(task.await.expect("task").expect("yield"), "the claim held while it waited");
+    assert!(!s.crawler.progress().waiting_for_live);
+    db.drop_db().await;
+}

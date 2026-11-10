@@ -414,3 +414,56 @@ async fn a_copy_behind_its_original_in_one_batch_is_dropped_with_it() {
     assert_eq!(pending(&mut f).await, 0);
     f.cleanup().await;
 }
+
+/// While live ingest would lose unread entries within the margin, full
+/// sheds a stranger's quiet like: acked unapplied and counted, its account
+/// holed and queued, a blocking shed gap open before the ack; a member's
+/// commit still applies. Once the backlog is small again, shedding stops
+/// and the gap resolves.
+#[tokio::test]
+async fn full_sheds_a_strangers_quiet_like_and_never_a_members_commit() {
+    const STRANGER: &str = "did:plc:shedstrangeraaaaaaaaaaaa";
+    const OTHER: &str = "did:plc:shedotheraaaaaaaaaaaaaaa";
+    let (rec, handle) = recorder();
+    let _local = metrics::set_default_local_recorder(&rec);
+    let opts = Options::default();
+    let Some(mut f) = Fixture::new("fl_shed", opts).await else {
+        return;
+    };
+    {
+        let scope = f.writer.scope().clone();
+        let mut sets = scope.write_guard().await;
+        sets.full.kinds = crate::config::FullGroup::ALL.to_vec();
+        scope.set_public(&mut sets, crate::indexing::PublicState { mode: crate::indexing::PublicMode::On, breadth: crate::indexing::Breadth::Full, generation: 1, ..crate::indexing::PublicState::default() });
+    }
+    f.cfg.writer_lanes = 1;
+    let like = json!({"repo": STRANGER, "rev": "3kaaaaaaaaab2", "_relay": BSKY, "time": chrono::Utc::now().to_rfc3339(), "ops": [{"action": "create", "path": "app.bsky.feed.like/3kaaaaaaaaab2", "cid": "bafyop",
+        "record": {"$type": "app.bsky.feed.like", "subject": {"uri": format!("at://{OTHER}/app.bsky.feed.post/3kaaaaaaaaaa2"), "cid": "bafyop"}, "createdAt": chrono::Utc::now().to_rfc3339()}}]});
+    f.add(&[("type", "commit".to_string()), ("data", like.to_string()), ("seq", "1".to_string())], None).await;
+    f.add(&post_commit(super::live::MEMBER, "3kaaaaaaaaab2", "3kaaaaaaaaab2", BSKY), None).await;
+    let (c, _) = f.consumer().await;
+    let mut c = c.with_shedding(true, Duration::from_secs(600));
+    let behind = crate::firehose::projection::Projection { at: Instant::now(), input_per_sec: 1000.0, processed_per_sec: 400.0, lag: 900_000, pending: 0, length: 1_000_000, time_to_trim: Some(120.0) };
+    c.test.projection = Some(behind);
+    c.startup().await.expect("startup");
+    assert!(c.run_until(|c| c.throughput.processed >= 2, Duration::from_secs(10)).await);
+    let pool = f.db.pool.clone();
+    let p = &pool;
+    let likes: i64 = sqlx::query_scalar("SELECT count(*) FROM likes").fetch_one(p).await.expect("likes");
+    assert_eq!(likes, 0, "the stranger's like was shed");
+    assert!(posts::stored(p, &post_uri(super::live::MEMBER, "3kaaaaaaaaab2")).await, "the member's post applied");
+    assert_eq!(rendered(&handle, METRIC_SHED, &["relay=\"bsky\""]), Some(1.0));
+    let gap: i64 = sqlx::query_scalar("SELECT count(*) FROM full_gaps WHERE kind = 'shed' AND blocking AND resolved_at IS NULL").fetch_one(p).await.expect("gap");
+    assert_eq!(gap, 1);
+    let (state, epoch): (String, i64) = sqlx::query_as("SELECT f.state, f.epoch FROM full_crawl f JOIN dids d ON d.id = f.account WHERE d.did = $1").bind(STRANGER).fetch_one(p).await.expect("row");
+    assert_eq!(state, "pending");
+    assert!(epoch >= 1, "the shed account took a hole");
+    assert_eq!(pending(&mut f).await, 0);
+    // Caught up: the next batch stops shedding and the gap resolves.
+    c.test.projection = Some(crate::firehose::projection::Projection { lag: 0, time_to_trim: None, ..behind });
+    f.add(&post_commit(super::live::MEMBER, "3kaaaaaaaaab3", "3kaaaaaaaaab3", BSKY), None).await;
+    assert!(c.run_until(|c| c.throughput.processed >= 3, Duration::from_secs(10)).await);
+    let open: i64 = sqlx::query_scalar("SELECT count(*) FROM full_gaps WHERE kind = 'shed' AND resolved_at IS NULL").fetch_one(p).await.expect("gap");
+    assert_eq!(open, 0);
+    f.cleanup().await;
+}

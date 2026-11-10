@@ -605,7 +605,7 @@ fn with_leave(_cfg: &FileConfig, _value: &str, _intents: &[Intent], checked: Res
 }
 
 fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
-    let nonzero: [(&str, u64); 41] = [
+    let nonzero: [(&str, u64); 45] = [
         ("firehose.batch_size", u64::from(cfg.firehose.batch_size)),
         ("firehose.lane_batch", u64::from(cfg.firehose.lane_batch)),
         ("firehose.writer_lanes", u64::from(cfg.firehose.writer_lanes)),
@@ -644,9 +644,13 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
         ("full_crawl.plc_rate_per_sec", u64::from(cfg.full_crawl.plc_rate_per_sec)),
         ("full_crawl.max_attempts", u64::from(cfg.full_crawl.max_attempts)),
         ("full_crawl.claim_lease_secs", u64::from(cfg.full_crawl.claim_lease_secs)),
+        ("full_crawl.batch_ops", u64::from(cfg.full_crawl.batch_ops)),
+        ("full_crawl.yield_above_lag_secs", u64::from(cfg.full_crawl.yield_above_lag_secs)),
         ("full.relist_pages_per_sec", u64::from(cfg.full.relist_pages_per_sec)),
         ("full.status_pass_pages_per_sec", u64::from(cfg.full.status_pass_pages_per_sec)),
         ("full.label_cache_secs", u64::from(cfg.full.label_cache_secs)),
+        ("full_trial.trim_margin_minutes", u64::from(cfg.full_trial.trim_margin_minutes)),
+        ("full.shed_margin_minutes", u64::from(cfg.full.shed_margin_minutes)),
     ];
     for (key, value) in nonzero {
         if value == 0 {

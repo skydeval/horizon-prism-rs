@@ -1702,6 +1702,8 @@ pub(super) mod hooks {
         pauses: Mutex<HashMap<&'static str, Pause>>,
         /// The database volume's `(free, total)` bytes a trial reads.
         pub volume: Mutex<Option<(u64, u64)>>,
+        /// The live ingest projection a trial's lag cause reads.
+        pub projection: Mutex<Option<crate::firehose::projection::Projection>>,
         /// The trial's bounds checker panics once.
         pub checker_panics: std::sync::atomic::AtomicBool,
         /// The trial's bounds checker looks at nothing.

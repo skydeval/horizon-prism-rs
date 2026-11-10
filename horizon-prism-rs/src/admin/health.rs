@@ -73,6 +73,7 @@ pub const WATCHED: &[&str] = &[
     crate::system_accounts::METRIC_STATE,
     crate::system_accounts::METRIC_PENDING,
     crate::db::pool::METRIC_ACQUIRE,
+    crate::firehose::consumer::METRIC_SHEDDING,
 ];
 
 /// `private_read_content_total{form}`, emitted by the private tier.
@@ -1005,6 +1006,30 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
     out
 }
 
+/// Full ingest while the full network is indexed: shedding, falling behind
+/// or keeping up, with the rates and the database's largest wait class.
+#[must_use]
+pub fn ingest_check(p: Option<crate::firehose::projection::Projection>, now: Option<&Snapshot>) -> Check {
+    const NAME: &str = "Full ingest";
+    let Some(p) = p else {
+        return Check::no_data(NAME, "live ingest's rates are not known yet.");
+    };
+    let shedding = now.and_then(|s| s.sum(crate::firehose::consumer::METRIC_SHEDDING)).is_some_and(|v| v >= 1.0);
+    let rates = format!("the relays send {:.0} entries a second and Prism processes {:.0}", p.input_per_sec, p.processed_per_sec);
+    let waits = crate::db::waits::tally().largest_since(&std::collections::BTreeMap::new()).map(|c| format!(" The database spends most of its time {}.", c.words())).unwrap_or_default();
+    if shedding {
+        return Check::new(
+            NAME,
+            Level::Amber,
+            format!("Full ingest is shedding: {rates}. Members' and S's entries are applied in full; the accounts of the commits shed are fetched again whole.{waits}"),
+        );
+    }
+    match p.time_to_trim {
+        Some(t) => Check::new(NAME, Level::Amber, format!("Live ingest falls behind: {rates}, and the stream would drop unread entries in about {} minutes.{waits}", (t / 60.0).round())),
+        None => Check::new(NAME, Level::Ok, format!("Live ingest keeps up: {rates}.")),
+    }
+}
+
 /// Full indexing's checks: the full network's warnings while it runs (or
 /// a note that it does not), and a trial's warnings while one has any.
 async fn full_checks(state: &AdminState) -> Vec<Check> {
@@ -1023,6 +1048,9 @@ async fn full_checks(state: &AdminState) -> Vec<Check> {
             out.push(text.link("/admin/indexing", "Indexing"));
         }
         Err(e) => out.push(Check::no_data("Full network", &format!("its status could not be read ({e})")).link("/admin/indexing", "Indexing")),
+    }
+    if breadth == crate::indexing::Breadth::Full {
+        out.push(ingest_check(crate::firehose::projection::published().get(), state.health.ring.latest().as_deref()).link("/admin/indexing", "Indexing"));
     }
     if let Ok(trial) = public.trial_status().await {
         let warnings: Vec<String> = trial["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();
@@ -1059,6 +1087,19 @@ mod tests {
     use super::*;
 
     /// System-accounts amendment 1 T-A8: the check for each state.
+    #[test]
+    fn the_full_ingest_check_says_shedding_falling_behind_or_keeping_up() {
+        use crate::firehose::projection::Projection;
+        let p = Projection { at: std::time::Instant::now(), input_per_sec: 1300.0, processed_per_sec: 900.0, lag: 10, pending: 0, length: 100, time_to_trim: Some(600.0) };
+        assert_eq!(ingest_check(None, None).level, Level::NoData);
+        let c = ingest_check(Some(p), None);
+        assert!(c.level == Level::Amber && c.text.contains("about 10 minutes"), "{}", c.text);
+        let c = ingest_check(Some(Projection { time_to_trim: None, ..p }), None);
+        assert!(c.level == Level::Ok && c.text.contains("1300 entries a second"), "{}", c.text);
+        let shedding = snap(&format!("{} 1\n", crate::firehose::consumer::METRIC_SHEDDING), 0);
+        assert!(ingest_check(Some(p), Some(&shedding)).text.contains("shedding"));
+    }
+
     #[test]
     fn system_accounts_check_says_each_state() {
         let at = |state: &str| {

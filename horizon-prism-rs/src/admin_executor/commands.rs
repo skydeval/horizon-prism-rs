@@ -76,7 +76,7 @@ pub enum AdminCommand {
     IndexingStatus,
     /// `indexing full-trial start`: full indexing for a bounded time, with
     /// a record of what it added; unset bounds take `[full_trial]`'s.
-    FullTrialStart { hours: Option<Float>, max_added_gb: Option<Float>, end_below_free_percent: Option<u32>, history: bool },
+    FullTrialStart { hours: Option<Float>, max_added_gb: Option<Float>, end_below_free_percent: Option<u32>, history: bool, end_on_lag: Option<bool>, trim_margin_minutes: Option<u32> },
     /// `indexing full-trial end`: end a running trial now.
     FullTrialEnd,
     /// `indexing full-trial keep`: keep full for real; the record goes.
@@ -165,9 +165,9 @@ impl AdminCommand {
             Self::ListsPurge { did } => ("lists purge", json!({ "did": did })),
             Self::IndexingPublicScope { value } => ("indexing public-scope", json!({ "value": value.as_str() })),
             Self::IndexingStatus => ("indexing status", json!({})),
-            Self::FullTrialStart { hours, max_added_gb, end_below_free_percent, history } => (
+            Self::FullTrialStart { hours, max_added_gb, end_below_free_percent, history, end_on_lag, trim_margin_minutes } => (
                 "indexing full-trial start",
-                json!({ "hours": hours.map(|h| h.0), "max_added_gb": max_added_gb.map(|g| g.0), "end_below_free_percent": end_below_free_percent, "history": history }),
+                json!({ "hours": hours.map(|h| h.0), "max_added_gb": max_added_gb.map(|g| g.0), "end_below_free_percent": end_below_free_percent, "history": history, "end_on_lag": end_on_lag, "trim_margin_minutes": trim_margin_minutes }),
             ),
             Self::FullTrialEnd => ("indexing full-trial end", json!({})),
             Self::FullTrialKeep => ("indexing full-trial keep", json!({})),
@@ -313,8 +313,19 @@ impl AdminCommand {
                 if end_below_free_percent.is_some_and(|p| p > 100) {
                     return Err(InvalidCommand(format!("{command}: end_below_free_percent is a share of 0 to 100")));
                 }
+                let trim_margin_minutes = n("trim_margin_minutes")?;
+                if trim_margin_minutes == Some(0) {
+                    return Err(InvalidCommand(format!("{command}: trim_margin_minutes must be more than 0")));
+                }
                 if command == "indexing full-trial start" {
-                    Self::FullTrialStart { hours, max_added_gb, end_below_free_percent, history: args.get("history").and_then(Value::as_bool).unwrap_or(false) }
+                    Self::FullTrialStart {
+                        hours,
+                        max_added_gb,
+                        end_below_free_percent,
+                        history: args.get("history").and_then(Value::as_bool).unwrap_or(false),
+                        end_on_lag: args.get("end_on_lag").and_then(Value::as_bool),
+                        trim_margin_minutes,
+                    }
                 } else {
                     Self::FullTrialBounds { hours, max_added_gb, end_below_free_percent }
                 }
@@ -576,13 +587,15 @@ impl Handlers {
             AdminCommand::ListsPurge { did } => self.lists_purge(did).await,
             AdminCommand::IndexingPublicScope { value } => self.indexing_public_scope(*value, actor).await,
             AdminCommand::IndexingStatus => self.public.status().await.map(Outcome::Done).map_err(|e| e.to_string()),
-            AdminCommand::FullTrialStart { hours, max_added_gb, end_below_free_percent, history } => {
+            AdminCommand::FullTrialStart { hours, max_added_gb, end_below_free_percent, history, end_on_lag, trim_margin_minutes } => {
                 let d = self.public.trial_defaults();
                 let bounds = crate::indexing::trial::Bounds {
                     hours: hours.map_or(d.hours, |h| h.0),
                     max_added_gb: max_added_gb.map_or(d.max_added_gb, |g| g.0),
                     end_below_free_percent: end_below_free_percent.unwrap_or(d.end_below_free_percent),
                     history: *history,
+                    end_on_lag: end_on_lag.unwrap_or(d.end_on_lag),
+                    trim_margin_minutes: trim_margin_minutes.unwrap_or(d.trim_margin_minutes),
                 };
                 match self.public.start_trial(bounds, actor.label()).await {
                     Ok(s) => Ok(Outcome::Done(json!({
@@ -1272,7 +1285,7 @@ mod tests {
             AdminCommand::IndexingPublicScope { value: ScopeValue::Community },
             AdminCommand::IndexingPublicScope { value: ScopeValue::Full },
             AdminCommand::IndexingStatus,
-            AdminCommand::FullTrialStart { hours: Some(Float(0.5)), max_added_gb: None, end_below_free_percent: Some(5), history: false },
+            AdminCommand::FullTrialStart { hours: Some(Float(0.5)), max_added_gb: None, end_below_free_percent: Some(5), history: false, end_on_lag: Some(false), trim_margin_minutes: Some(20) },
             AdminCommand::FullTrialEnd,
             AdminCommand::FullTrialKeep,
             AdminCommand::FullTrialBounds { hours: None, max_added_gb: Some(Float(0.2)), end_below_free_percent: None },

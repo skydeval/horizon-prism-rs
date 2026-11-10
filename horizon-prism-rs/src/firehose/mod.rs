@@ -16,6 +16,7 @@ pub mod gap;
 pub mod index_request;
 pub mod jobs;
 pub mod normalize;
+pub mod projection;
 pub mod post_search;
 pub mod records;
 pub mod router;

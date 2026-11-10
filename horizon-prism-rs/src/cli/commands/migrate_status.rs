@@ -165,6 +165,8 @@ mod tests {
             "0066_full_trial_jobs",
             // Counts deferred inside a writer transaction.
             "0067_deferred_counts",
+            // A full trial's capacity samples.
+            "0068_full_trial_samples",
         ];
         let expected: Vec<String> = names.iter().map(|n| format!("{n}  applied")).chain(["status: up to date".to_string()]).collect();
         assert_eq!(out, expected.join("\n"));

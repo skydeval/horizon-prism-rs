@@ -32,6 +32,7 @@ impl CrawlBoard {
         json!({
             "running": p.running,
             "paused": p.paused,
+            "waiting_for_live": p.waiting_for_live,
             "history": p.history,
             "crawled": p.crawled,
             "failed": p.failed,

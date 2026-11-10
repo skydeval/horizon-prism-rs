@@ -174,6 +174,7 @@ pub(super) struct CommitWork<'e> {
 impl Lane {
     pub(super) fn book_busy(&self, d: Duration) {
         metrics::gauge!(METRIC_LANE_BUSY, "lane" => self.label.clone()).increment(d.as_secs_f64());
+        super::super::projection::totals().lanes_busy_us.fetch_add(u64::try_from(d.as_micros()).unwrap_or(u64::MAX), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn duplicate_here(&self, repo: &str, key: Option<&CopyKey>) -> bool {

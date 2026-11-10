@@ -55,6 +55,11 @@ mod lanes;
 use lanes::{Done, Lane, Work};
 pub use lanes::{CONFLICT_RETRIES, LowWater, METRIC_LANE_BATCH_SPLITS, METRIC_LANE_BUSY, METRIC_LANE_QUEUE, METRIC_LANE_RETRIES, lane_of};
 
+/// Metric: commits shed unapplied, by relay.
+pub const METRIC_SHED: &str = "firehose_shed_total";
+/// Metric: 1 while full sheds.
+pub const METRIC_SHEDDING: &str = "firehose_shedding";
+
 /// The span status reports the dedupe share over.
 pub const DEDUPE_WINDOW: Duration = Duration::from_secs(300);
 
@@ -404,12 +409,19 @@ fn micros(d: Duration) -> u64 {
 #[derive(Debug, Default)]
 pub struct ThroughputShared {
     backlog_busy_us: AtomicU64,
+    /// Entries booked since the start, every path.
+    processed: AtomicU64,
 }
 
 impl ThroughputShared {
     #[must_use]
     pub fn backlog_busy_us(&self) -> u64 {
         self.backlog_busy_us.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn processed(&self) -> u64 {
+        self.processed.load(Ordering::Relaxed)
     }
 }
 
@@ -434,6 +446,8 @@ pub(crate) struct TestTuning {
     pub entry_delay: Duration,
     paced_until: Option<tokio::time::Instant>,
     pub ring_reset: bool,
+    /// The projection shedding reads, in place of the process's.
+    pub projection: Option<super::projection::Projection>,
     /// The database's name: the key of the consumer's hooks.
     pub db: String,
     pub record: Arc<std::sync::Mutex<Record>>,
@@ -517,6 +531,13 @@ pub struct Consumer {
     dedupe_ring: VecDeque<(Instant, u64, u64)>,
     /// Duplicates dropped at dispatch, for the delay's sampling.
     drops_seen: u64,
+    /// Full's shedding: whether `[full] at_lag` is "shed", its margin, and
+    /// whether it sheds now; the repos shed in the batch in progress, whose
+    /// holes commit before any of their entries is booked.
+    shed_on: bool,
+    shed_margin: Duration,
+    shedding: bool,
+    shed_repos: Vec<String>,
     #[cfg(test)]
     pub(crate) test: TestTuning,
 }
@@ -545,6 +566,7 @@ impl Consumer {
                 entry_delay: Duration::ZERO,
                 paced_until: None,
                 ring_reset: true,
+                projection: None,
                 db: pool.connect_options().get_database().unwrap_or_default().to_string(),
                 record: Arc::default(),
             },
@@ -577,7 +599,93 @@ impl Consumer {
             dedupe_on_deduped: 0,
             dedupe_ring: VecDeque::new(),
             drops_seen: 0,
+            shed_on: false,
+            shed_margin: Duration::from_secs(600),
+            shedding: false,
+            shed_repos: Vec::new(),
         }
+    }
+
+    /// Shed strangers' quiet commits while live ingest would lose unread
+    /// entries within `margin` (`[full] at_lag = "shed"`).
+    #[must_use]
+    pub fn with_shedding(mut self, on: bool, margin: Duration) -> Self {
+        self.shed_on = on;
+        self.shed_margin = margin;
+        self
+    }
+
+    /// The projection shedding reads; a test may set its own.
+    fn projection(&self) -> Option<super::projection::Projection> {
+        #[cfg(test)]
+        if let Some(p) = self.test.projection {
+            return Some(p);
+        }
+        super::projection::published().get()
+    }
+
+    /// Whether to shed in the batch about to be read: on once the
+    /// projection says unread entries would be trimmed within the margin,
+    /// off once the backlog is under a tenth of the stream. Stopping
+    /// resolves the shed gap.
+    async fn update_shedding(&mut self) -> Result<(), ConsumerError> {
+        let full = self.writer.scope().public_breadth() == crate::indexing::Breadth::Full;
+        let p = self.projection();
+        let next = if !self.shed_on || !full {
+            false
+        } else if self.shedding {
+            p.is_none_or(|p| (p.lag + p.pending).saturating_mul(10) >= p.length)
+        } else {
+            p.is_some_and(|p| p.trims_within(self.shed_margin))
+        };
+        if next != self.shedding {
+            metrics::gauge!(METRIC_SHEDDING).set(if next { 1.0 } else { 0.0 });
+            if next {
+                tracing::warn!(event = "firehose_shedding", "live ingest would lose unread entries soon: strangers' quiet commits are acked unapplied, their accounts fetched again whole later");
+            } else {
+                sqlx::query("UPDATE full_gaps SET resolved_at = now() WHERE kind = 'shed' AND resolved_at IS NULL").execute(&self.pool).await?;
+                tracing::info!(event = "firehose_shedding_stopped", "live ingest caught up; every entry is applied again");
+            }
+            self.shedding = next;
+        }
+        Ok(())
+    }
+
+    /// The shed repos of the batch: a blocking gap row, then one
+    /// transaction that gives every shed account a hole (its row created
+    /// pending when it has none), committed before any shed entry is booked.
+    async fn shed_holes(&mut self) -> Result<(), ConsumerError> {
+        if self.shed_repos.is_empty() {
+            return Ok(());
+        }
+        let mut repos = std::mem::take(&mut self.shed_repos);
+        repos.sort();
+        repos.dedup();
+        let open: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM full_gaps WHERE kind = 'shed' AND resolved_at IS NULL)").fetch_one(&self.pool).await?;
+        if !open {
+            crate::indexing::crawl::relist::open_gap(&self.pool, "shed", None, true, serde_json::json!({})).await?;
+        }
+        let ids = self.writer.ids().account_ids(&repos).await?;
+        let mut accounts: Vec<crate::db::ids::AccountId> = ids.values().copied().collect();
+        accounts.sort_unstable();
+        let (groups, generation) = {
+            let sets = self.writer.scope().read_guard().await;
+            (sets.full.kinds.iter().map(|g| g.as_str().to_string()).collect::<Vec<String>>(), i64::try_from(sets.public.crawl_generation).unwrap_or(i64::MAX))
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT 1 FROM full_crawl WHERE account = ANY($1) ORDER BY account FOR UPDATE").bind(&accounts).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO full_crawl (account, generation, groups) SELECT a, $2, $3 FROM unnest($1::int[]) AS a ORDER BY a ON CONFLICT (account) DO NOTHING")
+            .bind(&accounts)
+            .bind(generation)
+            .bind(&groups)
+            .execute(&mut *tx)
+            .await?;
+        for &a in &accounts {
+            crate::indexing::crawl::continuity::clear_uncovered(&mut tx, a, &groups).await?;
+            crate::indexing::crawl::continuity::hole(&mut tx, a, generation, &groups, "shed").await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Name each relay whose entries come from its primary URL again after
@@ -1108,6 +1216,7 @@ impl Consumer {
         let entries = Arc::new(entries);
         let dedupe = self.dedupe_on();
         self.batch_dedupe = dedupe;
+        self.update_shedding().await?;
         let mut start = 0;
         let mut carry = None;
         while start < entries.len() {
@@ -1118,12 +1227,18 @@ impl Consumer {
             } else {
                 self.run_lanes(&entries, start, carry.take(), dedupe).await
             };
+            // Shed accounts take their holes before any entry is booked.
+            if let Err(e) = self.shed_holes().await {
+                self.shed_repos.clear();
+                return Err(e);
+            }
             let finished = self.finish(&entries[start..end], outcome).await;
             // Every lane's time in the round, busy or not: the share the
             // lanes were not busy is the round's barrier and the consumer's
             // serial reading and booking.
             #[allow(clippy::cast_precision_loss)]
             metrics::gauge!(METRIC_LANE_CAPACITY).increment(round.elapsed().as_secs_f64() * self.lanes() as f64);
+            super::projection::totals().lanes_capacity_us.fetch_add(micros(round.elapsed()).saturating_mul(self.lanes() as u64), Ordering::Relaxed);
             finished?;
             start = end;
             carry = next;
@@ -1388,6 +1503,7 @@ impl Consumer {
         self.count(entry, done.path);
         if done.duplicate {
             self.throughput.deduped += 1;
+            super::projection::totals().deduped.fetch_add(1, Ordering::Relaxed);
         }
         if self.batch_dedupe {
             self.dedupe_on_entries += 1;
@@ -1419,7 +1535,13 @@ impl Consumer {
 
     /// Book one processed entry (§4.2).
     fn count(&mut self, entry: &StreamEntry, path: EntryPath) {
+        let totals = super::projection::totals();
+        totals.processed.fetch_add(1, Ordering::Relaxed);
+        if path == EntryPath::Tx {
+            totals.applied.fetch_add(1, Ordering::Relaxed);
+        }
         self.throughput.processed += 1;
+        self.shared.processed.fetch_add(1, Ordering::Relaxed);
         if let Some(i) = EntryPath::ALL.iter().position(|p| *p == path) {
             self.throughput.by_path[i] += 1;
         }
@@ -1532,7 +1654,22 @@ impl Consumer {
                         let watermark = contribution(entry.id_ms(), commit.time).map(|c| (label.clone(), c));
                         Work::Done(Done::duplicate(&label, watermark))
                     }
-                    None => Work::Commit { commit, label, tier, key },
+                    None => {
+                        let shed = if self.shedding { self.writer.shed_outline(&commit.repo, &commit.rev, &commit.ops, tier).await } else { None };
+                        match shed {
+                            // Acked unapplied: its outline ops and watermark
+                            // are booked, its copy is not marked seen, and
+                            // its account takes a hole.
+                            Some(outline) => {
+                                metrics::counter!(METRIC_SHED, "relay" => label.clone()).increment(1);
+                                super::projection::totals().shed.fetch_add(1, Ordering::Relaxed);
+                                self.shed_repos.push(commit.repo.clone());
+                                let watermark = contribution(entry.id_ms(), commit.time).map(|c| (label.clone(), c));
+                                Work::Done(Done { outline, watermark, ..Done::nothing() })
+                            }
+                            None => Work::Commit { commit, label, tier, key },
+                        }
+                    }
                 }
             }
         })
@@ -1724,6 +1861,9 @@ pub(crate) struct SamplerState {
     backlog: VecDeque<(Instant, u64)>,
     headroom_above_since: Option<Instant>,
     headroom_warned: bool,
+    /// This tick's readings, for the projection.
+    pub reading: super::projection::Reading,
+    projector: super::projection::Projector,
 }
 
 /// What `entries-added` adds to the input counter: the growth since the
@@ -1738,12 +1878,15 @@ pub(crate) fn stream_added_delta(prev: &mut Option<u64>, now: u64) -> u64 {
 /// One sampler tick (§4.2): three independent calls, each with its own
 /// timeout, classed as success, missing key or group, or failure.
 pub(crate) async fn sample_once<C: SampleCalls>(calls: &mut C, cfg: &FirehoseConfig, state: &mut SamplerState) {
+    state.reading = super::projection::Reading::default();
     // 1. The stream: its input, and its length for a missing group's lag.
     let length = match classify_call(SampleCall::Stream, calls.stream_info()).await {
         Reply::Ok(info) => {
             if let Some(added) = flat_u64(&info, "entries-added") {
                 metrics::counter!(METRIC_STREAM_ADDED).increment(stream_added_delta(&mut state.prev_added, added));
+                state.reading.added = Some(added);
             }
+            state.reading.length = flat_u64(&info, "length");
             flat_u64(&info, "length")
         }
         Reply::Missing => Some(0),
@@ -1753,13 +1896,17 @@ pub(crate) async fn sample_once<C: SampleCalls>(calls: &mut C, cfg: &FirehoseCon
     let listed = match classify_call(SampleCall::Groups, calls.groups()).await {
         Reply::Ok(groups) => group_field(&groups, &cfg.group, "name").map(|_| groups),
         Reply::Missing => None,
-        Reply::Failed => return sample_pending(calls).await,
+        Reply::Failed => {
+            state.reading.pending = sample_pending(calls).await;
+            return;
+        }
     };
     match listed {
         Some(groups) => {
             metrics::gauge!(METRIC_GROUP_PRESENT).set(1.0);
             if let Some(lag) = group_field(&groups, &cfg.group, "lag").and_then(|v| as_u64(&v)) {
                 set_lag(state, cfg, lag);
+                state.reading.lag = Some(lag);
             }
         }
         None => {
@@ -1767,21 +1914,27 @@ pub(crate) async fn sample_once<C: SampleCalls>(calls: &mut C, cfg: &FirehoseCon
             // This tick's length; unchanged when the stream call failed.
             if let Some(length) = length {
                 set_lag(state, cfg, length);
+                state.reading.lag = Some(length);
             }
         }
     }
-    sample_pending(calls).await;
+    state.reading.pending = sample_pending(calls).await;
 }
 
-async fn sample_pending<C: SampleCalls>(calls: &mut C) {
+/// The group's pending count, when the call answered.
+async fn sample_pending<C: SampleCalls>(calls: &mut C) -> Option<u64> {
     match classify_call(SampleCall::Pending, calls.pending()).await {
         Reply::Ok(Value::Array(parts)) => {
             let count = parts.first().and_then(as_u64).unwrap_or(0);
             #[allow(clippy::cast_precision_loss)]
             metrics::gauge!(METRIC_PENDING).set(count as f64);
+            Some(count)
         }
-        Reply::Ok(_) | Reply::Missing => metrics::gauge!(METRIC_PENDING).set(0.0),
-        Reply::Failed => {}
+        Reply::Ok(_) | Reply::Missing => {
+            metrics::gauge!(METRIC_PENDING).set(0.0);
+            Some(0)
+        }
+        Reply::Failed => None,
     }
 }
 
@@ -1849,6 +2002,11 @@ pub fn spawn_lag_sampler(
             tick.tick().await;
             sample_once(&mut calls, &cfg, &mut state).await;
             headroom_tick(&mut state, Instant::now(), shared.backlog_busy_us());
+            // The backlog against the stream's bound, for the crawl's yield,
+            // full's shedding and a trial's end.
+            let reading = super::projection::Reading { processed: shared.processed(), ..state.reading };
+            let projection = state.projector.tick(Instant::now(), reading);
+            super::projection::published().set(projection);
         }
     })
 }

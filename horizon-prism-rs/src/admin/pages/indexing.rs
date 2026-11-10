@@ -510,7 +510,7 @@ pub async fn trial(State(state): State<AdminState>, ConnectInfo(peer): ConnectIn
     let from = if state.scope.public_mode() == PublicMode::Off { ScopeValue::KryphocronOnly } else { ScopeValue::Community };
     let first = crate::indexing::trial::first_bound(bounds, volume, crate::indexing::full::GROWTH_BYTES_PER_DAY);
     let what = crate::indexing::trial::confirm_text(from, bounds, &warnings, None, first).join(" ");
-    let cmd = AdminCommand::FullTrialStart { hours: None, max_added_gb: None, end_below_free_percent: None, history: bounds.history };
+    let cmd = AdminCommand::FullTrialStart { hours: None, max_added_gb: None, end_below_free_percent: None, history: bounds.history, end_on_lag: None, trim_margin_minutes: None };
     trial_form(
         &state,
         &op,

@@ -77,6 +77,13 @@ relist_pages_per_sec = 5
 status_pass_pages_per_sec = 5
 # The weekly counts repair while full runs (in a form that locks no table).
 weekly_count_repair = false
+# When live ingest falls so far behind that the stream would drop unread
+# entries within shed_margin_minutes: "shed" acks strangers' likes,
+# reposts and follows that notify no member without applying them, and
+# fetches those accounts again whole later; members', S's and everything
+# involving them always apply. "none": a dropped stretch is a gap.
+at_lag = "shed"
+shed_margin_minutes = 10
 
 [full_crawl]
 # The history crawl. Off: the network is stored live only.
@@ -95,6 +102,11 @@ plc_rate_per_sec = 10
 verify_signatures = true
 max_attempts = 10
 claim_lease_secs = 1800
+# Records applied in one transaction.
+batch_ops = 500
+# Claimers start no transaction while live ingest is this many seconds of
+# input behind, and go on below a third of it.
+yield_above_lag_secs = 30
 
 [full_trial]
 # A trial's limits; each can be given per trial on the command.
@@ -102,6 +114,10 @@ hours = 24.0
 max_added_gb = 50.0
 end_below_free_percent = 10
 history = false
+# The trial ends itself when live ingest falls so far behind that the stream
+# would drop unread entries within trim_margin_minutes.
+end_on_lag = true
+trim_margin_minutes = 15
 
 [scope]
 # members_only | members_and_follows | members_and_interactions | members_and_one_hop
