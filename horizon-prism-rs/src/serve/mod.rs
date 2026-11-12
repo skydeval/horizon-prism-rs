@@ -700,6 +700,9 @@ pub async fn run() -> Result<Stopped, StartupError> {
     tasks.push(spawn_lag_sampler(redis.clone(), fh.clone(), throughput, LAG_SAMPLE_INTERVAL));
     // The pool's use, and what Prism's backends wait on while full runs.
     tasks.push(crate::db::waits::spawn(pool.clone(), scope.clone()));
+    // Counts: the log the count triggers write, folded into the count tables.
+    let counts_status = Arc::new(crate::counts::FoldStatus::new(Duration::from_millis(cfg.file.counts.fold_interval_ms)));
+    tasks.push(crate::counts::Folder::new(pool.clone(), &cfg.file.counts, Arc::clone(&counts_status)).spawn());
 
     // The post-migration task, made here so retention's age cap can wait
     // for its indexes; it is spawned once ingest runs (below).
@@ -1219,6 +1222,7 @@ pub async fn run() -> Result<Stopped, StartupError> {
         schema: Some(schema_status.clone()),
         farsight: health_farsight,
         public: Some(public.clone()),
+        counts: Some(Arc::clone(&counts_status)),
     };
     // Pronouns and plural systems (plural-pronouns design §2.4, §2.8): the
     // listings run through the internal transport, with the background loop
@@ -1380,6 +1384,8 @@ pub async fn run() -> Result<Stopped, StartupError> {
     for t in tasks {
         t.abort();
     }
+    // The lanes have stopped: what they logged is folded once more.
+    crate::counts::final_round(&pool).await;
     if restart.requested() {
         tracing::warn!(event = "serve_stopped", exit_code = EXIT_RESTART, "shutdown complete; exiting for a restart");
         return Ok(Stopped::Restart);

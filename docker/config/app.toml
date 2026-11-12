@@ -430,6 +430,12 @@ stale_max_secs = 86400
 sync_timeout_ms = 800
 refresh_rate_per_sec = 20
 refresh_queue_max = 100000
+# Local counts are folded from a log in the background: how often, so how
+# far counts may run behind ingest (at least 10; above 60000 warns), and
+# the log rows one fold takes at most before it splits into slices (at
+# least 1000).
+fold_interval_ms = 1000
+fold_slice_rows = 100000
 
 [microcosm]
 slingshot_url = "https://slingshot.microcosm.blue"

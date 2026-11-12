@@ -67,6 +67,32 @@ pub struct LaneRun {
     pub phases: Vec<(String, f64)>,
     /// What the scratch database's sessions waited on, sampled.
     pub waits: Vec<(crate::db::waits::WaitClass, u64)>,
+    /// The counts folder beside the lanes: what it folded.
+    pub counts: Option<FolderRun>,
+}
+
+/// The counts folder during one run.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FolderRun {
+    /// Log rows folded during the run, a second.
+    pub per_sec: f64,
+    /// How far counts were behind, the 99th percentile of samples every
+    /// 100 ms, in seconds.
+    pub behind_p99: f64,
+    /// The settle after the run: its time, and the rows it folded.
+    pub settle_secs: f64,
+    pub settled_rows: i64,
+}
+
+/// The 99th percentile of `v`.
+fn p99(mut v: Vec<f64>) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f64::total_cmp);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+    let i = ((v.len() as f64 * 0.99).ceil() as usize).clamp(1, v.len()) - 1;
+    v[i]
 }
 
 /// The CLI process's metrics, read back for the profile; none is installed
@@ -173,6 +199,10 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
     let seeded = Instant::now();
     seed(&pool, params).await.map_err(|e| format!("seeding: {e}"))?;
     let seed_secs = seeded.elapsed().as_secs_f64();
+    // The seed's counts, folded before the runs: one large settle.
+    let settling = Instant::now();
+    let seed_fold = crate::counts::settle(&pool).await.map_err(|e| format!("folding the seed's counts: {e}"))?;
+    let seed_fold = (seed_fold, settling.elapsed());
     let writer = full_writer(&pool).await.with_bulk_arm(params.bulk_arm);
     let mut runs = Vec::new();
     let handle = recorder();
@@ -181,18 +211,34 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
         let before = phase_sums(handle.as_ref());
         // What the database waits on, sampled while the run goes.
         let tally = std::sync::Arc::new(crate::db::waits::WaitTally::default());
+        // The counts folder runs beside the lanes, as in serve.
+        let status = std::sync::Arc::new(crate::counts::FoldStatus::new(Duration::from_millis(cfg.file.counts.fold_interval_ms)));
+        let folder = crate::counts::Folder::new(pool.clone(), &cfg.file.counts, std::sync::Arc::clone(&status)).spawn();
+        let behind = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sampling = {
-            let (pool, tally) = (pool.clone(), std::sync::Arc::clone(&tally));
+            let (pool, tally, status, behind) = (pool.clone(), std::sync::Arc::clone(&tally), std::sync::Arc::clone(&status), std::sync::Arc::clone(&behind));
             tokio::spawn(async move {
                 loop {
                     let _ = crate::db::waits::sample(&pool, &tally).await;
+                    if let Some(b) = status.view().behind {
+                        behind.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(b.as_secs_f64());
+                    }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             })
         };
         let mut run = apply(&writer, commits, lanes, params.lane_batch).await;
         sampling.abort();
+        folder.abort();
+        let _ = folder.await;
+        let settling = Instant::now();
+        let settled = crate::counts::settle(&pool).await.map_err(|e| format!("folding the run's counts: {e}"))?;
+        let settle_secs = settling.elapsed().as_secs_f64();
         if let Ok(run) = &mut run {
+            #[allow(clippy::cast_precision_loss)]
+            let per_sec = status.folded() as f64 / run.secs.max(1e-9);
+            let samples = std::mem::take(&mut *behind.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+            run.counts = Some(FolderRun { per_sec, behind_p99: p99(samples), settle_secs, settled_rows: settled.folded() });
             let after = phase_sums(handle.as_ref());
             let n = f64::from(run.commits.max(1));
             run.phases = crate::firehose::writer::Phase::ALL
@@ -212,7 +258,15 @@ async fn check_in(cfg: &AppConfig, scratch: &str, params: &Params, input: Option
     let size: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database())").fetch_one(&pool).await.map_err(|e| e.to_string())?;
     pool.close().await;
     let last = last_result(input.as_ref(), &runs);
-    Ok((words(params, input, &runs, seed_secs, size, range.slowest), last))
+    let mut report = words(params, input, &runs, seed_secs, size, range.slowest);
+    let _ = writeln!(
+        report,
+        "The seed's counts: {} log rows folded in one settle of {} slices, {:.1} s.",
+        seed_fold.0.folded(),
+        seed_fold.0.slices.max(seed_fold.0.tag_slices),
+        seed_fold.1.as_secs_f64()
+    );
+    Ok((report, last))
 }
 
 /// The `worker_state` key of the last full-check's result.
@@ -470,7 +524,7 @@ async fn apply(writer: &Writer, commits: Vec<Synthetic>, lanes: u32, batch: u32)
         retries += t.await.map_err(|e| e.to_string())??;
     }
     let secs = started.elapsed().as_secs_f64();
-    Ok(LaneRun { lanes, commits: total, secs, per_sec: f64::from(total) / secs.max(1e-9), retries, phases: Vec::new(), waits: Vec::new() })
+    Ok(LaneRun { lanes, commits: total, secs, per_sec: f64::from(total) / secs.max(1e-9), retries, phases: Vec::new(), waits: Vec::new(), counts: None })
 }
 
 fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, size: i64, range: Duration) -> String {
@@ -510,6 +564,13 @@ fn words(p: &Params, input: Option<Input>, runs: &[LaneRun], seed_secs: f64, siz
             #[allow(clippy::cast_precision_loss)]
             let waits: Vec<String> = r.waits.iter().filter(|(_, n)| *n > 0).map(|(c, n)| format!("{} {:.0} %", c.as_str(), *n as f64 * 100.0 / total as f64)).collect();
             let _ = writeln!(out, "    database sessions: {}", waits.join(", "));
+        }
+        if let Some(c) = r.counts {
+            let _ = writeln!(
+                out,
+                "    counts folder: {:.0} changes a second, behind {:.1} s at p99; the settle after the run folded {} rows in {:.2} s",
+                c.per_sec, c.behind_p99, c.settled_rows, c.settle_secs
+            );
         }
     }
     if let Some(n) = need {
@@ -571,6 +632,7 @@ mod tests {
         };
         let likes: i64 = sqlx::query_scalar("SELECT count(*) FROM likes").fetch_one(&db.pool).await.expect("likes");
         assert_eq!(likes, 3000);
+        crate::counts::before_read(&db.pool).await;
         let counted: Option<i64> = sqlx::query_scalar("SELECT sum(like_count)::bigint FROM post_counts").fetch_one(&db.pool).await.expect("counts");
         assert!(counted.unwrap_or(0) > 0, "the triggers counted the seeded likes");
         for (i, lanes) in [1u32, 4].into_iter().enumerate() {
@@ -584,11 +646,12 @@ mod tests {
             .await
             .expect("viral");
         assert!(viral >= 2 * 56, "the viral post took its share of likes: {viral}");
-        let text = words(&p, Some(Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: vec![("commit".into(), 0.002)], waits: vec![(crate::db::waits::WaitClass::Wal, 3)] }], 1.0, 1_000_000, Duration::from_millis(5));
+        let text = words(&p, Some(Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: vec![("commit".into(), 0.002)], waits: vec![(crate::db::waits::WaitClass::Wal, 3)], counts: Some(FolderRun { per_sec: 1200.0, behind_p99: 1.4, settle_secs: 0.2, settled_rows: 30 }) }], 1.0, 1_000_000, Duration::from_millis(5));
         assert!(text.contains("about 50 a second need applying") && text.contains("writer_lanes = 4 or more"), "{text}");
         assert!(text.contains("lane time per commit: commit 2.00 ms") && text.contains("database sessions: wal 100 %"), "{text}");
+        assert!(text.contains("counts folder: 1200 changes a second, behind 1.4 s at p99; the settle after the run folded 30 rows in 0.20 s"), "{text}");
         // The kept result reads back as a sentence.
-        let last = last_result(Some(&Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 1, commits: 400, secs: 10.0, per_sec: 40.0, retries: 0, phases: Vec::new(), waits: Vec::new() }, LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: Vec::new(), waits: Vec::new() }]);
+        let last = last_result(Some(&Input { per_sec: 100.0, unique_share: 0.5, sampled: 10 }), &[LaneRun { lanes: 1, commits: 400, secs: 10.0, per_sec: 40.0, retries: 0, phases: Vec::new(), waits: Vec::new(), counts: None }, LaneRun { lanes: 4, commits: 400, secs: 1.0, per_sec: 400.0, retries: 0, phases: Vec::new(), waits: Vec::new(), counts: None }]);
         let sentence = last_sentence(&last);
         assert!(sentence.contains("1 lanes 40/s, 4 lanes 400/s") && sentence.contains("about 50 a second needed") && sentence.contains("advice: 4 lanes or more"), "{sentence}");
         db.drop_db().await;

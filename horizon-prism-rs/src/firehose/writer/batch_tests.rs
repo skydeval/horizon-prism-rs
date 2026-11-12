@@ -1,8 +1,8 @@
-//! Batched writer transactions and deferred counts: a batch's counts equal
-//! the same commits' one transaction at a time; a deferring transaction
-//! that does not apply its counts still counts them at commit; two
-//! transactions that touch hot rows in opposite orders do not deadlock once
-//! counts are deferred (and do without); a commit that can change the scope
+//! Batched writer transactions and logged counts: a batch's counts equal
+//! the same commits' one transaction at a time; a rolled-back savepoint or
+//! batch leaves no log row and a re-applied batch logs nothing; two
+//! transactions that like hot posts in opposite orders lock no count row
+//! and wait on nothing of each other's; a commit that can change the scope
 //! sets runs alone; a failure inside a batch commits none of it.
 
 use std::sync::Arc;
@@ -133,8 +133,10 @@ async fn apply_all(w: &Writer, items: &[LiveCommit<'_>], max: usize) -> usize {
     calls
 }
 
-/// Every count table's rows by natural key, all-zero rows left out.
+/// Every count table's rows by natural key, all-zero rows left out, after
+/// a settle.
 async fn counts(pool: &PgPool) -> (Vec<(String, String, i32, i32, i32, i32)>, Vec<(String, i32, i32, i32)>, Vec<(String, i32, i32, i32, i32)>) {
+    crate::counts::before_read(pool).await;
     let posts: Vec<(String, String, i32, i32, i32, i32)> = sqlx::query_as(
         "SELECT d.did, c.rkey::text, c.like_count, c.repost_count, c.reply_count, c.quote_count FROM post_counts c JOIN dids d ON d.id = c.author \
          WHERE c.like_count + c.repost_count + c.reply_count + c.quote_count > 0 ORDER BY 1, 2",
@@ -160,7 +162,7 @@ async fn counts(pool: &PgPool) -> (Vec<(String, String, i32, i32, i32, i32)>, Ve
 
 /// Counts after one batch equal counts after the same commits one
 /// transaction each; a like, unlike and like again by one account moves
-/// the count by one; nothing is left in the deltas or counted as left.
+/// the count by one; nothing is left in the log after a settle.
 #[tokio::test]
 async fn counts_after_a_batch_equal_counts_after_the_same_commits_one_at_a_time() {
     let Some(one) = fresh_db("batch_counts_one").await else {
@@ -185,25 +187,31 @@ async fn counts_after_a_batch_equal_counts_after_the_same_commits_one_at_a_time(
     assert_eq!((a_actor.1, a_actor.3), (2, 1), "two posts, one follower after the unfollow");
     assert!(a.2.iter().any(|t| t.0 == "batchtag" && t.1 == 3 && t.2 == 3 && t.3 == 1 && t.4 == 1), "{:?}", a.2);
     for db in [&one, &batched] {
-        let left: Option<Value> = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'writer_counts_left'").fetch_optional(&db.pool).await.expect("left");
-        assert_eq!(left, None, "every writer transaction applied its own counts");
+        assert_eq!(log_rows(&db.pool).await, 0, "the settle left nothing in the log");
     }
     one.drop_db().await;
     batched.drop_db().await;
 }
 
-/// A transaction that defers and never applies still counts at commit, and
-/// counts it; a rolled-back savepoint takes its deltas with it; a session
-/// that only sets the flag, with no deltas table, counts at once.
+/// Rows of the count log, both tables.
+async fn log_rows(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT (SELECT count(*) FROM count_log) + (SELECT count(*) FROM count_log_tags)").fetch_one(pool).await.expect("log rows")
+}
+
+/// A rolled-back savepoint and a rolled-back batch leave no log rows; a
+/// committed like logs one row and touches no count row until the fold; a
+/// re-applied committed batch logs nothing.
 #[tokio::test]
-async fn a_deferring_transaction_that_does_not_apply_its_counts_still_counts() {
-    let Some(db) = fresh_db("batch_counts_left").await else {
+async fn rolled_back_writes_leave_no_log_rows_and_a_reapplied_batch_logs_nothing() {
+    let Some(db) = fresh_db("batch_counts_log").await else {
         return;
     };
     let p = &db.pool;
     let w = writer(p).await;
     let corpus = corpus();
     apply_all(&w, &items(&corpus[..4]), 1).await;
+    crate::counts::settle(p).await.expect("settle");
+    let lag = hooks::arm(hooks::COUNTS_LAG, db.name());
     let ids = w.ids().account_ids(&[A.to_string(), B.to_string(), C.to_string()]).await.expect("ids");
     let (a, b, c) = (ids[A], ids[B], ids[C]);
     let post1 = crate::db::ids::rkey_value(&tid(1)).expect("tid");
@@ -217,48 +225,43 @@ async fn a_deferring_transaction_that_does_not_apply_its_counts_still_counts() {
             .bind(a)
             .bind(post1)
     };
-    // Deferred, a rolled-back savepoint, and no apply: counted at commit.
-    let mut conn = p.acquire().await.expect("conn");
-    let mut tx = conn.begin().await.expect("begin");
-    sqlx::query("SELECT prism_defer_counts()").execute(&mut *tx).await.expect("defer");
+    let mut tx = p.begin().await.expect("begin");
     let mut sp = tx.begin().await.expect("savepoint");
     insert_like(c, 900).execute(&mut *sp).await.expect("like");
     sp.rollback().await.expect("rollback");
     insert_like(b, 901).execute(&mut *tx).await.expect("like");
-    assert_eq!(like_count().await, 0, "the deferring transaction touched no count row");
-    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_temp.prism_count_deltas").fetch_one(&mut *tx).await.expect("deltas");
-    assert_eq!(pending, 1, "the rolled-back like took its delta with it");
+    let pending: i64 = sqlx::query_scalar("SELECT count(*) FROM count_log WHERE kind = 1").fetch_one(&mut *tx).await.expect("log");
+    assert_eq!(pending, 1, "the rolled-back like took its log row with it");
     tx.commit().await.expect("commit");
-    assert_eq!(like_count().await, 1);
-    let left: Option<Value> = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'writer_counts_left'").fetch_optional(p).await.expect("left");
-    assert_eq!(left, Some(json!(1)), "the commit counted the counts it found left");
-    // Applied: nothing left at commit, and a later statement counts at once.
-    let mut tx = conn.begin().await.expect("begin");
-    sqlx::query("SELECT prism_defer_counts()").execute(&mut *tx).await.expect("defer");
+    assert_eq!(like_count().await, 0, "the trigger touched no count row");
+    let committed = log_rows(p).await;
+    let mut tx = p.begin().await.expect("begin");
     insert_like(c, 902).execute(&mut *tx).await.expect("like");
-    sqlx::query("SELECT prism_apply_counts()").execute(&mut *tx).await.expect("apply");
-    insert_like(c, 903).execute(&mut *tx).await.expect("like after the apply");
-    tx.commit().await.expect("commit");
-    assert_eq!(like_count().await, 2, "C counts once, however many likes");
-    let left: Option<Value> = sqlx::query_scalar("SELECT value FROM worker_state WHERE key = 'writer_counts_left'").fetch_optional(p).await.expect("left");
-    assert_eq!(left, Some(json!(1)));
-    drop(conn);
-    // A fresh session with the flag and no table: counted at once.
-    let mut other = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
-    let mut tx = other.begin().await.expect("begin");
-    sqlx::query("SET LOCAL prism.defer_counts = on").execute(&mut *tx).await.expect("flag");
-    sqlx::query("DELETE FROM likes WHERE author = $1 AND rkey = 901").bind(b).execute(&mut *tx).await.expect("unlike");
-    tx.commit().await.expect("commit");
-    assert_eq!(like_count().await, 1);
+    tx.rollback().await.expect("rollback");
+    assert_eq!(log_rows(p).await, committed, "a rolled-back transaction logs nothing");
+    crate::counts::settle(p).await.expect("settle");
+    assert_eq!((like_count().await, log_rows(p).await), (1, 0));
+    // A failed batch logs nothing; the same batch applied, then applied
+    // again (a crash after commit, before the ack), logs once.
+    let rest = items(&corpus[4..]);
+    let failing = hooks::arm_times(hooks::WRITER_FAIL_IN_BATCH, &format!("{}/{C}", db.name()), 1);
+    assert!(w.apply_batch(&rest, 64).await.is_err());
+    drop(failing);
+    assert_eq!(log_rows(p).await, 0, "the rolled-back batch's log rows went with it");
+    assert_eq!(apply_all(&w, &rest, 64).await, 1);
+    let logged = log_rows(p).await;
+    assert!(logged > 0);
+    assert_eq!(apply_all(&w, &rest, 64).await, 1);
+    assert_eq!(log_rows(p).await, logged, "the re-applied batch changed no row, so it logged nothing");
+    drop(lag);
     db.drop_db().await;
 }
 
-/// Two transactions like hot posts P and Q in opposite orders. Deferred,
-/// neither waits on the other's count rows until it applies, sorted: both
-/// commit and the counts are right. Not deferred, the same interleaving
-/// deadlocks, so the test bites.
+/// Two transactions like hot posts P and Q in opposite orders. Neither
+/// locks a count row, so neither waits on the other: both commit in either
+/// order, no deadlock, and the counts are right after a settle.
 #[tokio::test]
-async fn opposite_orders_on_hot_rows_do_not_deadlock_once_counts_are_deferred() {
+async fn opposite_orders_on_hot_posts_lock_no_count_row() {
     let Some(db) = fresh_db("batch_hot_rows").await else {
         return;
     };
@@ -269,10 +272,7 @@ async fn opposite_orders_on_hot_rows_do_not_deadlock_once_counts_are_deferred() 
     let ids = w.ids().account_ids(&[A.to_string(), B.to_string(), C.to_string()]).await.expect("ids");
     let (a, b, c) = (ids[A], ids[B], ids[C]);
     let (pp, qq) = (crate::db::ids::rkey_value(&tid(1)).expect("tid"), crate::db::ids::rkey_value(&tid(2)).expect("tid"));
-    // Rows for both posts exist, so the immediate triggers update them.
     sqlx::query("INSERT INTO post_counts (author, rkey) VALUES ($1, $2), ($1, $3) ON CONFLICT DO NOTHING").bind(a).bind(pp).bind(qq).execute(p).await.expect("rows");
-    // Too old for the trend tallies, so the count rows are the only rows
-    // the two transactions share.
     let like = |author: i32, rkey: i64, subject: i64| {
         sqlx::query("INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES ($1, $2, $3, 1, $4, 1, now() - interval '30 days')")
             .bind(author)
@@ -280,59 +280,22 @@ async fn opposite_orders_on_hot_rows_do_not_deadlock_once_counts_are_deferred() 
             .bind(a)
             .bind(subject)
     };
-    for (round, defer) in [(0i64, true), (1, false)] {
-        let mut c1 = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
-        let mut c2 = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
-        sqlx::query("SET deadlock_timeout = '100ms'").execute(&mut c1).await.expect("timeout");
-        sqlx::query("SET deadlock_timeout = '100ms'").execute(&mut c2).await.expect("timeout");
-        let mut t1 = c1.begin().await.expect("begin");
-        let mut t2 = c2.begin().await.expect("begin");
-        if defer {
-            sqlx::query("SELECT prism_defer_counts()").execute(&mut *t1).await.expect("defer");
-            sqlx::query("SELECT prism_defer_counts()").execute(&mut *t2).await.expect("defer");
-        }
-        let k = 1000 + round * 10;
-        like(b, k, pp).execute(&mut *t1).await.expect("b likes P");
-        like(c, k + 1, qq).execute(&mut *t2).await.expect("c likes Q");
-        let second = async {
-            let r = like(b, k + 2, qq).execute(&mut *t1).await;
-            match r {
-                Ok(_) => sqlx::query("SELECT prism_apply_counts()").execute(&mut *t1).await.map(|_| ()),
-                Err(e) => Err(e),
-            }
-        };
-        let other = async {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let r = like(c, k + 3, pp).execute(&mut *t2).await;
-            match r {
-                Ok(_) => sqlx::query("SELECT prism_apply_counts()").execute(&mut *t2).await.map(|_| ()),
-                Err(e) => Err(e),
-            }
-        };
-        // Deferred, t2's apply waits for t1's rows: t1 commits first.
-        let (r1, r2) = if defer {
-            let r1 = second.await;
-            let commit1 = async {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                t1.commit().await
-            };
-            let (r2, c1r) = tokio::join!(other, commit1);
-            c1r.expect("t1 commits");
-            (r1, r2)
-        } else {
-            tokio::join!(second, other)
-        };
-        let deadlocked = [&r1, &r2].iter().any(|r| matches!(r, Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("40P01")));
-        if defer {
-            assert!(r1.is_ok() && r2.is_ok(), "deferred: {r1:?} {r2:?}");
-            t2.commit().await.expect("t2 commits");
-            let counts: (i32,) = sqlx::query_as("SELECT like_count FROM post_counts WHERE author = $1 AND rkey = $2").bind(a).bind(pp).fetch_one(p).await.expect("count");
-            let counts_q: (i32,) = sqlx::query_as("SELECT like_count FROM post_counts WHERE author = $1 AND rkey = $2").bind(a).bind(qq).fetch_one(p).await.expect("count");
-            assert_eq!((counts.0, counts_q.0), (2, 2), "both accounts like both posts");
-        } else {
-            assert!(deadlocked, "immediate counts deadlock in this order: {r1:?} {r2:?}");
-        }
-    }
+    let mut c1 = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
+    let mut c2 = sqlx::PgConnection::connect_with(&p.connect_options()).await.expect("connect");
+    let mut t1 = c1.begin().await.expect("begin");
+    let mut t2 = c2.begin().await.expect("begin");
+    like(b, 1000, pp).execute(&mut *t1).await.expect("b likes P");
+    like(c, 1001, qq).execute(&mut *t2).await.expect("c likes Q");
+    tokio::time::timeout(Duration::from_secs(5), like(b, 1002, qq).execute(&mut *t1)).await.expect("no wait").expect("b likes Q");
+    tokio::time::timeout(Duration::from_secs(5), like(c, 1003, pp).execute(&mut *t2)).await.expect("no wait").expect("c likes P");
+    let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *t1).await.expect("pid");
+    let locked = crate::test_support::locked_relations(p, pid).await;
+    assert!(!locked.iter().any(|r| r == "post_counts"), "the writer holds no lock on a count row: {locked:?}");
+    t2.commit().await.expect("t2 commits");
+    t1.commit().await.expect("t1 commits");
+    crate::counts::settle(p).await.expect("settle");
+    let count = |k: i64| sqlx::query_scalar::<_, i32>("SELECT like_count FROM post_counts WHERE author = $1 AND rkey = $2").bind(a).bind(k).fetch_one(p);
+    assert_eq!((count(pp).await.expect("P"), count(qq).await.expect("Q")), (2, 2), "both accounts like both posts");
     db.drop_db().await;
 }
 
@@ -496,6 +459,7 @@ fn equivalence_items(corpus: &[Commit]) -> Vec<LiveCommit<'_>> {
 /// `dids.did`; generated serials and clock columns left out (`id`,
 /// `indexed_at`, `deleted_at`, `next_at`, `updated_at`).
 async fn tables(pool: &PgPool) -> Vec<(String, Vec<String>)> {
+    crate::counts::before_read(pool).await;
     let queries: [(&str, &str); 14] = [
         ("likes", "SELECT concat_ws('|', da.did, l.rkey, ds.did, l.subj_coll, l.subj_rkey, encode(l.subj_cid, 'hex'), l.rev, l.created_at, dv.did, l.via_coll, l.via_rkey) FROM likes l JOIN dids da ON da.id = l.author LEFT JOIN dids ds ON ds.id = l.subj_author LEFT JOIN dids dv ON dv.id = l.via_author"),
         ("reposts", "SELECT concat_ws('|', da.did, l.rkey, ds.did, l.subj_coll, l.subj_rkey, l.rev, l.created_at, dv.did, l.via_coll) FROM reposts l JOIN dids da ON da.id = l.author LEFT JOIN dids ds ON ds.id = l.subj_author LEFT JOIN dids dv ON dv.id = l.via_author"),

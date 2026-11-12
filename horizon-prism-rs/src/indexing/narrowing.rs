@@ -105,7 +105,7 @@ const TRUNCATE: &str = "TRUNCATE ";
 
 /// A step that empties `table` whole.
 fn truncate(table: &'static str) -> Step {
-    Step { table, sql: format!("{TRUNCATE}{table}"), candidates: None, bind: Bind::None }
+    Step { table, sql: format!("{TRUNCATE}{table}"), candidates: None, bind: Bind::None, counts: false }
 }
 
 /// How a trial's exit empties `full_labels`.
@@ -257,7 +257,7 @@ pub const FULL_DRAIN_STEP_NAMES: [&str; 20] = [
 
 /// A trial's narrowing: the narrowing's steps, with the trial's profiles
 /// cleared after the identity rows.
-pub const TRIAL_STEP_NAMES: [&str; 39] = [
+pub const TRIAL_STEP_NAMES: [&str; 40] = [
     "posts",
     "post_search",
     "likes",
@@ -282,6 +282,7 @@ pub const TRIAL_STEP_NAMES: [&str; 39] = [
     "actors",
     TRIAL_PROFILES,
     "actor_counts",
+    TRIAL_ZERO_ACCOUNTS,
     "constellation_counts",
     "record_tombstones",
     "did_cache",
@@ -303,13 +304,14 @@ pub const TRIAL_STEP_NAMES: [&str; 39] = [
 /// cleared after the identity rows, and the count rows and trend hours the
 /// drain's deletes left at zero removed (the drain's own tables leave them
 /// to their triggers).
-pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 24] = [
+pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 25] = [
     "post_search",
     "blocks",
     "actor_self_records",
     "actors",
     TRIAL_PROFILES,
     "actor_counts",
+    TRIAL_ZERO_ACCOUNTS,
     TRIAL_ZERO_COUNTS,
     TRIAL_ZERO_TRENDS,
     TRIAL_ADDED_TRENDS,
@@ -334,6 +336,8 @@ pub const TRIAL_FULL_DRAIN_STEP_NAMES: [&str; 24] = [
 pub const TRIAL_PROFILES: &str = "trial_profiles";
 /// The step that removes count rows the trial's removed rows left at zero.
 pub const TRIAL_ZERO_COUNTS: &str = "trial_zero_counts";
+/// The step that removes the record's accounts' counts that are all zero.
+pub const TRIAL_ZERO_ACCOUNTS: &str = "trial_zero_accounts";
 /// The step that removes trend hours the trial's removed rows left at zero.
 pub const TRIAL_ZERO_TRENDS: &str = "trial_zero_trends";
 /// The step that removes trend rows outside a kryphocron_only trial's
@@ -368,49 +372,74 @@ fn trial_steps(labels: LabelsExit) -> Vec<Step> {
     let profiles = super::trial::TrialTable::Actors.code();
     let account = did_of("ac.id");
     let mut out = vec![
+        // The trial's accounts' counts with no source left go with their
+        // pending log rows (a key deleter).
         Step {
             table: "actor_counts",
-            sql: format!(
-                "DELETE FROM actor_counts WHERE id IN (SELECT ac.id FROM actor_counts ac \
-                   JOIN (SELECT a AS id FROM full_trial_rows UNION SELECT s_a FROM full_trial_rows WHERE s_a IS NOT NULL) r ON r.id = ac.id \
-                 WHERE (ac.followers_count = 0 AND ac.follows_count = 0 AND ac.posts_count = 0) \
-                    OR (NOT {} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id) \
-                   AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.subject = ac.id) AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author = ac.id) \
-                   AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = ac.id)) LIMIT {BATCH_SIZE})",
-                kept(&account)
+            sql: crate::db::retention::key_delete_sql(
+                "actor_counts",
+                &format!(
+                    "SELECT ac.id FROM actor_counts ac \
+                       JOIN (SELECT a AS id FROM full_trial_rows UNION SELECT s_a FROM full_trial_rows WHERE s_a IS NOT NULL) r ON r.id = ac.id \
+                     WHERE NOT {} AND NOT EXISTS (SELECT 1 FROM actors x WHERE x.id = ac.id) \
+                       AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.subject = ac.id) AND NOT EXISTS (SELECT 1 FROM follows x WHERE x.author = ac.id) \
+                       AND NOT EXISTS (SELECT 1 FROM posts x WHERE x.author = ac.id) LIMIT {BATCH_SIZE}",
+                    kept(&account)
+                ),
             ),
             candidates: None,
             bind: Bind::None,
+            counts: true,
+        },
+        // Their counts all back at zero, with no change pending, go
+        // whatever else holds the account (a value deleter).
+        Step {
+            table: TRIAL_ZERO_ACCOUNTS,
+            sql: format!(
+                "DELETE FROM actor_counts WHERE id IN (SELECT ac.id FROM actor_counts ac \
+                   JOIN (SELECT a AS id FROM full_trial_rows UNION SELECT s_a FROM full_trial_rows WHERE s_a IS NOT NULL) r ON r.id = ac.id \
+                 WHERE ac.followers_count = 0 AND ac.follows_count = 0 AND ac.posts_count = 0 \
+                   AND NOT EXISTS (SELECT 1 FROM count_log l WHERE l.kind BETWEEN 5 AND 7 AND l.a = ac.id) LIMIT {BATCH_SIZE})"
+            ),
+            candidates: None,
+            bind: Bind::None,
+            counts: true,
         },
         Step {
             table: TRIAL_ZERO_COUNTS,
+            counts: true,
             ..batched_composite(
                 "post_counts",
                 &["author", "rkey"],
                 "pc",
-                "pc.like_count = 0 AND pc.repost_count = 0 AND pc.reply_count = 0 AND pc.quote_count = 0",
+                "pc.like_count = 0 AND pc.repost_count = 0 AND pc.reply_count = 0 AND pc.quote_count = 0 \
+                 AND NOT EXISTS (SELECT 1 FROM count_log l WHERE l.kind BETWEEN 1 AND 4 AND l.a = pc.author AND l.b = pc.rkey)",
                 Bind::None,
             )
         },
         Step {
             table: TRIAL_ZERO_TRENDS,
+            counts: true,
             ..batched_composite(
                 "tag_activity_hourly",
                 &["tag", "hour"],
                 "ta",
-                "ta.posts <= 0 AND ta.likes <= 0 AND ta.reposts <= 0 AND ta.replies <= 0",
+                "ta.posts <= 0 AND ta.likes <= 0 AND ta.reposts <= 0 AND ta.replies <= 0 \
+                 AND NOT EXISTS (SELECT 1 FROM count_log_tags l WHERE l.tag = ta.tag AND l.hour = ta.hour)",
                 Bind::None,
             )
         },
+        // Trend rows outside the baseline's keys go with their pending log
+        // rows (a key deleter).
         Step {
             table: TRIAL_ADDED_TRENDS,
-            sql: format!(
-                "DELETE FROM tag_activity_hourly WHERE (tag, hour) IN (SELECT ta.tag, ta.hour FROM tag_activity_hourly ta \
-                 WHERE {} LIMIT {BATCH_SIZE})",
-                super::trial::TREND_ROW_ADDED
+            sql: crate::db::retention::key_delete_sql(
+                "tag_activity_hourly",
+                &format!("SELECT ta.tag, ta.hour FROM tag_activity_hourly ta WHERE {} LIMIT {BATCH_SIZE}", super::trial::TREND_ROW_ADDED),
             ),
             candidates: None,
             bind: Bind::None,
+            counts: true,
         },
         Step {
             table: "record_tombstones",
@@ -420,6 +449,7 @@ fn trial_steps(labels: LabelsExit) -> Vec<Step> {
             ),
             candidates: None,
             bind: Bind::None,
+            counts: false,
         },
         batched_composite("relay_account_status", &["account", "relay"], "ras", "TRUE", Bind::None),
         Step {
@@ -434,6 +464,7 @@ fn trial_steps(labels: LabelsExit) -> Vec<Step> {
             ),
             candidates: None,
             bind: Bind::None,
+            counts: false,
         },
     ];
     if labels == LabelsExit::Delete {
@@ -486,8 +517,14 @@ impl PublicIndexing {
         };
         let labels = if matches!(list, SweepList::TrialNarrowing | SweepList::TrialFull) { self.trial_labels_exit().await } else { LabelsExit::Truncate };
         let steps = steps(list, private, labels);
+        let mut settled = false;
         for i in start..steps.len() {
             let step = &steps[i];
+            // The count steps run after a settle, once.
+            if step.counts && !settled {
+                crate::counts::settle_or_go_on(&self.pool, "the sweep of counts").await;
+                settled = true;
+            }
             loop {
                 match self.run_step(generation, step).await {
                     Ok(Some(deleted)) => {
@@ -570,7 +607,16 @@ impl PublicIndexing {
                 if guard.public.generation != generation {
                     return Ok(None);
                 }
-                let n = bound(sqlx::query(&step.sql), &step.bind).execute(&self.pool).await?.rows_affected();
+                let n = if step.counts {
+                    // Its own short transaction, the counts lock first.
+                    let mut tx = self.pool.begin().await?;
+                    crate::counts::lock(&mut tx).await?;
+                    let n = bound(sqlx::query(&step.sql), &step.bind).execute(&mut *tx).await?.rows_affected();
+                    tx.commit().await?;
+                    n
+                } else {
+                    bound(sqlx::query(&step.sql), &step.bind).execute(&self.pool).await?.rows_affected()
+                };
                 drop(guard);
                 total += n;
                 if n < BATCH_SIZE {
@@ -603,6 +649,9 @@ impl PublicIndexing {
                     }
                     let mut tx = self.pool.begin().await?;
                     sqlx::query(LOCK_DID_SQL).bind(did).execute(&mut *tx).await?;
+                    if step.counts {
+                        crate::counts::lock(&mut tx).await?;
+                    }
                     let n = bound(sqlx::query(&step.sql), &step.bind).bind(did).execute(&mut *tx).await?.rows_affected();
                     tx.commit().await?;
                     drop(guard);
@@ -713,5 +762,45 @@ mod tests {
         for s in scope_steps(Vec::new()) {
             assert!(!s.sql.contains(super::super::full::SINCE_KEY), "{}", s.table);
         }
+    }
+
+    /// A trial exit's value deleters: a count row or trend hour at zero is
+    /// removed only when no change of its key is pending in the log; the
+    /// pending one is kept, so the fold's later change is not lost.
+    #[tokio::test]
+    async fn zero_rows_with_a_pending_change_are_kept() {
+        let Some(db) = crate::test_support::fresh_db("narrowing_zero_pending").await else {
+            return;
+        };
+        let p = &db.pool;
+        let lag = crate::test_support::hooks::arm(crate::test_support::hooks::COUNTS_LAG, db.name());
+        let ids = crate::db::ids::Ids::new(p.clone()).account_ids(&[super::super::full_check::seeded_did(1), super::super::full_check::seeded_did(2)]).await.expect("ids");
+        let (a, fan) = (ids[&super::super::full_check::seeded_did(1)], ids[&super::super::full_check::seeded_did(2)]);
+        sqlx::query("INSERT INTO post_counts (author, rkey) VALUES ($1, 1), ($1, 2)").bind(a).execute(p).await.expect("zero rows");
+        sqlx::query("INSERT INTO tag_activity_hourly (tag, hour) VALUES ('zerotag', date_trunc('hour', now())), ('pendtag', date_trunc('hour', now()))").execute(p).await.expect("zero hours");
+        sqlx::query("INSERT INTO likes (author, rkey, subj_author, subj_coll, subj_rkey, rev, created_at) VALUES ($1, 9, $2, 1, 2, 1, now() - interval '30 days')")
+            .bind(fan)
+            .bind(a)
+            .execute(p)
+            .await
+            .expect("pending like");
+        sqlx::query("INSERT INTO count_log_tags (tag, hour, dposts, dlikes, dreposts, dreplies) VALUES ('pendtag', date_trunc('hour', now()), 1, 0, 0, 0)").execute(p).await.expect("pending tag");
+        for name in [TRIAL_ZERO_COUNTS, TRIAL_ZERO_TRENDS] {
+            let step = steps(SweepList::TrialNarrowing, Vec::new(), LabelsExit::Truncate).into_iter().find(|s| s.table == name).expect("step");
+            assert!(step.counts, "{name} takes the counts lock");
+            let mut tx = p.begin().await.expect("begin");
+            crate::counts::lock(&mut tx).await.expect("lock");
+            sqlx::query(&step.sql).execute(&mut *tx).await.expect("step");
+            tx.commit().await.expect("commit");
+        }
+        let rows: Vec<i64> = sqlx::query_scalar("SELECT rkey FROM post_counts ORDER BY rkey").fetch_all(p).await.expect("rows");
+        assert_eq!(rows, [2], "the zero row with a pending like stays");
+        let tags: Vec<String> = sqlx::query_scalar("SELECT tag FROM tag_activity_hourly ORDER BY tag").fetch_all(p).await.expect("tags");
+        assert_eq!(tags, ["pendtag"]);
+        crate::counts::settle(p).await.expect("settle");
+        let n: i32 = sqlx::query_scalar("SELECT like_count FROM post_counts WHERE author = $1 AND rkey = 2").bind(a).fetch_one(p).await.expect("count");
+        assert_eq!(n, 1, "the kept row took its change");
+        drop(lag);
+        db.drop_db().await;
     }
 }

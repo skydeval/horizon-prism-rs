@@ -669,6 +669,7 @@ async fn the_sweep_empties_and_thins_every_table() {
     members(p, &[MEMBER]).await;
     in_scope(p, &[MEMBER, B, D]).await;
     exec(p, &sweep_seed()).await;
+    crate::counts::before_read(p).await;
     for t in TABLES {
         assert!(count(p, &format!("SELECT count(*) FROM {}", t.name)).await > 0, "{} is seeded", t.name);
     }
@@ -720,6 +721,7 @@ async fn the_sweep_empties_and_thins_every_table() {
     }
     assert_eq!(likes_windows, 3, "a kept window did not end the table");
     pi.end_sweep(2).await.expect("end");
+    crate::counts::before_read(p).await;
     for t in ["feed_items", "notifications", "posts", "threadgates", "postgates", "starter_packs", "labeler_services", "nearhorizon_poll_posts", "tag_activity_hourly", "starter_pack_counts"] {
         assert_eq!(count(p, &format!("SELECT count(*) FROM {t}")).await, 0, "{t} is emptied");
     }

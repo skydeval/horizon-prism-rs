@@ -196,6 +196,36 @@ pub(crate) struct Step {
     /// Per-DID steps: the query listing DIDs that have deletable rows.
     pub(crate) candidates: Option<String>,
     pub(crate) bind: Bind,
+    /// The step writes count rows: each batch takes the counts lock first,
+    /// and the job settles the count log before it.
+    pub(crate) counts: bool,
+}
+
+/// A count table's batched delete as a key deleter: the rows `select`
+/// picks (it names the table's key columns) and their keys' pending log
+/// rows, in one statement, as counting at once would have applied the log
+/// rows and then deleted the row.
+pub(crate) fn key_delete_sql(table: &str, select: &str) -> String {
+    let (keys, log) = match table {
+        "post_counts" => ("author, rkey", "DELETE FROM count_log l USING k WHERE l.kind BETWEEN 1 AND 4 AND l.a = k.author AND l.b = k.rkey"),
+        "actor_counts" => ("id", "DELETE FROM count_log l USING k WHERE l.kind BETWEEN 5 AND 7 AND l.a = k.id"),
+        _ => ("tag, hour", "DELETE FROM count_log_tags l USING k WHERE l.tag = k.tag AND l.hour = k.hour"),
+    };
+    format!("WITH k AS MATERIALIZED ({select}), lg AS ({log}) DELETE FROM {table} WHERE ({keys}) IN (SELECT {keys} FROM k)")
+}
+
+/// Whether `table` is a count table the count log's folder writes.
+#[must_use]
+pub(crate) fn is_count_table(table: &str) -> bool {
+    matches!(table, "post_counts" | "actor_counts" | "tag_activity_hourly")
+}
+
+/// `step` as a key deleter of its count table: `select` (its key columns
+/// from the step's own predicate) is deleted with its pending log rows.
+fn counted(mut step: Step, select: &str) -> Step {
+    step.sql = key_delete_sql(step.table, select);
+    step.counts = true;
+    step
 }
 
 const NOT_IN_SCOPE: &str = "NOT EXISTS (SELECT 1 FROM scope_dids s WHERE s.did = {col})";
@@ -241,6 +271,7 @@ pub(crate) fn batched(table: &'static str, key: &str, alias: &str, pred: &str, b
         ),
         candidates: None,
         bind,
+        counts: false,
     }
 }
 
@@ -258,6 +289,7 @@ pub(crate) fn batched_composite(table: &'static str, keys: &[&str], alias: &str,
         ),
         candidates: None,
         bind,
+        counts: false,
     }
 }
 
@@ -274,17 +306,16 @@ fn scoped_ids(table: &'static str, keys: &[&str], alias: &str, from: &str, did_c
 fn scoped_ids_with(table: &'static str, keys: &[&str], alias: &str, from: &str, did_col: &str, pred: &str, bind: Bind) -> Step {
     let selected: Vec<String> = keys.iter().map(|k| format!("{alias}.{k}")).collect();
     let did_param = if matches!(bind, Bind::None) { 1 } else { 2 };
-    Step {
+    let select = format!("SELECT {} FROM {from} WHERE {did_col} = ${did_param} AND {pred} LIMIT {BATCH_SIZE}", selected.join(", "));
+    let step = Step {
         table,
-        sql: format!(
-            "DELETE FROM {table} WHERE ({}) IN (SELECT {} FROM {from} \
-             WHERE {did_col} = ${did_param} AND {pred} LIMIT {BATCH_SIZE})",
-            keys.join(", "),
-            selected.join(", ")
-        ),
+        sql: format!("DELETE FROM {table} WHERE ({}) IN ({select})", keys.join(", ")),
         candidates: Some(format!("SELECT DISTINCT {did_col} AS did FROM {from} WHERE {pred} LIMIT {CANDIDATE_PAGE}")),
         bind,
-    }
+        counts: false,
+    };
+    // A count table's rows go with their pending log rows.
+    if is_count_table(table) { counted(step, &select) } else { step }
 }
 
 /// [`scoped_ids`] for `follows` or `blocks`, keyed by `(author, rkey)`. Rows name
@@ -493,12 +524,12 @@ fn time_steps(settings: &RetentionSettings) -> Vec<Step> {
             days(settings.notification_days),
         ),
         // Trend aggregates: hours past the aggregate's retention (§7.5).
-        batched(
-            "tag_activity_hourly",
-            "ctid",
-            "ta",
-            &format!("ta.hour < now() - make_interval(hours => {})", settings.trend_aggregate_hours),
-            Bind::None,
+        counted(
+            batched_composite("tag_activity_hourly", &["tag", "hour"], "ta", "TRUE", Bind::None),
+            &format!(
+                "SELECT ta.tag, ta.hour FROM tag_activity_hourly ta WHERE ta.hour < now() - make_interval(hours => {}) LIMIT {BATCH_SIZE}",
+                settings.trend_aggregate_hours
+            ),
         ),
         batched(
             "constellation_counts",
@@ -616,7 +647,19 @@ pub(crate) async fn run_batch(pool: &PgPool, scope: &dyn ScopeGuard, step: &Step
         Bind::Days(d) => query.bind(*d),
         Bind::Dids(dids) => query.bind(dids.clone()),
     };
-    let result = query.execute(pool).await;
+    let result = if step.counts {
+        // The counts lock first, then the one count statement.
+        async {
+            let mut tx = pool.begin().await?;
+            crate::counts::lock(&mut tx).await?;
+            let r = query.execute(&mut *tx).await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(r)
+        }
+        .await
+    } else {
+        query.execute(pool).await
+    };
     drop(guard);
     Ok(result?.rows_affected())
 }
@@ -700,6 +743,9 @@ pub(crate) async fn delete_did_rows(
         let guard = scope.read().await;
         let mut tx = pool.begin().await?;
         sqlx::query(LOCK_DID_SQL).bind(did).execute(&mut *tx).await?;
+        if step.counts {
+            crate::counts::lock(&mut tx).await?;
+        }
         let query = sqlx::query::<sqlx::Postgres>(&step.sql);
         let query = match &step.bind {
             Bind::None => query.bind(did),
@@ -728,7 +774,13 @@ pub(crate) async fn run_steps(
     steps: &[Step],
 ) -> Result<RetentionReport, sqlx::Error> {
     let mut report = RetentionReport::default();
+    let mut settled = false;
     for step in steps {
+        // Count steps run after a settle, once per run.
+        if step.counts && !settled {
+            crate::counts::settle_or_go_on(pool, "retention of counts").await;
+            settled = true;
+        }
         let n = run_step(pool, scope, step).await?;
         if n > 0 {
             metrics::counter!(METRIC_DELETED_ROWS, "table" => step.table).increment(n);
@@ -896,7 +948,9 @@ mod tests {
     fn every_step_is_batched_at_ten_thousand() {
         for step in all_steps() {
             assert!(step.sql.contains("LIMIT 10000"), "{}: {}", step.table, step.sql);
-            assert!(step.sql.starts_with(&format!("DELETE FROM {} ", step.table)));
+            // A count table's delete takes its keys' pending log rows too.
+            let prefix = if step.counts { "WITH k AS MATERIALIZED (".to_string() } else { format!("DELETE FROM {} ", step.table) };
+            assert!(step.sql.starts_with(&prefix), "{}: {}", step.table, step.sql);
         }
     }
 

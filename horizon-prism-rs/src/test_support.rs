@@ -317,9 +317,15 @@ pub mod hooks {
     /// Writer lanes: a lane waits before it applies an entry of this repo.
     /// Key: `<database>/<repo>`.
     pub const LANE_BEFORE_ENTRY: &str = "fl_lane_before_entry";
-    /// Batched writes: a writer transaction does not defer its counts.
-    /// Key: `<database>/*`.
-    pub const WRITER_NO_DEFER: &str = "tb_writer_no_defer";
+    /// Counts from the log: a count read does not fold first, so it sees
+    /// counts as far behind as the folder leaves them. Key: the database.
+    pub const COUNTS_LAG: &str = "lc_counts_lag";
+    /// A fold fails after its statement, so its transaction rolls back.
+    /// Key: the database.
+    pub const FOLD_FAILS: &str = "lc_fold_fails";
+    /// A direct writer of count rows, after its settle and before it takes
+    /// the counts lock. Key: the database.
+    pub const COUNTS_AFTER_SETTLE: &str = "lc_counts_after_settle";
     /// Batched writes: a writer transaction fails transiently when it comes
     /// to this repo's commit. Key: `<database>/<repo>`.
     pub const WRITER_FAIL_IN_BATCH: &str = "tb_writer_fail_in_batch";
@@ -752,6 +758,7 @@ pub mod graph {
             .execute(pool)
             .await
             .expect("graph row");
+            crate::counts::before_read(pool).await;
         }
     }
 
@@ -906,6 +913,7 @@ pub mod interactions {
                         .expect("odd ref");
                 }
             }
+            crate::counts::before_read(pool).await;
             self.uri()
         }
     }
@@ -1018,12 +1026,19 @@ pub mod interactions {
         ids.rkey_ids(&keys).await.expect("alias");
     }
 
-    /// Set a post's four counts `(like, repost, reply, quote)`.
+    /// Set a post's four counts `(like, repost, reply, quote)`, as a
+    /// recomputer of counts does: after a settle, under the counts lock,
+    /// the key's pending log rows dropped with the write.
     pub async fn set_post_counts(pool: &PgPool, post: &str, counts: (i32, i32, i32, i32)) {
         intern(pool, &[post]).await;
+        crate::counts::before_read(pool).await;
+        let mut tx = pool.begin().await.expect("begin");
+        crate::counts::lock(&mut tx).await.expect("counts lock");
         sqlx::query(
-            "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
-             SELECT r.author, r.rkey, $2, $3, $4, $5 FROM ref_of($1) r WHERE r.coll = 1 \
+            "WITH k AS (SELECT r.author, r.rkey FROM ref_of($1) r WHERE r.coll = 1), \
+             lg AS (DELETE FROM count_log l USING k WHERE l.kind BETWEEN 1 AND 4 AND l.a = k.author AND l.b = k.rkey) \
+             INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+             SELECT k.author, k.rkey, $2, $3, $4, $5 FROM k \
              ON CONFLICT (author, rkey) DO UPDATE SET like_count = EXCLUDED.like_count, repost_count = EXCLUDED.repost_count, \
                reply_count = EXCLUDED.reply_count, quote_count = EXCLUDED.quote_count",
         )
@@ -1032,13 +1047,15 @@ pub mod interactions {
         .bind(counts.1)
         .bind(counts.2)
         .bind(counts.3)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("post counts");
+        tx.commit().await.expect("commit");
     }
 
     /// A post's four counts `(like, repost, reply, quote)`, when it has a row.
     pub async fn post_counts(pool: &PgPool, post: &str) -> Option<(i32, i32, i32, i32)> {
+        crate::counts::before_read(pool).await;
         sqlx::query_as(
             "SELECT c.like_count, c.repost_count, c.reply_count, c.quote_count FROM post_counts c, ref_of($1) r \
              WHERE r.coll = 1 AND c.author = r.author AND c.rkey = r.rkey",
@@ -1053,8 +1070,12 @@ pub mod interactions {
     pub async fn set_actor_counts(pool: &PgPool, did: &str, counts: (i32, i32, i32)) {
         let ids = Ids::new(pool.clone());
         let id = ids.account_ids(&[did.to_string()]).await.expect("intern")[did];
+        crate::counts::before_read(pool).await;
+        let mut tx = pool.begin().await.expect("begin");
+        crate::counts::lock(&mut tx).await.expect("counts lock");
         sqlx::query(
-            "INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) VALUES ($1, $2, $3, $4) \
+            "WITH lg AS (DELETE FROM count_log WHERE kind BETWEEN 5 AND 7 AND a = $1) \
+             INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) VALUES ($1, $2, $3, $4) \
              ON CONFLICT (id) DO UPDATE SET followers_count = EXCLUDED.followers_count, \
                follows_count = EXCLUDED.follows_count, posts_count = EXCLUDED.posts_count",
         )
@@ -1062,9 +1083,10 @@ pub mod interactions {
         .bind(counts.0)
         .bind(counts.1)
         .bind(counts.2)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("actor counts");
+        tx.commit().await.expect("commit");
     }
 }
 

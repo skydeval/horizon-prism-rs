@@ -346,6 +346,10 @@ impl PublicIndexing {
         // 2.
         sqlx::query("SET LOCAL lock_timeout = '1s'").execute(&mut *tx).await?;
         sqlx::query("SET LOCAL statement_timeout = '3s'").execute(&mut *tx).await?;
+        // A count table's batch holds the counts lock, before it writes.
+        if is_count_table(t.name) && !left_to_triggers(list, t.name) {
+            crate::counts::lock(&mut tx).await?;
+        }
         #[cfg(test)]
         {
             let code = self.hooks.inject.lock().expect("hooks").pop_front();
@@ -421,9 +425,15 @@ impl PublicIndexing {
         let mut n = self.start_window(table);
         let mut backoff = self.settings.retry_base;
         self.progress(|p| p.sweep_batch_rows = n);
+        let mut settled = false;
         loop {
             let name = TABLES[table].name;
             let started = Instant::now();
+            // The count tables are swept after a settle, once.
+            if !settled && is_count_table(name) && !left_to_triggers(list, name) {
+                crate::counts::settle_or_go_on(&self.pool, "the sweep of counts").await;
+                settled = true;
+            }
             match self.sweep_batch_in(list, generation, table, after.as_ref(), n).await {
                 Ok(Batch::Exit) => return,
                 Ok(Batch::Superseded) => return Self::superseded("sweep", generation),
@@ -731,8 +741,43 @@ async fn select_window(conn: &mut PgConnection, t: &SweepTable, after: Option<&C
     })
 }
 
+/// The count tables, whose rows the count log's folder also writes.
+fn is_count_table(name: &str) -> bool {
+    matches!(name, "post_counts" | "tag_activity_hourly")
+}
+
 async fn delete_window(conn: &mut PgConnection, t: &SweepTable, window: &Window) -> Result<u64, sqlx::Error> {
     let (name, pred) = (t.name, t.delete_when);
+    // A count row goes with the key's pending log rows, in one statement.
+    match (name, window) {
+        ("post_counts", Window::AuthorRkey(authors, rkeys)) => {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "WITH d AS (DELETE FROM {name} t WHERE (t.author, t.rkey) IN (SELECT * FROM unnest($1::integer[], $2::bigint[])) AND {pred} \
+                            RETURNING t.author, t.rkey), \
+                 lg AS (DELETE FROM count_log l USING d WHERE l.kind BETWEEN 1 AND 4 AND l.a = d.author AND l.b = d.rkey) \
+                 SELECT count(*) FROM d"
+            ))
+            .bind(authors)
+            .bind(rkeys)
+            .fetch_one(conn)
+            .await?;
+            return Ok(u64::try_from(n).unwrap_or(0));
+        }
+        ("tag_activity_hourly", Window::TagHour(tags, hours)) => {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "WITH d AS (DELETE FROM {name} t WHERE (t.tag, t.hour) IN (SELECT * FROM unnest($1::text[], $2::timestamptz[])) AND {pred} \
+                            RETURNING t.tag, t.hour), \
+                 lg AS (DELETE FROM count_log_tags l USING d WHERE l.tag = d.tag AND l.hour = d.hour) \
+                 SELECT count(*) FROM d"
+            ))
+            .bind(tags)
+            .bind(hours)
+            .fetch_one(conn)
+            .await?;
+            return Ok(u64::try_from(n).unwrap_or(0));
+        }
+        _ => {}
+    }
     let result = match (t.key, window) {
         (Key::Text(col), Window::Text(keys)) => {
             sqlx::query(&format!("DELETE FROM {name} t WHERE t.{col} = ANY($1) AND {pred}"))

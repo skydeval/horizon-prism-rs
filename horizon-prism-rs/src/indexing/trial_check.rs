@@ -17,6 +17,47 @@ use super::public_mode::{PublicIndexing, ScopeValue, now, rfc3339};
 use super::trial::{FULL_ONLY, METRIC_CHECK_ROWS, Refused, Trial, TrialState, TrialTable, bytes_words, database_bytes, table_figures};
 use crate::db::retention::LOCK_DID_SQL;
 
+/// One post's counts recomputed from its rows, its pending log rows
+/// deleted in the same statement: (stored, pending change, recomputed),
+/// each as (likes, reposts, replies, quotes). The value is written when it
+/// differs from the stored one; all zero, the row goes.
+const RECOMPUTE_POST_SQL: &str = "WITH lg AS (DELETE FROM count_log l WHERE l.kind BETWEEN 1 AND 4 AND l.a = $1 AND l.b = $2 RETURNING l.kind, l.actor, l.delta), \
+     ch AS (SELECT p.kind, CASE WHEN p.d = 0 THEN 0 ELSE (n.cnt > 0)::int - (n.cnt - p.d > 0)::int END AS c \
+            FROM (SELECT kind, actor, sum(delta)::int AS d FROM lg WHERE kind IN (1, 2) GROUP BY 1, 2) p \
+            CROSS JOIN LATERAL (SELECT CASE WHEN p.kind = 1 \
+                THEN (SELECT count(*) FROM likes y WHERE y.subj_author = $1 AND y.subj_rkey = $2 AND y.subj_coll = 1 AND y.author = p.actor) \
+                ELSE (SELECT count(*) FROM reposts y WHERE y.subj_author = $1 AND y.subj_rkey = $2 AND y.subj_coll = 1 AND y.author = p.actor) END AS cnt) n \
+            UNION ALL SELECT kind, delta FROM lg WHERE kind IN (3, 4)), \
+     pend AS (SELECT COALESCE(sum(c) FILTER (WHERE kind = 1), 0)::int AS l, COALESCE(sum(c) FILTER (WHERE kind = 2), 0)::int AS r, \
+                     COALESCE(sum(c) FILTER (WHERE kind = 3), 0)::int AS p, COALESCE(sum(c) FILTER (WHERE kind = 4), 0)::int AS q FROM ch), \
+     fresh AS (SELECT (SELECT count(DISTINCT author) FROM likes WHERE subj_author = $1 AND subj_coll = 1 AND subj_rkey = $2)::int AS l, \
+                      (SELECT count(DISTINCT author) FROM reposts WHERE subj_author = $1 AND subj_coll = 1 AND subj_rkey = $2)::int AS r, \
+                      (SELECT count(*) FROM posts WHERE parent_author = $1 AND parent_coll = 1 AND parent_rkey = $2)::int AS p, \
+                      (SELECT count(*) FROM posts WHERE quote_author = $1 AND quote_coll = 1 AND quote_rkey = $2)::int AS q), \
+     old AS (SELECT COALESCE(max(like_count), 0) AS l, COALESCE(max(repost_count), 0) AS r, COALESCE(max(reply_count), 0) AS p, \
+                    COALESCE(max(quote_count), 0) AS q FROM post_counts WHERE author = $1 AND rkey = $2), \
+     differs AS (SELECT f.* FROM fresh f, old o WHERE (f.l, f.r, f.p, f.q) IS DISTINCT FROM (o.l, o.r, o.p, o.q)), \
+     del AS (DELETE FROM post_counts c USING differs f WHERE c.author = $1 AND c.rkey = $2 AND (f.l, f.r, f.p, f.q) = (0, 0, 0, 0) RETURNING 1), \
+     up AS (INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
+            SELECT $1, $2, f.l, f.r, f.p, f.q FROM differs f WHERE (f.l, f.r, f.p, f.q) <> (0, 0, 0, 0) \
+            ON CONFLICT (author, rkey) DO UPDATE SET like_count = EXCLUDED.like_count, repost_count = EXCLUDED.repost_count, \
+              reply_count = EXCLUDED.reply_count, quote_count = EXCLUDED.quote_count RETURNING 1) \
+     SELECT o.l, o.r, o.p, o.q, pend.l, pend.r, pend.p, pend.q, f.l, f.r, f.p, f.q FROM fresh f, pend, old o";
+
+/// A row of [`RECOMPUTE_POST_SQL`].
+type Recomputed = (i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32);
+
+/// One account's followers recomputed, its pending followers changes
+/// deleted in the same statement: (stored, pending change, recomputed).
+const RECOMPUTE_FOLLOWERS_SQL: &str = "WITH lg AS (DELETE FROM count_log l WHERE l.kind = 7 AND l.a = $1 RETURNING l.delta), \
+     fresh AS (SELECT count(*)::int AS n FROM follows WHERE subject = $1), \
+     old AS (SELECT followers_count AS n FROM actor_counts WHERE id = $1), \
+     up AS (INSERT INTO actor_counts (id, followers_count) SELECT $1, f.n FROM fresh f \
+            WHERE f.n IS DISTINCT FROM (SELECT COALESCE((SELECT n FROM old), 0)) \
+            ON CONFLICT (id) DO UPDATE SET followers_count = EXCLUDED.followers_count RETURNING 1) \
+     SELECT COALESCE((SELECT n FROM old), 0), COALESCE((SELECT sum(delta) FROM lg), 0)::int, f.n FROM fresh f";
+
+
 /// Record keys classified per statement.
 const PAGE: i64 = 2_000;
 /// Keys of each fault the result lists.
@@ -320,7 +361,8 @@ impl PublicIndexing {
                 return Ok(());
             }
         }
-        // 2. Derived rows.
+        // 2. Derived rows, on settled counts.
+        crate::counts::settle(&self.pool).await?;
         let derived = self.check_derived(&t, true).await?;
         for (table, n) in &derived {
             if *n > 0 {
@@ -333,10 +375,12 @@ impl PublicIndexing {
             self.check_table(&t, tbl, &mut again, false).await?;
         }
         let left_after: u64 = Counts::total(&again.missed) + Counts::total(&again.unexplained) + self.check_derived(&t, false).await?.iter().map(|(_, n)| n).sum::<u64>();
-        // 3. Counts of the subjects the trial moved.
+        // 3. Counts of the subjects the trial moved, recomputed.
+        crate::counts::settle_or_go_on(&self.pool, "the trial check's counts").await;
         let (posts, accounts, repaired) = self.check_counts().await?;
         // What the start mode held before the trial: its count rows, its
-        // trend hours and its jobs.
+        // trend hours and its jobs, settled.
+        crate::counts::settle(&self.pool).await?;
         let held = self.check_start_mode(&t).await?;
         // 4. The tables only full writes.
         let mut full_left = Vec::new();
@@ -363,7 +407,8 @@ impl PublicIndexing {
         // 5. Sanity: full admitted ops, yet nothing was recorded.
         let full_decisions = t.counters.get("full_decisions").and_then(Value::as_u64).unwrap_or(0).max(self.trial_counters().full_decisions());
         let sane = !(full_decisions > 0 && recorded_total == 0);
-        // 6. What compact storage keeps, and the baseline.
+        // 6. What compact storage keeps, and the baseline, settled.
+        crate::counts::settle(&self.pool).await?;
         let report = self.trial_report(&t).await?;
         let mut causes = Vec::new();
         if left_after > 0 {
@@ -380,20 +425,21 @@ impl PublicIndexing {
         let mut words = result_words(&t, &counts, (posts, accounts, repaired, &held.words(t.from)), &full_left, (labels_start, labels_exit), &report, &causes);
         // What the trial says of this server's capacity.
         #[allow(clippy::type_complexity)]
-        let samples: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, bool)> =
-            sqlx::query_as("SELECT input, processed, deduped, applied, lanes_busy, filling FROM full_trial_samples WHERE trial = $1 ORDER BY at")
+        let samples: Vec<(Option<f64>, Option<f64>, Option<f64>, Option<f64>, Option<f64>, bool, Option<f64>)> =
+            sqlx::query_as("SELECT input, processed, deduped, applied, lanes_busy, filling, counts_behind FROM full_trial_samples WHERE trial = $1 ORDER BY at")
                 .bind(t.id)
                 .fetch_all(&self.pool)
                 .await?;
         let samples: Vec<super::trial::Sample> = samples
             .into_iter()
-            .map(|(input, processed, deduped, applied, lanes_busy, filling)| super::trial::Sample {
+            .map(|(input, processed, deduped, applied, lanes_busy, filling, counts_behind)| super::trial::Sample {
                 input,
                 processed: processed.unwrap_or(0.0),
                 deduped: deduped.unwrap_or(0.0),
                 applied: applied.unwrap_or(0.0),
                 lanes_busy,
                 filling,
+                counts_behind,
             })
             .collect();
         let waits = super::trial::trial_largest_wait();
@@ -621,7 +667,16 @@ impl PublicIndexing {
             if remove && n > 0 {
                 let cols = key.trim_matches(|c| c == '(' || c == ')').split(", ").map(|c| format!("x.{c}")).collect::<Vec<_>>().join(", ");
                 let guard = self.scope.read_guard().await;
-                sqlx::query(&format!("DELETE FROM {table} WHERE {key} IN (SELECT {cols} {from})")).execute(&self.pool).await?;
+                if crate::db::retention::is_count_table(table) {
+                    // A count row goes with its key's pending log rows, in
+                    // its own transaction under the counts lock.
+                    let mut tx = self.pool.begin().await?;
+                    crate::counts::lock(&mut tx).await?;
+                    sqlx::query(&crate::db::retention::key_delete_sql(table, &format!("SELECT {cols} {from}"))).execute(&mut *tx).await?;
+                    tx.commit().await?;
+                } else {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE {key} IN (SELECT {cols} {from})")).execute(&self.pool).await?;
+                }
                 drop(guard);
             }
             out.push((table, u64::try_from(n).unwrap_or(0)));
@@ -641,60 +696,32 @@ impl PublicIndexing {
         .await?;
         let accounts: Vec<i32> = sqlx::query_scalar("SELECT DISTINCT s_a FROM full_trial_rows WHERE s_a IS NOT NULL AND s_b IS NULL").fetch_all(&self.pool).await?;
         let mut repaired = 0;
-        for (a, k) in &posts {
+        // Recomputed under the counts lock, up to 1 000 keys a transaction:
+        // each key's value and its pending log rows in one statement, so a
+        // change committed meanwhile is counted once, by the fold or here.
+        // A key counts as repaired when the recompute differs from the
+        // stored value plus its pending change.
+        for chunk in posts.chunks(1000) {
             let mut tx = self.pool.begin().await?;
-            let stored: Option<(i32, i32, i32, i32)> =
-                sqlx::query_as("SELECT like_count, repost_count, reply_count, quote_count FROM post_counts WHERE author = $1 AND rkey = $2 FOR UPDATE")
-                    .bind(a)
-                    .bind(k)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-            let fresh: (i64, i64, i64, i64) = sqlx::query_as(
-                "SELECT (SELECT count(DISTINCT author) FROM likes WHERE subj_author = $1 AND subj_coll = 1 AND subj_rkey = $2), \
-                        (SELECT count(DISTINCT author) FROM reposts WHERE subj_author = $1 AND subj_coll = 1 AND subj_rkey = $2), \
-                        (SELECT count(*) FROM posts WHERE parent_author = $1 AND parent_coll = 1 AND parent_rkey = $2), \
-                        (SELECT count(*) FROM posts WHERE quote_author = $1 AND quote_coll = 1 AND quote_rkey = $2)",
-            )
-            .bind(a)
-            .bind(k)
-            .fetch_one(&mut *tx)
-            .await?;
-            let have = stored.map_or((0, 0, 0, 0), |s| (i64::from(s.0), i64::from(s.1), i64::from(s.2), i64::from(s.3)));
-            if have != fresh {
-                if fresh == (0, 0, 0, 0) {
-                    sqlx::query("DELETE FROM post_counts WHERE author = $1 AND rkey = $2").bind(a).bind(k).execute(&mut *tx).await?;
-                } else {
-                    sqlx::query(
-                        "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) VALUES ($1, $2, $3, $4, $5, $6) \
-                         ON CONFLICT (author, rkey) DO UPDATE SET like_count = EXCLUDED.like_count, repost_count = EXCLUDED.repost_count, \
-                           reply_count = EXCLUDED.reply_count, quote_count = EXCLUDED.quote_count",
-                    )
-                    .bind(a)
-                    .bind(k)
-                    .bind(i32::try_from(fresh.0).unwrap_or(i32::MAX))
-                    .bind(i32::try_from(fresh.1).unwrap_or(i32::MAX))
-                    .bind(i32::try_from(fresh.2).unwrap_or(i32::MAX))
-                    .bind(i32::try_from(fresh.3).unwrap_or(i32::MAX))
-                    .execute(&mut *tx)
-                    .await?;
+            crate::counts::lock(&mut tx).await?;
+            for (a, k) in chunk {
+                let r: Recomputed = sqlx::query_as(RECOMPUTE_POST_SQL).bind(a).bind(k).fetch_one(&mut *tx).await?;
+                let (old, pend, fresh) = ((r.0, r.1, r.2, r.3), (r.4, r.5, r.6, r.7), (r.8, r.9, r.10, r.11));
+                let clamp = |o: i32, d: i32| o.saturating_add(d).max(0);
+                if fresh != (clamp(old.0, pend.0), clamp(old.1, pend.1), clamp(old.2, pend.2), clamp(old.3, pend.3)) {
+                    repaired += 1;
                 }
-                repaired += 1;
             }
             tx.commit().await?;
         }
-        for a in &accounts {
+        for chunk in accounts.chunks(1000) {
             let mut tx = self.pool.begin().await?;
-            let stored: Option<i32> = sqlx::query_scalar("SELECT followers_count FROM actor_counts WHERE id = $1 FOR UPDATE").bind(a).fetch_optional(&mut *tx).await?;
-            let fresh: i64 = sqlx::query_scalar("SELECT count(*) FROM follows WHERE subject = $1").bind(a).fetch_one(&mut *tx).await?;
-            if i64::from(stored.unwrap_or(0)) != fresh {
-                sqlx::query(
-                    "INSERT INTO actor_counts (id, followers_count) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET followers_count = EXCLUDED.followers_count",
-                )
-                .bind(a)
-                .bind(i32::try_from(fresh).unwrap_or(i32::MAX))
-                .execute(&mut *tx)
-                .await?;
-                repaired += 1;
+            crate::counts::lock(&mut tx).await?;
+            for a in chunk {
+                let (old, pend, fresh): (i32, i32, i32) = sqlx::query_as(RECOMPUTE_FOLLOWERS_SQL).bind(a).fetch_one(&mut *tx).await?;
+                if fresh != old.saturating_add(pend).max(0) {
+                    repaired += 1;
+                }
             }
             tx.commit().await?;
         }
@@ -738,7 +765,10 @@ impl PublicIndexing {
             let added = format!("FROM tag_activity_hourly ta WHERE {}", super::trial::TREND_ROW_ADDED);
             held.trend_rows_added = sqlx::query_scalar(&format!("SELECT count(*) {added}")).fetch_one(&self.pool).await?;
             if held.trend_rows_added > 0 {
-                sqlx::query(&format!("DELETE FROM tag_activity_hourly WHERE (tag, hour) IN (SELECT ta.tag, ta.hour {added})")).execute(&self.pool).await?;
+                let mut tx = self.pool.begin().await?;
+                crate::counts::lock(&mut tx).await?;
+                sqlx::query(&crate::db::retention::key_delete_sql("tag_activity_hourly", &format!("SELECT ta.tag, ta.hour {added}"))).execute(&mut *tx).await?;
+                tx.commit().await?;
             }
         }
         // An exit to community fills S again, so the jobs are its own.

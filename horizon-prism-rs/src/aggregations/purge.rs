@@ -518,8 +518,34 @@ impl Purger {
                 break;
             }
         }
+        if kind == PurgeKind::AccountDeleted {
+            total += self.delete_account_counts(did).await?;
+        }
         tracing::info!(event = "purge_batches_done", did, kind = kind.as_str(), rows = total, "purge deletion finished");
         Ok(total)
+    }
+
+    /// A deleted account's counts, after its records' deletes committed
+    /// their changes to the count log: after a settle, in a short
+    /// transaction under the counts lock, the row and its pending log rows.
+    async fn delete_account_counts(&self, did: &str) -> Result<u64, sqlx::Error> {
+        crate::counts::settle_or_go_on(&self.pool, "a purge's counts").await;
+        let guard = self.scope.read_guard().await;
+        let mut tx = self.pool.begin().await?;
+        lock_dids_shared(&mut tx, &[did.to_string()]).await?;
+        crate::counts::lock(&mut tx).await?;
+        let n = sqlx::query(
+            "WITH k AS (SELECT id FROM dids WHERE did = $1), \
+             lg AS (DELETE FROM count_log l USING k WHERE l.kind BETWEEN 5 AND 7 AND l.a = k.id) \
+             DELETE FROM actor_counts WHERE id IN (SELECT id FROM k)",
+        )
+        .bind(did)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        drop(guard);
+        Ok(n)
     }
 
     /// One batch: up to [`BATCH`] rows per statement, returning the rows
@@ -571,11 +597,6 @@ impl Purger {
                 // Subscriptions others hold on the deleted account go too.
                 n += delete_batch(conn, "activity_subscriptions", "ctid", "subject_did = $1", did).await?;
                 n += sqlx::query("DELETE FROM notification_seen WHERE did = $1")
-                    .bind(did)
-                    .execute(&mut *conn)
-                    .await?
-                    .rows_affected();
-                n += sqlx::query("DELETE FROM actor_counts WHERE id = (SELECT id FROM dids WHERE did = $1)")
                     .bind(did)
                     .execute(&mut *conn)
                     .await?

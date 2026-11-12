@@ -347,6 +347,8 @@ pub struct HealthInputs {
     /// The public-indexing switch serve runs: full indexing's status, its
     /// trial, the relays' tiers and the crawl.
     pub public: Option<crate::indexing::PublicIndexing>,
+    /// The counts folder serve runs.
+    pub counts: Option<Arc<crate::counts::FoldStatus>>,
 }
 
 impl HealthInputs {
@@ -1002,8 +1004,22 @@ pub async fn gather(state: &AdminState, banners: Banners) -> Vec<Check> {
         ..base
     };
     let mut out = checks(&inputs, &state.health.ring);
+    if let Some(status) = &state.health.counts {
+        out.push(counts_check(crate::counts::health(status, &state.pool).await));
+    }
     out.extend(full_checks(state).await);
     out
+}
+
+/// The Counts line: how far local counts are behind ingest.
+#[must_use]
+pub fn counts_check(h: crate::counts::Health) -> Check {
+    const NAME: &str = "Counts";
+    match h {
+        crate::counts::Health::NoData(why) => Check::new(NAME, Level::NoData, why),
+        crate::counts::Health::Ok(text) => Check::new(NAME, Level::Ok, text),
+        crate::counts::Health::Warning(text) => Check::new(NAME, Level::Amber, text),
+    }
 }
 
 /// Full ingest while the full network is indexed: shedding, falling behind
@@ -1050,7 +1066,11 @@ async fn full_checks(state: &AdminState) -> Vec<Check> {
         Err(e) => out.push(Check::no_data("Full network", &format!("its status could not be read ({e})")).link("/admin/indexing", "Indexing")),
     }
     if breadth == crate::indexing::Breadth::Full {
-        out.push(ingest_check(crate::firehose::projection::published().get(), state.health.ring.latest().as_deref()).link("/admin/indexing", "Indexing"));
+        let mut check = ingest_check(crate::firehose::projection::published().get(), state.health.ring.latest().as_deref());
+        if let Some(behind) = state.health.counts.as_ref().and_then(|c| c.view().behind) {
+            check.text.push_str(&format!(" Counts are up to {} behind.", crate::counts::span(behind)));
+        }
+        out.push(check.link("/admin/indexing", "Indexing"));
     }
     if let Ok(trial) = public.trial_status().await {
         let warnings: Vec<String> = trial["warnings"].as_array().into_iter().flatten().filter_map(|w| w.as_str().map(str::to_string)).collect();

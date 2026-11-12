@@ -71,8 +71,6 @@ pub enum Phase {
     Locks,
     /// The ops' own statements.
     Ops,
-    /// Applying the counts a transaction deferred.
-    Counts,
     /// Full indexing's continuity statements.
     Continuity,
     /// `COMMIT`, and its flush.
@@ -80,7 +78,7 @@ pub enum Phase {
 }
 
 impl Phase {
-    pub const ALL: [Self; 7] = [Self::Ids, Self::Acquire, Self::Locks, Self::Ops, Self::Counts, Self::Continuity, Self::Commit];
+    pub const ALL: [Self; 6] = [Self::Ids, Self::Acquire, Self::Locks, Self::Ops, Self::Continuity, Self::Commit];
 
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -89,7 +87,6 @@ impl Phase {
             Self::Acquire => "acquire",
             Self::Locks => "locks",
             Self::Ops => "ops",
-            Self::Counts => "counts",
             Self::Continuity => "continuity",
             Self::Commit => "commit",
         }
@@ -1257,8 +1254,8 @@ impl Writer {
     /// cannot change the scope sets or the private tier: its repo is not
     /// tracked, no owner-side rule applies, no op is a private-tier op, and
     /// no op grows scope. Each commit's statements and outcomes are those
-    /// it has alone; the transaction defers counts and applies them once,
-    /// then runs continuity for every copy, in account order. One report
+    /// it has alone (their count changes go to the count log); the
+    /// transaction then runs continuity for every copy, in account order. One report
     /// per commit applied, in order; at least one.
     ///
     /// # Errors
@@ -1320,19 +1317,16 @@ impl Writer {
 
         let mut tx = self.pool.begin().await?;
         phases.acquired();
-        // 4 and 5: counts deferred; every DID lock of the batch in one sorted
-        // statement, then every URI lock in one.
+        // 4 and 5: every DID lock of the batch in one sorted statement, then
+        // every URI lock in one. Counts need nothing here: the count
+        // triggers log their changes, and the counts folder applies them.
         let mut lock_dids: Vec<String> = Vec::new();
         let mut lock_uri_list: Vec<String> = Vec::new();
         for &i in &writing {
             lock_dids.extend(preps[i].lock_dids.iter().cloned());
             lock_uri_list.extend(preps[i].lock_uris.iter().cloned());
         }
-        #[cfg(test)]
-        let defer = !crate::test_support::hooks::injected_in(crate::test_support::hooks::WRITER_NO_DEFER, &self.pool, "*");
-        #[cfg(not(test))]
-        let defer = true;
-        lock_dids_shared_deferring(&mut tx, &lock_dids, defer).await?;
+        lock_dids_shared(&mut tx, &lock_dids).await?;
         lock_uris(&mut tx, &lock_uri_list).await?;
         // 6. After the locks: an account whose deletion purge runs without
         // the scope write guard is re-read here, and full's arm checks the
@@ -1424,15 +1418,12 @@ impl Writer {
             }
         }
         phases.mark(Phase::Ops);
-        // 8. Counts, once, in key order.
-        sqlx::query("SELECT prism_apply_counts()").execute(&mut *tx).await?;
-        phases.mark(Phase::Counts);
         // 9. A full trial's record, after the row statements, before
         // continuity: one statement, entries merged by key.
         #[cfg(test)]
         let entries = if crate::test_support::hooks::injected_in(crate::test_support::hooks::TRIAL_RECORD_OFF, &self.pool, "*") { Vec::new() } else { entries };
         crate::indexing::trial::insert_entries(&mut tx, &entries).await?;
-        // 10. Full indexing's continuity, after every count write, the
+        // 10. Full indexing's continuity, after every row write, the
         // batch's `full_crawl` rows in one ascending pass.
         let copies: Vec<ContinuityCopy<'_>> = writing
             .iter()
@@ -1454,6 +1445,8 @@ impl Writer {
         tx.commit().await?;
         phases.mark(Phase::Commit);
         drop(guard);
+        // A test reads counts as a fold leaves them (nothing in production).
+        crate::counts::before_read(&self.pool).await;
 
         // 12. After commit, in order: first sightings, the trial's counters,
         // memory effects, the feed.
@@ -3522,23 +3515,6 @@ fn op_keys(repo: &str, names: &OpNames<'_>, accounts: &std::collections::HashMap
     keys
 }
 
-/// Shared DID locks for every DID in `dids`, in ascending key order, as
-/// [`lock_dids_shared`]; with `defer`, the statement also defers the
-/// transaction's counts (`prism_defer_counts`), in the same round trip.
-async fn lock_dids_shared_deferring(conn: &mut PgConnection, dids: &[String], defer: bool) -> Result<(), sqlx::Error> {
-    if !defer {
-        return lock_dids_shared(conn, dids).await;
-    }
-    sqlx::query(
-        "SELECT prism_defer_counts() FROM (SELECT count(pg_advisory_xact_lock_shared(k)) FROM \
-         (SELECT DISTINCT hashtextextended('did:' || d, 0) AS k FROM unnest($1::text[]) AS d ORDER BY k) AS s) AS l",
-    )
-    .bind(dids)
-    .execute(conn)
-    .await?;
-    Ok(())
-}
-
 /// Full's post-lock status check for every repo of `repos` (with whether
 /// Refract lists it): a deleted account, or one a takedown relay reports
 /// non-active while `suspended_accounts = "refract_only"` and Refract does
@@ -5102,6 +5078,8 @@ pub(crate) mod fixtures {
         let post = post_ids(pool, &accounts, &rkeys, key, &u, &p).await.expect("ids");
         let mut conn = pool.acquire().await.expect("conn");
         upsert_post(&mut conn, &post, &p, rev, true).await.expect("post");
+        drop(conn);
+        crate::counts::before_read(pool).await;
         u.uri.clone()
     }
 

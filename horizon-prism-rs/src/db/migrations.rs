@@ -264,6 +264,7 @@ mod tests {
         };
         // (posts, likes, reposts, replies) summed over hours, per tag.
         let totals = || async {
+            crate::counts::before_read(p).await;
             let rows: Vec<(String, i64, i64, i64, i64)> = sqlx::query_as(
                 "SELECT tag, sum(posts)::bigint, sum(likes)::bigint, sum(reposts)::bigint, sum(replies)::bigint \
                  FROM tag_activity_hourly GROUP BY tag ORDER BY tag",

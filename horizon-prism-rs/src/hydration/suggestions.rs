@@ -189,6 +189,7 @@ impl Hydrator {
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.refresh_secs)) {
             let sql = format!("SELECT ad.did FROM actors a JOIN dids ad ON ad.id = a.id WHERE {} ORDER BY {order} LIMIT $1", eligible(Some(cfg.active_days), "$2"));
             let relays = self.hidden_relays().await;
+            crate::counts::before_read(self.pool()).await;
             let started = Instant::now();
             let found = sqlx::query_scalar(&sql).bind(i64::from(cfg.pool_size)).bind(relays).fetch_all(self.pool()).await;
             metrics::histogram!(METRIC_REFRESH_SECONDS).record(started.elapsed().as_secs_f64());

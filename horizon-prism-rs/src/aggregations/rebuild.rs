@@ -687,19 +687,25 @@ impl Rebuild {
 }
 
 /// §9.5 repair: recompute both count tables from the base tables, likes
-/// and reposts by account (#727). The
-/// share-row-exclusive locks hold count-trigger writers for the duration,
-/// so no increment is lost or doubled. A function of the pool, so the end
+/// and reposts by account (#727). After a settle, under the counts lock,
+/// the share-row-exclusive lock on the count log holds the count triggers'
+/// writers for the duration, and the log's rows go with the recompute, so
+/// no change is lost or doubled. A function of the pool, so the end
 /// of a public-indexing fill runs it too (public-indexing design §8.5).
 ///
 /// # Errors
 ///
 /// Database errors.
 pub async fn repair_counts(pool: &PgPool) -> Result<(), sqlx::Error> {
+    crate::counts::settle_or_go_on(pool, "the counts repair").await;
+    let _holding = crate::counts::holding(pool, "a counts repair is running");
     let mut tx = pool.begin().await?;
-    sqlx::query("LOCK TABLE post_counts, actor_counts IN SHARE ROW EXCLUSIVE MODE")
-        .execute(&mut *tx)
-        .await?;
+    // The counts lock, then the log held: writers' log inserts wait, as
+    // they waited on the count tables' lock before, and the log rows the
+    // recompute covers go.
+    crate::counts::lock(&mut tx).await?;
+    sqlx::query("LOCK TABLE count_log IN SHARE ROW EXCLUSIVE MODE").execute(&mut *tx).await?;
+    sqlx::query("DELETE FROM count_log").execute(&mut *tx).await?;
     sqlx::query("DELETE FROM post_counts").execute(&mut *tx).await?;
     sqlx::query(
         "INSERT INTO post_counts (author, rkey, like_count, repost_count, reply_count, quote_count) \
@@ -751,19 +757,23 @@ pub struct KeysetReport {
     pub slowest: Duration,
 }
 
-/// The counts repair without a table lock, for network-sized tables: per
-/// range of account ids, a short transaction per count table inserts the
-/// range's missing count rows, locks its count rows in key order as the
-/// count triggers do, and only then recomputes them from that range's
-/// sources in a later statement, so a trigger that commits in between is
-/// never lost; count rows with no source left are removed. Ranges commit
-/// on their own, and the repair resumes from its stored cursor after a
-/// restart. A range that deadlocks is retried.
+/// The counts repair without a table lock, for network-sized tables: after
+/// a settle, per range of account ids, a short transaction per count table
+/// takes the counts lock, inserts the range's missing count rows, locks
+/// them in key order, and recomputes them from that range's sources, the
+/// range's pending log rows deleted in the same statement, so a change
+/// committed before it is counted once and one after it waits in the log;
+/// count rows with no source left are removed. A row counts as repaired
+/// only when the recompute differs from the stored value plus its pending
+/// change. Ranges commit on their own, and the repair resumes from its
+/// stored cursor after a restart. A range that deadlocks is retried.
 ///
 /// # Errors
 ///
 /// Database errors, a range's after its retries.
 pub async fn repair_counts_keyset(pool: &PgPool) -> Result<KeysetReport, sqlx::Error> {
+    crate::counts::settle_or_go_on(pool, "the counts repair").await;
+    let _holding = crate::counts::holding(pool, "a counts repair is running");
     let max: Option<i32> = sqlx::query_scalar("SELECT max(id) FROM dids").fetch_one(pool).await?;
     let mut lo: i32 = sqlx::query_scalar("SELECT (value #>> '{}')::int FROM worker_state WHERE key = $1")
         .bind(KEYSET_CURSOR_KEY)
@@ -849,7 +859,17 @@ async fn repair_range_once(pool: &PgPool, table: CountTable, lo: i32, hi: i32) -
                UNION SELECT quote_author, quote_rkey FROM posts WHERE quote_coll = 1 AND quote_author >= $1 AND quote_author < $2 \
              ) s WHERE a IS NOT NULL AND k IS NOT NULL ON CONFLICT (author, rkey) DO NOTHING",
             "SELECT count(*) FROM (SELECT 1 FROM post_counts WHERE author >= $1 AND author < $2 ORDER BY author, rkey FOR UPDATE) l",
-            "WITH t AS ( \
+            "WITH lg AS (DELETE FROM count_log l WHERE l.kind BETWEEN 1 AND 4 AND l.a >= $1 AND l.a < $2 RETURNING l.kind, l.a, l.b, l.actor, l.delta), \
+             pend AS (SELECT a, b, \
+                        COALESCE(sum(c) FILTER (WHERE kind = 1), 0)::int AS l, COALESCE(sum(c) FILTER (WHERE kind = 2), 0)::int AS r, \
+                        COALESCE(sum(c) FILTER (WHERE kind = 3), 0)::int AS p, COALESCE(sum(c) FILTER (WHERE kind = 4), 0)::int AS q FROM ( \
+                        SELECT x.kind, x.a, x.b, CASE WHEN x.d = 0 THEN 0 ELSE (n.cnt > 0)::int - (n.cnt - x.d > 0)::int END AS c \
+                        FROM (SELECT kind, a, b, actor, sum(delta)::int AS d FROM lg WHERE kind IN (1, 2) GROUP BY 1, 2, 3, 4) x \
+                        CROSS JOIN LATERAL (SELECT CASE WHEN x.kind = 1 \
+                            THEN (SELECT count(*) FROM likes y WHERE y.subj_author = x.a AND y.subj_rkey = x.b AND y.subj_coll = 1 AND y.author = x.actor) \
+                            ELSE (SELECT count(*) FROM reposts y WHERE y.subj_author = x.a AND y.subj_rkey = x.b AND y.subj_coll = 1 AND y.author = x.actor) END AS cnt) n \
+                        UNION ALL SELECT kind, a, b, delta FROM lg WHERE kind IN (3, 4)) u GROUP BY a, b), \
+             t AS ( \
                SELECT a, k, sum(l)::int AS l, sum(r)::int AS r, sum(p)::int AS p, sum(q)::int AS q FROM ( \
                  SELECT subj_author AS a, subj_rkey AS k, count(DISTINCT author) AS l, 0 AS r, 0 AS p, 0 AS q FROM likes \
                    WHERE subj_coll = 1 AND subj_author >= $1 AND subj_author < $2 GROUP BY 1, 2 \
@@ -860,10 +880,16 @@ async fn repair_range_once(pool: &PgPool, table: CountTable, lo: i32, hi: i32) -
                ) s WHERE a IS NOT NULL AND k IS NOT NULL GROUP BY a, k), \
              u AS (UPDATE post_counts c SET like_count = t.l, repost_count = t.r, reply_count = t.p, quote_count = t.q FROM t \
                    WHERE c.author = t.a AND c.rkey = t.k \
-                     AND (c.like_count, c.repost_count, c.reply_count, c.quote_count) IS DISTINCT FROM (t.l, t.r, t.p, t.q) RETURNING 1), \
+                     AND (c.like_count, c.repost_count, c.reply_count, c.quote_count) IS DISTINCT FROM (t.l, t.r, t.p, t.q) \
+                   RETURNING 1), \
              d AS (DELETE FROM post_counts c WHERE c.author >= $1 AND c.author < $2 \
                      AND NOT EXISTS (SELECT 1 FROM t WHERE t.a = c.author AND t.k = c.rkey) RETURNING 1) \
-             SELECT (SELECT count(*) FROM u), (SELECT count(*) FROM d)",
+             SELECT (SELECT count(*) FROM t JOIN post_counts o ON o.author = t.a AND o.rkey = t.k \
+                       LEFT JOIN pend ON pend.a = t.a AND pend.b = t.k \
+                     WHERE (t.l, t.r, t.p, t.q) IS DISTINCT FROM ( \
+                       GREATEST(o.like_count + COALESCE(pend.l, 0), 0), GREATEST(o.repost_count + COALESCE(pend.r, 0), 0), \
+                       GREATEST(o.reply_count + COALESCE(pend.p, 0), 0), GREATEST(o.quote_count + COALESCE(pend.q, 0), 0))), \
+                    (SELECT count(*) FROM d)",
         ),
         CountTable::Actors => (
             "INSERT INTO actor_counts (id, followers_count, follows_count, posts_count) \
@@ -873,19 +899,28 @@ async fn repair_range_once(pool: &PgPool, table: CountTable, lo: i32, hi: i32) -
                UNION SELECT author FROM posts WHERE author >= $1 AND author < $2 \
              ) s ON CONFLICT (id) DO NOTHING",
             "SELECT count(*) FROM (SELECT 1 FROM actor_counts WHERE id >= $1 AND id < $2 ORDER BY id FOR UPDATE) l",
-            "WITH t AS ( \
+            "WITH lg AS (DELETE FROM count_log l WHERE l.kind BETWEEN 5 AND 7 AND l.a >= $1 AND l.a < $2 RETURNING l.kind, l.a, l.delta), \
+             pend AS (SELECT a, COALESCE(sum(delta) FILTER (WHERE kind = 7), 0)::int AS fr, COALESCE(sum(delta) FILTER (WHERE kind = 6), 0)::int AS fs, \
+                        COALESCE(sum(delta) FILTER (WHERE kind = 5), 0)::int AS p FROM lg GROUP BY a), \
+             t AS ( \
                SELECT d, sum(fr)::int AS fr, sum(fs)::int AS fs, sum(p)::int AS p FROM ( \
                  SELECT subject AS d, count(*) AS fr, 0 AS fs, 0 AS p FROM follows WHERE subject >= $1 AND subject < $2 GROUP BY 1 \
                  UNION ALL SELECT author, 0, count(*), 0 FROM follows WHERE author >= $1 AND author < $2 GROUP BY 1 \
                  UNION ALL SELECT author, 0, 0, count(*) FROM posts WHERE author >= $1 AND author < $2 GROUP BY 1 \
                ) s GROUP BY d), \
              u AS (UPDATE actor_counts c SET followers_count = t.fr, follows_count = t.fs, posts_count = t.p FROM t \
-                   WHERE c.id = t.d AND (c.followers_count, c.follows_count, c.posts_count) IS DISTINCT FROM (t.fr, t.fs, t.p) RETURNING 1), \
+                   WHERE c.id = t.d AND (c.followers_count, c.follows_count, c.posts_count) IS DISTINCT FROM (t.fr, t.fs, t.p) \
+                   RETURNING 1), \
              d AS (DELETE FROM actor_counts c WHERE c.id >= $1 AND c.id < $2 AND NOT EXISTS (SELECT 1 FROM t WHERE t.d = c.id) RETURNING 1) \
-             SELECT (SELECT count(*) FROM u), (SELECT count(*) FROM d)",
+             SELECT (SELECT count(*) FROM t JOIN actor_counts o ON o.id = t.d LEFT JOIN pend ON pend.a = t.d \
+                     WHERE (t.fr, t.fs, t.p) IS DISTINCT FROM ( \
+                       GREATEST(o.followers_count + COALESCE(pend.fr, 0), 0), GREATEST(o.follows_count + COALESCE(pend.fs, 0), 0), \
+                       GREATEST(o.posts_count + COALESCE(pend.p, 0), 0))), \
+                    (SELECT count(*) FROM d)",
         ),
     };
     let mut tx = pool.begin().await?;
+    crate::counts::lock(&mut tx).await?;
     sqlx::query(missing).bind(lo).bind(hi).execute(&mut *tx).await?;
     let _locked: i64 = sqlx::query_scalar(lock).bind(lo).bind(hi).fetch_one(&mut *tx).await?;
     #[cfg(test)]
@@ -937,11 +972,11 @@ mod tests {
     }
 
     /// The keyset counts repair, the form full uses: it fixes wrong counts
-    /// and removes count rows with no source; while it holds one range's
-    /// rows, a writer of another count table goes on, and a like whose
-    /// trigger waits on a locked count row commits after the range and is
-    /// counted, not lost. In full the repair the weekly run and the admin
-    /// command use is this one, and it leaves no cursor behind.
+    /// and removes count rows with no source; while it holds one range
+    /// under the counts lock, writers go on (a like only logs its change),
+    /// and a like committed meanwhile is counted once, not lost or doubled.
+    /// In full the repair the weekly run and the admin command use is this
+    /// one, and it leaves no cursor behind.
     #[tokio::test]
     async fn the_keyset_repair_locks_no_table_and_loses_no_trigger() {
         use crate::test_support::{graph, hooks, interactions, posts};
@@ -963,18 +998,15 @@ mod tests {
             tokio::spawn(async move { repair_counts_keyset(&p).await })
         };
         paused.reached().await;
-        // The post counts range holds its rows: a like of the post waits on
-        // its count row; a follow, which writes account counts, goes on.
-        let like = {
-            let (p, post) = (p.clone(), post.clone());
-            tokio::spawn(async move { interactions::like(&p, STALE, "3kaaaaaaaaal1", &post).await })
-        };
-        tokio::time::timeout(Duration::from_secs(5), graph::follow(p, MEMBER, LIKED, "3kaaaaaaaaaf1")).await.expect("a writer of another table goes on");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!like.is_finished(), "the like's trigger waits on the locked count row");
+        // The post counts range holds the counts lock: a like of the post
+        // and a follow both go on, their changes logged. Reads do not fold
+        // while the range is paused.
+        let lag = hooks::arm(hooks::COUNTS_LAG, db.name());
+        tokio::time::timeout(Duration::from_secs(5), interactions::like(p, STALE, "3kaaaaaaaaal1", &post)).await.expect("a like goes on");
+        tokio::time::timeout(Duration::from_secs(5), graph::follow(p, MEMBER, LIKED, "3kaaaaaaaaaf1")).await.expect("a follow goes on");
         paused.release();
         let report = repair.await.expect("task").expect("repair");
-        like.await.expect("like");
+        drop(lag);
         assert!(report.ranges >= 1 && report.deleted >= 1, "{report:?}");
         assert_eq!(interactions::post_counts(p, &post).await, Some((3, 0, 0, 0)), "repaired, and the like that waited is counted");
         assert_eq!(interactions::post_counts(p, &gone).await, None, "a count row with no source is removed");

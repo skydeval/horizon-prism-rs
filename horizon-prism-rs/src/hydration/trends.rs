@@ -147,6 +147,7 @@ impl Hydrator {
         let mut slot = self.inner.trends.topics.lock().await;
         if slot.at.is_none_or(|at| at.elapsed() >= Duration::from_secs(cfg.cache_ttl_secs)) && self.tags_indexed().await? {
             let hours = i32::try_from(cfg.topics_window_hours).unwrap_or(i32::MAX);
+            crate::counts::before_read(self.pool()).await;
             let candidates: Vec<String> = sqlx::query_scalar(
                 "SELECT tag FROM tag_activity_hourly WHERE hour >= now() - make_interval(hours => $1) \
                  GROUP BY tag ORDER BY sum(GREATEST(posts, 0)) DESC, tag LIMIT $2",
@@ -216,6 +217,7 @@ impl Hydrator {
         let window = i32::try_from(cfg.window_hours).unwrap_or(i32::MAX);
         let lookback = i32::try_from(cfg.subject_lookback_hours).unwrap_or(i32::MAX);
         // The aggregate only picks candidates.
+        crate::counts::before_read(self.pool()).await;
         let candidates: Vec<String> = sqlx::query_scalar(
             "SELECT tag FROM tag_activity_hourly WHERE hour >= now() - make_interval(hours => $1) \
              GROUP BY tag \

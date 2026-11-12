@@ -20,6 +20,7 @@ pub mod appview_clients;
 pub mod cli;
 pub mod config;
 pub mod constellation;
+pub mod counts;
 pub mod cursor_key;
 pub mod db;
 pub mod farsight;

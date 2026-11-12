@@ -263,6 +263,8 @@ stale_max_secs = 86400
 sync_timeout_ms = 800
 refresh_rate_per_sec = 20
 refresh_queue_max = 100000
+fold_interval_ms = 1000
+fold_slice_rows = 100000
 
 [microcosm]
 slingshot_url = "https://slingshot.microcosm.blue"
@@ -1618,4 +1620,16 @@ mod standin {
         let hostname_plc = "[identity]\nplc_url = \"http://plc.test.internal:2582\"\n";
         assert_eq!(key_problems(&[("http://172.29.77.21:8086", both)], hostname_plc, none, "identity.plc_url"), Vec::<String>::new());
     }
+}
+
+/// The counts folder's options: an interval below 10 ms and slices below
+/// 1 000 rows are refused; an interval above a minute is not (Health and
+/// the start warn instead).
+#[test]
+fn counts_fold_options_are_checked() {
+    let p = invalid_problems(load("[counts]\nfold_interval_ms = 5\nfold_slice_rows = 999\n"));
+    assert!(has(&p, "counts.fold_interval_ms must be at least 10"), "{p:?}");
+    assert!(has(&p, "counts.fold_slice_rows must be at least 1000"), "{p:?}");
+    let cfg = load("[counts]\nfold_interval_ms = 120000\n").expect("a long interval starts");
+    assert_eq!(cfg.file.counts.fold_interval_ms, 120_000);
 }

@@ -50,6 +50,8 @@ const COMPACT: &[&str] = &[
     "feed_items",
     "post_counts",
     "actor_counts",
+    "count_log",
+    "count_log_tags",
     "record_tombstones",
     "actors",
     "lists",

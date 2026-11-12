@@ -187,6 +187,7 @@ impl super::Hydrator {
         if !ix.any_counts() {
             return Ok(out);
         }
+        crate::counts::before_read(self.pool()).await;
         let (dids, posts): (Vec<String>, Vec<String>) = targets.iter().cloned().partition(|t| t.starts_with("did:"));
         if ix.counts(FullGroup::Follows) && !dids.is_empty() {
             let rows: Vec<(String, Option<i32>)> = sqlx::query_as(ACTOR_COUNTS_SQL).bind(&dids).fetch_all(self.pool()).await?;

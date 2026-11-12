@@ -564,7 +564,8 @@ pub async fn fill_jobs_held(pool: &PgPool) -> Result<i64, sqlx::Error> {
 const COUNT_RANGE: i32 = 1 << 20;
 
 /// Posts that stored likes, reposts, replies or quotes name and that have
-/// no count row above zero: rows the counts should hold and do not. Read
+/// no count row above zero and no positive change pending in the count
+/// log: rows the counts should hold and do not. Read
 /// in ranges of the subject's account id, one short statement each.
 ///
 /// # Errors
@@ -584,7 +585,8 @@ pub async fn missing_post_counts(pool: &PgPool) -> Result<i64, sqlx::Error> {
                UNION SELECT parent_author, parent_rkey FROM posts WHERE parent_coll = 1 AND parent_author >= $1 AND parent_author < $2 \
                UNION SELECT quote_author, quote_rkey FROM posts WHERE quote_coll = 1 AND quote_author >= $1 AND quote_author < $2 \
              ) s WHERE a IS NOT NULL AND k IS NOT NULL AND NOT EXISTS (SELECT 1 FROM post_counts c WHERE c.author = s.a AND c.rkey = s.k \
-               AND (c.like_count > 0 OR c.repost_count > 0 OR c.reply_count > 0 OR c.quote_count > 0))",
+               AND (c.like_count > 0 OR c.repost_count > 0 OR c.reply_count > 0 OR c.quote_count > 0)) \
+               AND NOT EXISTS (SELECT 1 FROM count_log l WHERE l.kind BETWEEN 1 AND 4 AND l.a = s.a AND l.b = s.k AND l.delta > 0)",
         )
         .bind(lo)
         .bind(hi)
@@ -683,7 +685,7 @@ pub fn class_of(table: &str) -> Option<Class> {
     }
     let prefixed = ["private_", "outline_", crate::system_accounts::TABLE_PREFIX, "admin_", "refract_", "subscription", "subscribed_", "list_reference", "member_", "notification", "plural_"];
     Some(match table {
-        "post_counts" | "actor_counts" | "starter_pack_counts" | "odd_refs" | "post_search" | "tag_activity_hourly" => Class::Derived,
+        "post_counts" | "actor_counts" | "starter_pack_counts" | "odd_refs" | "post_search" | "tag_activity_hourly" | "count_log" | "count_log_tags" => Class::Derived,
         "did_cache" | "constellation_counts" | "identity_refresh" | "learned_inbound_blocks" | "refract_record_reads" => Class::Cache,
         "dids" | "rkey_aliases" | "collections" | "record_dicts" => Class::Kept,
         "_sqlx_migrations" | "full_trials" | "full_trial_rows" | "full_trial_jobs" | "full_trial_samples" | "members" | "scope_dids" | "operator_settings" | "operator_settings_history"
@@ -724,6 +726,8 @@ pub struct Sample {
     pub applied: f64,
     pub lanes_busy: Option<f64>,
     pub filling: bool,
+    /// The most the counts were behind ingest in the minute, seconds.
+    pub counts_behind: Option<f64>,
 }
 
 /// What a trial says of the server's capacity, from its samples (the first
@@ -778,6 +782,17 @@ pub fn capacity_words(samples: &[Sample], ended_on_lag: bool, waits: Option<crat
     out.extend(window(false));
     if ended_on_lag {
         out.push("It ended itself when the backlog would have reached the stream's limit within its margin.".to_string());
+    }
+    // The counts folder as the limit: behind more than ten intervals for
+    // more than half the minutes.
+    let bound = (crate::counts::fold_interval() * crate::counts::WARN_INTERVALS).as_secs_f64();
+    let held: Vec<f64> = steady.iter().filter_map(|s| s.counts_behind).filter(|b| *b > bound).collect();
+    if held.len() * 2 > steady.len() {
+        let most = held.iter().copied().fold(0.0, f64::max);
+        out.push(format!(
+            "Counts fell up to {} behind ingest: the counts folder, not the lanes, was the limit at this rate.",
+            crate::counts::span(Duration::from_secs_f64(most))
+        ));
     }
     if let Some(class) = waits {
         out.push(format!("The database spent most of its time {} (see Health).", class.words()));
@@ -915,6 +930,8 @@ pub async fn database_bytes(pool: &PgPool) -> Result<u64, sqlx::Error> {
 ///
 /// Database errors.
 pub async fn baseline(pool: &PgPool, free: Option<(u64, u64)>, from: ScopeValue) -> Result<Value, sqlx::Error> {
+    // Its counts and trends exact: the count log folded first.
+    crate::counts::settle(pool).await?;
     let tables = table_figures(pool).await?;
     let db = database_bytes(pool).await?;
     let dids_max: Option<i32> = sqlx::query_scalar("SELECT max(id) FROM dids").fetch_one(pool).await?;
@@ -1344,8 +1361,8 @@ impl PublicIndexing {
         };
         let filling = self.scope.read_guard().await.public.mode == PublicMode::Filling;
         sqlx::query(
-            "INSERT INTO full_trial_samples (trial, at, input, processed, deduped, shed, applied, lag, pending, time_to_trim, lanes_busy, crawl_records, filling) \
-             VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT DO NOTHING",
+            "INSERT INTO full_trial_samples (trial, at, input, processed, deduped, shed, applied, lag, pending, time_to_trim, lanes_busy, crawl_records, filling, counts_behind) \
+             VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT DO NOTHING",
         )
         .bind(t.id)
         .bind(projection.map(|p| p.input_per_sec))
@@ -1359,6 +1376,7 @@ impl PublicIndexing {
         .bind(busy)
         .bind(rate(before.crawl_records, now_totals.crawl_records))
         .bind(filling)
+        .bind(crate::counts::take_behind(&self.pool))
         .execute(&self.pool)
         .await?;
         Ok(())

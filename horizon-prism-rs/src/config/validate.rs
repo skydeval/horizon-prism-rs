@@ -685,6 +685,13 @@ fn numbers(cfg: &FileConfig, out: &mut Vec<String>) {
     if !(100..=10_000).contains(&cfg.identity.lodestar_timeout_ms) {
         out.push("identity.lodestar_timeout_ms must be between 100 and 10000".to_string());
     }
+    // Below these the counts folder would only spin.
+    if cfg.counts.fold_interval_ms < 10 {
+        out.push("counts.fold_interval_ms must be at least 10".to_string());
+    }
+    if cfg.counts.fold_slice_rows < 1000 {
+        out.push("counts.fold_slice_rows must be at least 1000".to_string());
+    }
     if cfg.counts.fresh_secs > cfg.counts.stale_max_secs {
         out.push("counts.fresh_secs must not exceed counts.stale_max_secs".to_string());
     }

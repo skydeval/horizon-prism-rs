@@ -899,6 +899,7 @@ impl Hydrator {
         if dids.is_empty() {
             return Ok(HashMap::new());
         }
+        crate::counts::before_read(self.pool()).await;
         let rows: Vec<StoredActorRow> = sqlx::query_as(
             "SELECT d.did, a.handle, a.display_name, a.description, a.avatar_cid, a.banner_cid, a.pds_endpoint, \
                a.indexed_at, a.profile_record, a.pronouns, a.website, a.joined_via_starter_pack_uri, \
@@ -957,6 +958,7 @@ impl Hydrator {
         if uris.is_empty() {
             return Ok(HashMap::new());
         }
+        crate::counts::before_read(self.pool()).await;
         let rows: Vec<StoredPostRow> = sqlx::query_as(&format!(
             "SELECT u.uri, d.did AS author_did, p.cid, p.record, {} AS reply_parent_uri, \
                {} AS reply_root_uri, {} AS quote_uri, p.created_at, p.indexed_at, \

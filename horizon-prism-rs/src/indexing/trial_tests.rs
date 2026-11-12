@@ -380,7 +380,19 @@ const PRE_TAG: &str = "SELECT COALESCE(sum(posts), 0)::bigint FROM tag_activity_
 /// it created removed; the check compares them and passes.
 #[tokio::test]
 async fn a_trial_from_kryphocron_only_leaves_counts_trends_and_jobs_as_they_were() {
-    let Some(db) = fresh_db("trial_off_state").await else {
+    off_state_trial("trial_off_state", false).await;
+}
+
+/// The same with the counts folder slowed to 5 s and reads not folding
+/// first from the trial's rows on: the exit and the check settle the counts
+/// themselves, so nothing the lag holds is counted as left behind.
+#[tokio::test]
+async fn a_trial_from_kryphocron_only_passes_with_counts_held_back() {
+    off_state_trial("trial_off_state_lagged", true).await;
+}
+
+async fn off_state_trial(name: &str, lagged: bool) {
+    let Some(db) = fresh_db(name).await else {
         return;
     };
     let p = &db.pool;
@@ -406,8 +418,21 @@ async fn a_trial_from_kryphocron_only_leaves_counts_trends_and_jobs_as_they_were
     assert_eq!(count(p, TRIAL_TAG).await, 2);
     let reply_tag = "SELECT count(*) FROM tag_activity_hourly WHERE tag = 'replytag'";
     assert_eq!(count(p, reply_tag).await, 1);
+    let held_back = lagged.then(|| {
+        let folder = crate::counts::Folder::new(
+            p.clone(),
+            &crate::config::CountsConfig { fold_interval_ms: 5000, ..crate::config::CountsConfig::default() },
+            std::sync::Arc::new(crate::counts::FoldStatus::default()),
+        )
+        .spawn();
+        (crate::test_support::hooks::arm(crate::test_support::hooks::COUNTS_LAG, db.name()), folder)
+    });
     assert_eq!(pi.end_trial("manual").await.expect("end").expect("ended").action, "draining");
     settled(&scope).await;
+    if let Some((lag, folder)) = held_back {
+        folder.abort();
+        drop(lag);
+    }
     assert_eq!(scope.public_mode(), PublicMode::Off);
     assert_eq!(count(p, &likes).await, 1, "the member's like still counts");
     assert_eq!((count(p, PRE_TAG).await, count(p, TRIAL_TAG).await), (3, 1), "the trend hours from before the trial stay");
@@ -1192,7 +1217,7 @@ async fn a_trial_ends_itself_when_live_ingest_falls_too_far_behind() {
 #[test]
 fn a_trials_capacity_is_said_in_words() {
     use crate::indexing::trial::{Sample, capacity_words};
-    let s = |input: f64, processed: f64, applied: f64, busy: f64, filling: bool| Sample { input: Some(input), processed, deduped: input * 0.6, applied, lanes_busy: Some(busy), filling };
+    let s = |input: f64, processed: f64, applied: f64, busy: f64, filling: bool| Sample { input: Some(input), processed, deduped: input * 0.6, applied, lanes_busy: Some(busy), filling, counts_behind: None };
     assert_eq!(capacity_words(&[s(1.0, 1.0, 1.0, 0.1, false); 5], false, None), None, "five minutes say nothing");
     let mut kept: Vec<Sample> = vec![s(1300.0, 1300.0, 500.0, 0.9, false); 5];
     kept.extend(vec![s(1300.0, 1300.0, 430.0, 0.41, false); 20]);
@@ -1204,4 +1229,11 @@ fn a_trials_capacity_is_said_in_words() {
     let w = capacity_words(&behind, true, Some(crate::db::waits::WaitClass::DiskRead)).expect("words");
     assert!(w.contains("While community's fill ran, this server applied 300 a second") && w.contains("This server applied 410 a second"), "{w}");
     assert!(w.contains("could not keep up") && w.contains("ended itself") && w.contains("waiting for disk reads"), "{w}");
+    assert!(!w.contains("Counts fell"), "the folder kept up: {w}");
+    // The counts folder held back for most minutes: it, not the lanes, was
+    // the limit.
+    let mut held: Vec<Sample> = vec![s(1300.0, 1300.0, 500.0, 0.4, false); 5];
+    held.extend((0..20).map(|i| Sample { counts_behind: Some(if i < 15 { 180.0 } else { 2.0 }), ..s(1300.0, 1300.0, 500.0, 0.4, false) }));
+    let w = capacity_words(&held, false, None).expect("words");
+    assert!(w.contains("Counts fell up to 3 minutes behind ingest: the counts folder, not the lanes, was the limit at this rate."), "{w}");
 }

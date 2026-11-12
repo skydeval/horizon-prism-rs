@@ -1114,7 +1114,7 @@ impl Default for DbConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PoolSize {
     /// 16, plus one connection for each writer lane, history-crawl claimer
-    /// and backfill worker.
+    /// and backfill worker, and one for the counts folder.
     #[default]
     Auto,
     Fixed(u32),
@@ -1131,6 +1131,7 @@ impl PoolSize {
         match self {
             Self::Fixed(n) => n,
             Self::Auto => Self::BASE
+                .saturating_add(1)
                 .saturating_add(file.firehose.writer_lanes)
                 .saturating_add(file.full_crawl.concurrency)
                 .saturating_add(file.backfill.concurrency),
@@ -1293,6 +1294,12 @@ pub struct CountsConfig {
     pub sync_timeout_ms: u64,
     pub refresh_rate_per_sec: u32,
     pub refresh_queue_max: u64,
+    /// The local counts folder: how often it applies the count log to the
+    /// count tables, so how far counts may run behind ingest.
+    pub fold_interval_ms: u64,
+    /// Log rows one fold transaction takes at most: a larger log is folded
+    /// in slices of about this many.
+    pub fold_slice_rows: u64,
 }
 
 impl Default for CountsConfig {
@@ -1304,6 +1311,8 @@ impl Default for CountsConfig {
             sync_timeout_ms: 800,
             refresh_rate_per_sec: 20,
             refresh_queue_max: 100_000,
+            fold_interval_ms: 1000,
+            fold_slice_rows: 100_000,
         }
     }
 }

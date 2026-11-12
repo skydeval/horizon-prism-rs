@@ -154,13 +154,13 @@ mod tests {
     fn the_auto_pool_follows_the_writers_and_warns_near_the_servers_limit() {
         use crate::config::{FileConfig, PoolSize};
         let mut file = FileConfig::default();
-        // 16 + 1 lane + 4 claimers + 4 backfill workers.
+        // 16 + the counts folder + 1 lane + 4 claimers + 4 backfill workers.
         assert_eq!(file.db.pool_size, PoolSize::Auto);
-        assert_eq!(file.db.pool_size.connections(&file), 25);
+        assert_eq!(file.db.pool_size.connections(&file), 26);
         file.firehose.writer_lanes = 8;
         file.full_crawl.concurrency = 6;
         file.backfill.concurrency = 2;
-        assert_eq!(file.db.pool_size.connections(&file), 32);
+        assert_eq!(file.db.pool_size.connections(&file), 33);
         assert_eq!(PoolSize::Fixed(12).connections(&file), 12);
         // Postgres's default max_connections is 100.
         assert_eq!(pool_warning(32, 100), None);

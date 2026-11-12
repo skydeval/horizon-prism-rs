@@ -679,6 +679,7 @@ impl Hydrator {
             // "Top among the most recent matches": only the newest
             // candidates are scored, from stored counts. No call is made.
             Sort::Top => {
+                crate::counts::before_read(self.pool()).await;
                 offset = p.cursor.as_deref().and_then(|c| c.parse::<i64>().ok()).unwrap_or(0).max(0);
                 if offset > max_offset {
                     return Ok(Ok(Self::emit(json!({ "posts": [] }))));
