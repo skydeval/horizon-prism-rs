@@ -11,6 +11,31 @@ released.
 
 ## [Unreleased]
 
+## [0.2.2] (2026-11-12)
+
+Counts no longer hold writers back.
+
+### Changed
+
+- Counts are folded from an insert-only log in the background, up to
+  `[counts] fold_interval_ms` (1 s) behind ingest, in every indexing mode.
+  Writers no longer lock count rows, so writer lanes no longer queue on a
+  popular post's counts. Health's Counts line says how far behind they are.
+  Fix counts with the counts repair, not by editing count tables by hand.
+  **Upgrade:** migration 0069. Rolling back to an older image means
+  restoring the database dump taken before the upgrade.
+
+### Added
+
+- `[counts] fold_interval_ms` (1000) and `fold_slice_rows` (100 000), and
+  metrics of the fold (`counts_behind_seconds`, `counts_fold_seconds`,
+  `counts_log_rows` and others). Full trial samples record how far behind
+  counts were.
+
+### Removed
+
+- The metric `writer_counts_left_total`.
+
 ## [0.2.1] (2026-11-10)
 
 Full indexing throughput and fixes.
